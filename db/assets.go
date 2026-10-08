@@ -58,6 +58,9 @@ type Asset struct {
 	TaskSource        string         `json:"task_source,omitempty"`
 	TaskSourceSummary string         `json:"task_source_summary,omitempty"`
 	TaskSourceNodeID  *int64         `json:"task_source_node_id,omitempty"`
+	// 批 6 L1 蜜罐静态签名识别:0=无信号;evidence 为命中签名(JSON 数组文本)。
+	HoneypotScore    float64 `json:"honeypot_score"`
+	HoneypotEvidence string  `json:"honeypot_evidence,omitempty"`
 }
 
 // AuthItem is one entry in the auth array.
@@ -1081,7 +1084,8 @@ SELECT id, type, company_id, array_to_json(task_ids)::text,
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text,
+       honeypot_score, COALESCE(honeypot_evidence,'')
 FROM assets
 WHERE type = $1
 ORDER BY last_seen DESC, id DESC
@@ -1112,7 +1116,8 @@ func (s *AssetStore) QueryByCompany(companyID int64, typ string, limit, offset i
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text,
+       honeypot_score, COALESCE(honeypot_evidence,'')
 FROM assets WHERE company_id = $1`
 	args := []any{companyID}
 	if typ != "" {
@@ -1164,7 +1169,8 @@ func (s *AssetStore) QueryByTask(taskID int64, typ string, limit, offset int) ([
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text,
+       honeypot_score, COALESCE(honeypot_evidence,'')
 FROM assets WHERE $1 = ANY(task_ids)`
 	args := []any{taskID}
 	if typ != "" {
@@ -1197,6 +1203,43 @@ func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
 	var n int
 	err := s.db.QueryRow(q, args...).Scan(&n)
 	return n, err
+}
+
+// QueryByHost 全局(不受 task_ids 限制)按 host 粗筛资产:ip/domain/root_domain
+// 精确相等、root_domain 作为 host 的后缀(子域命中根域)、url 含 "://host"。
+// 供 report_finding 自动锚定(agent/finding_anchor.go)在 SQL 层先收敛候选,
+// 再由 Go 层按 endpoint/service/ip 优先级定夺。limit <= 0 时取默认上限 500,
+// 防止极端情况下候选项爆炸。host 来自正则提取的 hostname/IP,不含 LIKE 元字符。
+func (s *AssetStore) QueryByHost(host string, limit int) ([]*Asset, error) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.Query(`SELECT id, type, company_id, array_to_json(task_ids)::text,
+       COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
+       COALESCE(c_segment::text,''), port,
+       COALESCE(icp,''), array_to_json(bound_domains)::text, array_to_json(open_ports)::text, COALESCE(record_type,''),
+       array_to_json(record_value)::text, COALESCE(bundle_id,''), COALESCE(app_name,''),
+       COALESCE(category,''), COALESCE(app_description,''), COALESCE(app_icp,''),
+       COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
+       COALESCE(favicon_mmh3,''), status_code, content_length,
+       COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
+       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text,
+       honeypot_score, COALESCE(honeypot_evidence,'')
+FROM assets
+WHERE lower(ip) = $1 OR lower(domain) = $1 OR lower(root_domain) = $1
+   OR (root_domain <> '' AND $1 LIKE '%.' || lower(root_domain))
+   OR lower(url) LIKE '%://' || $1 || '%'
+ORDER BY id
+LIMIT $2`, host, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAssets(rows)
 }
 
 func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
@@ -1362,7 +1405,8 @@ const assetSelectCols = `SELECT id, type, company_id, array_to_json(task_ids)::t
        COALESCE(url,''), COALESCE(service_type,''), COALESCE(service_name,''),
        COALESCE(favicon_mmh3,''), status_code, content_length,
        COALESCE(page_title,''), array_to_json(technologies)::text, array_to_json(auth)::text,
-       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text
+       COALESCE(method,''), array_to_json(params)::text, extra, last_seen::text,
+       honeypot_score, COALESCE(honeypot_evidence,'')
 FROM assets`
 
 // GetByIDs returns assets with the given ids (order preserved by id array order).
@@ -1486,6 +1530,7 @@ func scanAssets(rows *sql.Rows) ([]*Asset, error) {
 			&a.FaviconMMH3, &statusCode, &contentLength,
 			&a.PageTitle, &techsRaw, &authRaw,
 			&a.Method, &paramsRaw, &extraRaw, &a.LastSeen,
+			&a.HoneypotScore, &a.HoneypotEvidence,
 		); err != nil {
 			return nil, err
 		}

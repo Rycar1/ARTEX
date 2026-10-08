@@ -51,6 +51,14 @@ func TestReviewCompletionSendsCurrentCallWithoutHistory(t *testing.T) {
 		t.Fatal("review request cannot return a complete explanation")
 	}
 	body := p.request.Messages[0].Content[0].Text
+	// 裁判输入含目标侧可控文本，送模型前按不可信数据包裹（agent.WrapUntrustedData）。
+	// 这里先断言包裹存在，再剥掉标签解析其中的 JSON 信封。
+	const openTag = "<untrusted-data source=\"tool-input\">" + "\n"
+	const closeTag = "\n</untrusted-data>"
+	if !strings.HasPrefix(body, openTag) || !strings.HasSuffix(body, closeTag) {
+		t.Fatalf("model input is not wrapped as untrusted data: %s", body)
+	}
+	body = strings.TrimSuffix(strings.TrimPrefix(body, openTag), closeTag)
 	var got intercept.ReviewInput
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatal(err)

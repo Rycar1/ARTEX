@@ -163,3 +163,182 @@ func (t *ToolSet) expandDigest() actool.CoreTool {
 			return jsonResult(out)
 		})
 }
+
+// ---- merged from ymh fork: cold_index / cross-task digest helpers ----
+
+// coldDigestOverview returns the folded cold region for graph_overview: the flat
+// digest bodies and the asset-grouped index (§6.1/§6.2). covered is unused here
+// (kept for symmetry with the caller's coverage computation).
+func (t *ToolSet) coldDigestOverview() (digests []map[string]any, index []map[string]any) {
+	ads, err := t.ts.ActiveDigests()
+	if err != nil || len(ads) == 0 {
+		return nil, nil
+	}
+	memByDigest := map[int64][]int64{}
+	var allMembers []int64
+	for _, d := range ads {
+		ms, _ := t.ts.DigestMembers(d.ID)
+		memByDigest[d.ID] = ms
+		allMembers = append(allMembers, ms...)
+	}
+	assetsByNode, _ := t.ts.NodeAssets(allMembers)
+
+	digests = make([]map[string]any, 0, len(ads))
+	for _, d := range ads {
+		var p struct {
+			Body string `json:"body"`
+		}
+		_ = json.Unmarshal(d.Payload, &p)
+		digests = append(digests, map[string]any{
+			"id":           d.ID,
+			"body":         p.Body,
+			"member_count": len(memByDigest[d.ID]),
+		})
+	}
+
+	// index (§6.2): asset → digests. Each digest lands in EXACTLY ONE bucket — its
+	// representative asset = the asset anchored on the most of its members (mode;
+	// tie-break lowest id). This is what makes the index converge: bucketing a digest
+	// into every asset its members touch would duplicate it across dozens of buckets
+	// and blow up the top-level count instead of shrinking it (asset_ids are fine-
+	// grained — a real task has ~144 of them). A digest whose members anchor no asset
+	// falls into the 0 bucket ("(未锚定资产)").
+	byAsset := map[int64]map[int64]bool{} // asset id → set of digest ids
+	assetSet := map[int64]bool{}
+	for dID, ms := range memByDigest {
+		counts := map[int64]int{}
+		for _, m := range ms {
+			for _, a := range assetsByNode[m] {
+				counts[a]++
+			}
+		}
+		rep, best := int64(0), 0
+		for a, c := range counts {
+			if c > best || (c == best && (rep == 0 || a < rep)) {
+				rep, best = a, c
+			}
+		}
+		if byAsset[rep] == nil {
+			byAsset[rep] = map[int64]bool{}
+		}
+		byAsset[rep][dID] = true
+		if rep != 0 {
+			assetSet[rep] = true
+		}
+	}
+	labels := map[int64]string{}
+	if t.as != nil && len(assetSet) > 0 {
+		ids := make([]int64, 0, len(assetSet))
+		for a := range assetSet {
+			ids = append(ids, a)
+		}
+		if assets, err := t.as.GetByIDs(ids); err == nil {
+			for _, a := range assets {
+				if v := assetValue(a); v != "" {
+					labels[a.ID] = v
+				}
+			}
+		}
+	}
+	index = make([]map[string]any, 0, len(byAsset))
+	for a, dset := range byAsset {
+		dids := make([]int64, 0, len(dset))
+		for d := range dset {
+			dids = append(dids, d)
+		}
+		sort.Slice(dids, func(i, j int) bool { return dids[i] < dids[j] })
+		entry := map[string]any{"digest_ids": dids}
+		if a == 0 {
+			entry["asset"] = "(未锚定资产)"
+		} else {
+			entry["asset_id"] = a
+			if l := labels[a]; l != "" {
+				entry["asset"] = l
+			} else {
+				entry["asset"] = fmt.Sprintf("#%d", a)
+			}
+		}
+		index = append(index, entry)
+	}
+	sort.Slice(index, func(i, j int) bool {
+		return fmt.Sprint(index[i]["asset"]) < fmt.Sprint(index[j]["asset"])
+	})
+	return digests, index
+}
+
+// activeDigestBodies returns [{id, body, member_count}] for a store's active
+// digests — the folded cold region as flat bodies (§6.1). Shared by the current
+// task overview and the read-only related-task overview (§2 cross-task reuse).
+func activeDigestBodies(store *db.ExplorationStore) []map[string]any {
+	ads, err := store.ActiveDigests()
+	if err != nil || len(ads) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(ads))
+	for _, d := range ads {
+		var p struct {
+			Body string `json:"body"`
+		}
+		_ = json.Unmarshal(d.Payload, &p)
+		ms, _ := store.DigestMembers(d.ID)
+		out = append(out, map[string]any{"id": d.ID, "body": p.Body, "member_count": len(ms)})
+	}
+	return out
+}
+
+// expandIndex returns the active digests under one asset (§6.2 level-0), each
+// with its body + member count — so the planner can drill an asset directory down
+// to its directions without reading every digest globally.
+func (t *ToolSet) expandIndex() actool.CoreTool {
+	return t.writeExpTool("expand_index",
+		"展开冷区某个资产条目（来自概览 cold_index）：返回该资产名下的 cold digest 列表（id/body/member_count）。再往下看某个 digest 的成员用 expand_digest(id)。",
+		map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"asset_id": map[string]any{"type": "integer", "description": "资产 id（来自概览 cold_index 的 asset_id；传 0 或省略取未锚定资产桶）"},
+			},
+		},
+		func(ctx context.Context, raw json.RawMessage) (actool.Result, error) {
+			var in struct {
+				AssetID int64 `json:"asset_id"`
+			}
+			_ = json.Unmarshal(raw, &in)
+			ads, _ := t.ts.ActiveDigests()
+			out := make([]map[string]any, 0)
+			for _, d := range ads {
+				members, _ := t.ts.DigestMembers(d.ID)
+				assetsByNode, _ := t.ts.NodeAssets(members)
+				match := in.AssetID == 0
+				for _, m := range members {
+					for _, a := range assetsByNode[m] {
+						if a == in.AssetID {
+							match = true
+						}
+					}
+					if match {
+						break
+					}
+				}
+				// asset_id==0 means "unanchored bucket": include only digests with no asset.
+				if in.AssetID == 0 {
+					anchored := false
+					for _, m := range members {
+						if len(assetsByNode[m]) > 0 {
+							anchored = true
+							break
+						}
+					}
+					match = !anchored
+				}
+				if !match {
+					continue
+				}
+				var p struct {
+					Body string `json:"body"`
+				}
+				_ = json.Unmarshal(d.Payload, &p)
+				out = append(out, map[string]any{"id": d.ID, "body": p.Body, "member_count": len(members)})
+			}
+			return jsonResult(map[string]any{"asset_id": in.AssetID, "digests": out})
+		})
+}

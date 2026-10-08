@@ -26,6 +26,9 @@ import (
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/session"
+	stagepkg "github.com/Autumn-27/artex/stage"
+	"github.com/Autumn-27/artex/tunnel"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -43,8 +46,17 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	skillDir  string              // root directory for skill subdirectories
+	jwtKey    []byte              // HS256 signing key loaded from / generated into dataDir/jwt.key
+	gate      *Gate               // 反测绘伪装门控(F14,见 gate.go);nil = 关闭
+	stage     *stagepkg.Manager   // 受管文件投递暂存(F13,见 stage.go);nil = 降级关闭
+	sessReg   *session.Registry   // 立足点会话注册表(期 1a,见 session.go);nil = DB 未就绪
+	sessStore *db.SessionStore    // 会话落库访问层(secret AES-GCM,密钥由 jwtKey 派生)
+	credStore *db.CredentialStore // 凭据落库访问层(期 2,secret AES-GCM,与 sessions 不同域标签)
+	tunnels   *tunnel.Manager     // 多层代理隧道(期 3a,见 tunnel.go);nil = DB 未就绪
+	reverse   *PenelopeHandler    // 反弹 shell handler(期 5,见 reverse.go);nil = DB 未就绪
+	tickets   sseTicketStore      // SSE 一次性票据(F6,见 auth.go),零值可用
+	authkv    authKV              // auth 持久层注入(测试用);nil = 走 m.pg
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -149,9 +161,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		provByProfile: map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	s.initStage(dataDir) // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
+	checkToolsManifest(dataDir) // 期 6 外部工具清单自检(缺失常态,只打汇总日志)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -222,8 +236,20 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		s.seedStageShareTool()     // F13 受管文件投递工具 seed 进 tools 表(默认绑 worker)
+		s.initSessions()           // 期 1a 立足点会话子系统:Registry + 启动恢复(DB 存活会话)
+		s.seedSessionTools()       // 会话工具 seed 进 tools 表(默认绑 worker)
+		s.initCredentials()        // 期 2 凭据一等实体:落库访问层(secret AES-GCM)
+		s.seedCredentialTools()    // 凭据工具 seed 进 tools 表(默认绑 worker)
+		s.initTunnels(dataDir)     // 期 3a 多层代理隧道:Manager + 孤儿标 error + 健康巡检
+		s.seedTunnelTools()        // 隧道工具 seed 进 tools 表(默认绑 worker)
+		s.initReverse(dataDir)     // 期 5 反弹 handler:penelope 受管进程 + 上期 reverse 会话诚实标 dead
+		s.seedReverseTools()       // reverse_listen 工具 seed 进 tools 表(默认绑 worker)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
+		}
+		if err := s.seedFindingVerifier(); err != nil { // 反证验证 agent(需求二方案甲)
+			log.Printf("[verifier] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
@@ -256,6 +282,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	// 批 5 B2 出口审查:启动时向进程级共享 EgressGuard 注册平台敏感指纹
+	// (LLM key/jwt.key/gate 路径/PG 密码/callback_addr),所有任务的 guard 即时生效。
+	s.registerEgressFingerprints()
 	return s
 }
 
@@ -409,6 +438,20 @@ func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 	return o
 }
 
+// uaForTask 返回本任务稳定分配的客户端 UA(批 5 B4):池子读 settings 键
+// web_ua_pool(JSON 字符串数组,每次 run 现读、改池即时生效),未配置用默认池;
+// 选择是 hash(taskID) % len(pool),同一任务永远同一个。无 DB 时直接给默认池结果。
+func (s *Server) uaForTask(taskID int64) string {
+	if s.m == nil || s.m.pg == nil {
+		return agent.PickUA(nil, taskID)
+	}
+	raw, _, err := s.m.pg.GetSetting(settingWebUAPool)
+	if err != nil {
+		raw = ""
+	}
+	return agent.PickUA(agent.UAPoolFromSetting(raw), taskID)
+}
+
 // nonStreamingResolver returns a resolver capturing a profile's streaming choice.
 // The agents read it per run; a profile change rebuilds the agents (applyLLM),
 // so the captured value is always the one in effect for this build.
@@ -472,7 +515,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
+	s.chatAgent.SetGuard(s.agentGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
@@ -481,6 +524,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.llmOn = true
 	s.cfgMu.Unlock()
 	s.invalidateTaskAgents()
+	// 批 5 B2 出口审查:applyLLM 是 LLM profile 变更的唯一漏斗(保存/激活/删除
+	// 都经 reapplyActiveProfile→applyLLM),在这里整体替换 llm_api_key 指纹。
+	s.registerEgressFingerprints()
 
 	// wake the active task so a task created while idle starts exploring.
 	if t := s.m.ActiveTask(); t != nil {
@@ -613,7 +659,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
+	ca.SetGuard(s.agentGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
@@ -656,6 +702,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("POST /api/auth/refresh", s.authRefresh)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
+
+	// SSE 一次性票据(F6):凭 access token 换 60s 单用 ticket,EventSource 拼
+	// ?ticket= 连接,不再把 access token 放进 URL。
+	mux.HandleFunc("POST /api/sse-ticket", s.sseTicket)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
@@ -717,6 +769,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
+	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)   // 期 4:待授权网段列表
+	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide) // 期 4:审批扩 scope
 	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
@@ -765,6 +819,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/checks", s.listFindingChecks)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/checks", s.startFindingCheck)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
@@ -932,14 +988,52 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
 
+	// 一键放行(guard auto-allow):带时限的 ask 审批自动放行开关
+	mux.HandleFunc("GET /api/guard/auto-allow", s.guardAutoAllowGet)
+	mux.HandleFunc("PUT /api/guard/auto-allow", s.guardAutoAllowSet)
+
+	// 受管文件投递(F13):管理 API 在 JWT 之后;下载路径 /s/ 在 root mux(JWT 之外,
+	// 目标机器没有 token——安全靠 24 字节随机 token + 每 token 限速 + 一致性 404)。
+	mux.HandleFunc("POST /api/stage", s.stageCreate)
+	mux.HandleFunc("GET /api/stage", s.stageList)
+	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)
+
+	// 内网作战页（人工操作通道,JWT 后；与 agent host 工具隔离，见 intranet.go)。
+	// 人工 exec/write/delete/teardown 全部打 [intranet] 服务端审计日志。
+	mux.HandleFunc("GET /api/sessions", s.intranetListSessions)
+	mux.HandleFunc("GET /api/sessions/{id}", s.intranetGetSession)
+	mux.HandleFunc("POST /api/sessions/{id}/exec", s.intranetExec)
+	mux.HandleFunc("POST /api/sessions/{id}/probe", s.intranetProbeSession)
+	mux.HandleFunc("POST /api/sessions/{id}/list", s.intranetListDir)
+	mux.HandleFunc("POST /api/sessions/{id}/read", s.intranetReadFile)
+	mux.HandleFunc("POST /api/sessions/{id}/write", s.intranetWriteFile)
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.intranetDeleteSession)
+	mux.HandleFunc("POST /api/sessions/{id}/handoff", s.sessionHandoff) // 期 4:外网→内网任务移交
+	mux.HandleFunc("GET /api/tunnels", s.intranetListTunnels)
+	mux.HandleFunc("POST /api/tunnels/{id}/teardown", s.intranetTeardownTunnel)
+	mux.HandleFunc("GET /api/credentials", s.intranetListCredentials)
+	mux.HandleFunc("GET /api/intranet/topology", s.intranetTopology)
+
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
+	// 伪装门控(F14)包在最外层:静态 SPA、/api/*(含 /api/health)、SSE、favicon
+	// 全部在门控后,未过门控一律返回假 nginx 欢迎页而不是 JSON 401。
+	// /s/ 是唯一例外:暂存下载面目标机器不可能有门控 cookie,gate 对该前缀放行(见 gate.go)。
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
+	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload)
 	root.Handle("/", s.webuiHandler())
-	return root
+	return s.gate.wrap(root)
+}
+
+// SetGate 安装反测绘伪装门控(gate.go 的 NewGate 产物;nil = 直通)。
+// 门控位于 requireAuth 外层,过了门控后 JWT 流程一切照旧。
+func (s *Server) SetGate(g *Gate) {
+	s.gate = g
+	// 批 5 B2:入口路径是平台敏感信息,门控安装/变更后重新注册出口审查指纹。
+	s.registerEgressFingerprints()
 }
 
 // --- handlers ---
@@ -1734,6 +1828,20 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
+	// 与 listTasks 同源补齐聚合指标：此前单任务 DTO 的 goals/tokens/in_flight
+	// 恒为 0(只有列表端点填这些字段),任务详情页因此永远显示 0 目标 0 token。
+	if metrics, err := s.m.PG().TaskListMetricsAll(); err == nil {
+		if metric, ok := metrics[t.ExpID]; ok {
+			dto.Tokens = tokenTotalDTO(metric.Tokens)
+			dto.GoalsTotal = metric.Goals.Total
+			dto.GoalsMet = metric.Goals.Met
+			dto.InFlight = metric.RunningIntents
+			dto.LastActivity = metric.LastActivity
+			if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
+				dto.LastActivity = live
+			}
+		}
+	}
 	writeJSON(w, 200, dto)
 }
 
@@ -3749,7 +3857,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal)
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})
