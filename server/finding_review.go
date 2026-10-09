@@ -168,7 +168,7 @@ func (s *Server) reviewFindingOnce(ctx context.Context, f *db.DBFinding) (*db.Fi
 		if err != nil {
 			return nil, err
 		}
-		rev = got
+		rev = applyReviewFallback(f, got, src)
 	}
 	if err := s.applyFindingReview(ctx, f.ID, *rev); err != nil {
 		return nil, err
@@ -204,6 +204,11 @@ var reviewJunkRules = []struct {
 	{[]string{"目录列表", "directory listing"}, "目录列表,不含敏感数据"},
 	{[]string{"内网ip", "私网ip", "内网地址"}, "内网 IP 泄露,无实际影响"},
 	{[]string{"拒绝服务", "ddos", "dos攻击", "资源耗尽"}, "DoS/资源耗尽类,不予收录"},
+	{[]string{"反射型xss", "反射型 xss", "反射xss", "反射 xss", "reflected xss"}, "反射型 XSS:需受害者点击特制链接,单独一条不足以收录(除非能造成账号接管或后台操作)"},
+	{[]string{"钓鱼", "phishing"}, "钓鱼页面/仿冒登录:需用户主动输入账号,不构成可收录漏洞"},
+	{[]string{"中间人", "mitm", "man-in-the-middle"}, "中间人攻击:需控制链路且无直接业务影响,不予收录"},
+	{[]string{"图形验证码", "算术验证码"}, "仅验证码机制问题,无敏感影响,不予收录"},
+	{[]string{"公开接口", "本就公开", "公开展示"}, "本就公开/公开展示的数据或接口,不属于漏洞"},
 }
 
 // ruleReviewFinding 是零成本规则层:命中高置信垃圾洞清单返回 ignored,否则 nil 交给
@@ -222,6 +227,102 @@ func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 规则层兜底(对应 AutoHunter 的 _ignored_deepen_directive)
+//
+// LLM 把一条「已有真实入口线索、只是没打穿」的漏洞判成 ignored 时,纯规则再捞一次,
+// 转成 deepen 并写明还差什么 —— 避免有价值的线索被一句 ignored 直接归档。
+// 只作用于 LLM 结论;规则层命中的高置信垃圾洞不参与(否则会把垃圾洞救活)。
+// ---------------------------------------------------------------------------
+
+// reviewNeverDeepenMarkers 命中即「绝不转 deepen」—— 这些是明确垃圾/公开/需交互的洞。
+var reviewNeverDeepenMarkers = []string{
+	"反射型xss", "反射型 xss", "反射xss", "反射 xss", "self-xss", "self xss", "自xss", "自身xss",
+	"用户名枚举", "用户枚举", "账号枚举", "账户枚举", "user enumeration",
+	"phpinfo", "目录列表", "directory listing", "内网ip", "私网ip",
+	"拒绝服务", "ddos", "资源耗尽", "dos攻击",
+	"短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸", "sms bomb", "email bomb",
+	"图形验证码", "算术验证码", "钓鱼", "phishing", "中间人", "mitm",
+	"本就公开", "公开展示", "公开接口", "公开数据",
+}
+
+// reviewEntryMarkers 是「真实可打穿的入口」特征。
+var reviewEntryMarkers = []string{
+	"rce", "命令执行", "命令注入", "远程代码", "代码执行", "code execution", "command inject",
+	"sql注入", "sql injection", "注入点", "ssti", "模板注入", "反序列化", "deserial",
+	"文件上传", "upload", "任意文件写入", "任意文件读取",
+	"未授权", "越权", "无鉴权", "unauthorized",
+	"配置泄露", "泄露", "硬编码", "密钥", "secret", "token", "凭证", "password", "弱口令", "默认口令",
+}
+
+// reviewSideChannelMarkers 是「疑似打穿但缺直接回显」的侧信道特征。
+var reviewSideChannelMarkers = []string{
+	"时间盲", "time-based", "time based", "sleep(", "延时", "响应时间", "响应延迟",
+	"dnslog", "oast", "带外", "ceye", "interactsh", "burpcollaborator", "回连", "外连",
+	"无回显", "盲打", "blind",
+}
+
+// reviewWeakProofMarkers 是「有入口但证据链明显不足」的特征。
+var reviewWeakProofMarkers = []string{
+	"仅请求", "只有请求", "无响应", "无回显", "疑似", "可能存在", "理论", "待验证", "证据不足", "需进一步",
+}
+
+// reviewDeepenHint 判断一条被 LLM 判 ignored 的漏洞是否属于「已有真实入口线索、只是没
+// 打穿」。命中返回深挖指引文本,否则返回 ("", false)。纯规则、零成本。
+func reviewDeepenHint(f *db.DBFinding) (string, bool) {
+	text := strings.ToLower(strings.Join([]string{f.VulnClass, f.Name, f.Summary, f.Evidence, f.Report}, "\n"))
+	if strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	for _, m := range reviewNeverDeepenMarkers {
+		if strings.Contains(text, m) {
+			return "", false
+		}
+	}
+	entry := false
+	for _, m := range reviewEntryMarkers {
+		if strings.Contains(text, m) {
+			entry = true
+			break
+		}
+	}
+	if !entry {
+		return "", false
+	}
+	for _, m := range reviewSideChannelMarkers {
+		if strings.Contains(text, m) {
+			return "疑似盲打/无回显漏洞:已有侧信道线索但缺直接回显。沿同一注入点把结果坐实——用稳定 " +
+				"time-based(sleep 递增验证时间差线性)、DNS/HTTP 带外回连(dnslog/interactsh/ceye),或把命令/查询结果" +
+				"写入可回读的业务字段后访问,拿到明确执行结果证据;确认无任何侧信道差异再判 no_vuln。", true
+		}
+	}
+	for _, m := range reviewWeakProofMarkers {
+		if strings.Contains(text, m) {
+			return "已定位到真实入口但缺可自证的利用证据:补一份完整请求/响应或可复现 PoC,证明能读到敏感数据、" +
+				"执行命令或完成越权写操作;补不齐再判 no_vuln。", true
+		}
+	}
+	return "", false
+}
+
+// applyReviewFallback 把「真实入口但未打穿」的 ignored 转成 deepen,其余原样返回。
+func applyReviewFallback(f *db.DBFinding, rev *db.FindingReview, src string) *db.FindingReview {
+	if rev == nil || rev.Verdict != db.ReviewVerdictIgnored {
+		return rev
+	}
+	hint, ok := reviewDeepenHint(f)
+	if !ok {
+		return rev
+	}
+	return &db.FindingReview{
+		Verdict:  db.ReviewVerdictDeepen,
+		Severity: rev.Severity,
+		Score:    rev.Score,
+		Reasons:  "规则兜底:命中「真实入口但未打穿」特征,由 ignored 转 deepen(" + src + ")。\n" + hint,
+		Notes:    rev.Notes,
+	}
 }
 
 // reviewLLMOutput 是审核模型返回的 JSON 结构(契约见 review_prompts.go)。
@@ -307,6 +408,18 @@ func parseReviewJSON(text, src string) (*db.FindingReview, error) {
 		return nil, fmt.Errorf("审核结论无效: %q", out.Verdict)
 	}
 	reasons := append([]string{}, out.IgnoreReasons...)
+	// 模型自报「不在范围 / 重复」时一律按 ignored 落地,避免 accepted 与这两个字段自相
+	// 矛盾被误收(对应 AutoHunter 的 in_scope / is_duplicate 硬约束)。
+	if verdict == db.ReviewVerdictAccepted {
+		if out.InScope != nil && !*out.InScope {
+			verdict = db.ReviewVerdictIgnored
+			reasons = append(reasons, "自报不在授权/收录范围内")
+		}
+		if out.IsDuplicate != nil && *out.IsDuplicate {
+			verdict = db.ReviewVerdictIgnored
+			reasons = append(reasons, "自报与已有漏洞重复")
+		}
+	}
 	if verdict == db.ReviewVerdictIgnored {
 		reasons = append(reasons, out.DowngradeReasons...)
 	}

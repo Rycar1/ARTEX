@@ -22,7 +22,7 @@ import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { statusMeta } from "@/lib/status";
+import { statusMeta, toneClasses, type Tone } from "@/lib/status";
 import type { Finding, FindingStatus, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
@@ -39,6 +39,13 @@ const FINDING_STATUSES: FindingStatus[] = [
   "duplicate",
   "risk_accepted",
 ];
+
+// AI 二次审核结论的展示元数据(与 /function/reviews 页保持同一套配色)。
+const REVIEW_VERDICT_META: Record<string, { label: string; tone: Tone }> = {
+  accepted: { label: "已收录", tone: "green" },
+  ignored: { label: "已忽略", tone: "neutral" },
+  deepen: { label: "建议深挖", tone: "violet" },
+};
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
@@ -172,6 +179,43 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              {finding.review_verdict ? (
+                <Card>
+                  <CardHeader className="flex-row items-center justify-between">
+                    <CardTitle className="text-sm">AI 二次审核</CardTitle>
+                    <span
+                      className={`rounded border px-1.5 py-0.5 font-medium text-xs ${
+                        toneClasses[REVIEW_VERDICT_META[finding.review_verdict]?.tone ?? "neutral"]
+                      }`}
+                    >
+                      {REVIEW_VERDICT_META[finding.review_verdict]?.label ?? finding.review_verdict}
+                    </span>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-muted-foreground text-xs">
+                      {finding.review_severity ? (
+                        <span>审核严重度：{statusMeta("severity", finding.review_severity).label}</span>
+                      ) : null}
+                      {typeof finding.review_score === "number" ? (
+                        <span>价值分：{finding.review_score.toFixed(1)}</span>
+                      ) : null}
+                      {finding.reviewed_at ? <span>审核时间：{fmtTime(finding.reviewed_at)}</span> : null}
+                    </div>
+                    {finding.review_reasons ? (
+                      <div>
+                        <p className="mb-1 font-medium text-muted-foreground text-xs">判定原因</p>
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{finding.review_reasons}</p>
+                      </div>
+                    ) : null}
+                    {finding.review_notes ? (
+                      <div>
+                        <p className="mb-1 font-medium text-muted-foreground text-xs">审核备注</p>
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{finding.review_notes}</p>
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ) : null}
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>
