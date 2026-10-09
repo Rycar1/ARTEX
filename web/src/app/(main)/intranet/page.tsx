@@ -190,7 +190,7 @@ export default function IntranetPage() {
       {/* 上半部：内网拓扑 */}
       <Card>
         <CardContent className="p-0">
-          <div className="h-[42vh] w-full overflow-hidden rounded-xl">
+          <div className="h-[46vh] min-h-[340px] w-full overflow-hidden rounded-xl">
             <TopologyGraph
               data={topology}
               loading={loadingTopology}
