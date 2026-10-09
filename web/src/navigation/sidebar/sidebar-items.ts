@@ -18,6 +18,7 @@ import {
   ScrollText,
   Settings2,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Target,
   Terminal,
@@ -78,6 +79,7 @@ export const sidebarItems: NavGroup[] = [
       { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync },
       { id: "workspace", title: "工作空间", url: "/function/workspace", icon: FolderOpen },
       { id: "intranet", title: "内网", url: "/intranet", icon: Radar },
+      { id: "reviews", title: "二次审核", url: "/function/reviews", icon: ShieldCheck },
     ],
   },
   {

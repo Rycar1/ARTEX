@@ -31,6 +31,13 @@ type Store struct {
 	// as the agent ToolSet's notifyFinding. Errors inside the callback must not
 	// fail the already-committed record; implementors should log instead.
 	OnMerged func(findingID int64)
+
+	// OnRecorded, if set, is invoked once after Record commits a **new** finding
+	// (the 档 A merge path uses OnMerged instead). The caller (server 装配处)
+	// injects the AI 二次审核入队 hook here — same injection pattern as OnMerged.
+	// Errors inside the callback must not fail the already-committed record;
+	// implementors should log instead.
+	OnRecorded func(findingID int64)
 }
 
 func New(pg *db.DB, tr *traffic.Traffic, dir string) *Store {
@@ -198,9 +205,17 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		out, err = db.RecordFindingTx(ctx, tx, in, prepared)
 		return err
 	})
-	// C2:合并成功后触发对该 finding 的增量重验(事务已提交,回调失败不影响主流程)。
-	if err == nil && out != nil && out.Merged && s.OnMerged != nil {
-		s.OnMerged(out.FindingID)
+	// 事务已提交,回调失败不影响主流程。
+	// C2:合并(档 A)成功 → 对既有 finding 的增量重验。
+	// 二次审核:新登记(非合并)→ 入队 AI 审核。
+	if err == nil && out != nil {
+		if out.Merged {
+			if s.OnMerged != nil {
+				s.OnMerged(out.FindingID)
+			}
+		} else if s.OnRecorded != nil {
+			s.OnRecorded(out.FindingID)
+		}
 	}
 	return
 }

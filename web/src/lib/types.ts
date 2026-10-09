@@ -39,6 +39,8 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  review_enabled?: boolean; // 二次审核开关(创建时定,默认关)；true=新漏洞自动进入 AI 二次审核
+  review_src_type?: string; // 审核标准:edusrc(默认) | enterprise
 }
 
 export interface TaskCategory {
@@ -516,6 +518,14 @@ export interface Finding {
   source_task_id?: string;
   inherited?: boolean;
   assets?: FindingAsset[];
+  // AI 二次审核结论(见 server/finding_review.go)。review_verdict 空串=尚未审核;
+  // ignored 的漏洞已被自动置为 status=ignored,原因写在 review_reasons。
+  review_verdict?: "accepted" | "ignored" | "deepen" | "";
+  review_severity?: Severity | "";
+  review_score?: number;
+  review_reasons?: string;
+  review_notes?: string;
+  reviewed_at?: string;
   ts: string;
 }
 
@@ -555,6 +565,30 @@ export interface FindingDeepenResponse {
   queued: boolean;
 }
 
+// ---- AI 二次审核 (finding review) ----
+// ReviewVerdict 是 AI 二次审核的结论:accepted=收录;ignored=不符合收录标准(已自动
+// 置为忽略);deepen=有价值但没打穿,建议深挖。空串=尚未审核。
+export type ReviewVerdict = "accepted" | "ignored" | "deepen";
+
+// ReviewStats 是二次审核页顶部计数(整表聚合)。
+export interface ReviewStats {
+  total: number; // 已审(有结论)
+  accepted: number;
+  ignored: number;
+  deepen: number;
+  pending: number; // 开了审核但尚未出结论
+}
+
+// ReviewResult 是手动重审接口返回的结论。
+export interface ReviewResult {
+  finding_id: string;
+  verdict: ReviewVerdict;
+  severity?: Severity | "";
+  score?: number;
+  reasons?: string;
+  notes?: string;
+}
+
 // FindingStats 是发现全表聚合(统计卡 + 漏洞类型下拉),服务端计算,不受分页影响。
 export interface FindingStats {
   total: number;
@@ -588,6 +622,8 @@ export interface FindingQuery {
   sort?: "severity" | "time";
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
   assetScope?: string;
+  // 二次审核结论筛选;all/空 = 不筛选。pending = 开了审核但尚未出结论。
+  review?: "all" | "pending" | ReviewVerdict;
 }
 
 // ---- Findings by asset (资产视图) ----

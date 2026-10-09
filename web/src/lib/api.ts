@@ -77,6 +77,8 @@ import type {
   PendingScopeRow,
   PromptVar,
   PromptVersion,
+  ReviewResult,
+  ReviewStats,
   SessionExecResult,
   SessionFsEntry,
   SessionReadResult,
@@ -246,6 +248,7 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.review && q.review !== "all") p.set("review", q.review);
   return p;
 }
 
@@ -286,6 +289,8 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    reviewEnabled?: boolean;
+    reviewSrcType?: string;
     interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
@@ -300,6 +305,8 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      review_enabled: input.reviewEnabled ?? false, // 默认关;true=新漏洞自动进入 AI 二次审核
+      review_src_type: input.reviewSrcType ?? "edusrc", // 审核标准:edusrc(默认) | enterprise
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
@@ -583,6 +590,12 @@ export const api = {
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
   findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+  // ---- AI 二次审核 ----
+  // reviewStats 取二次审核页顶部计数(整表)。
+  reviewStats: () => get<ReviewStats>("/exploration/reviews/stats"),
+  // reviewFinding 手动重审一条漏洞(无视任务开关),同步返回审核结论。
+  reviewFinding: (id: string) =>
+    post<ReviewResult>(`/exploration/findings/${encodeURIComponent(id)}/review`, {}),
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {

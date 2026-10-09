@@ -525,6 +525,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
+    review_enabled BOOLEAN NOT NULL DEFAULT false,
+    review_src_type TEXT NOT NULL DEFAULT 'edusrc',
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -547,6 +549,10 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false
 -- 给 agent 开放 add_task_scope/list_untested_assets;false=全部关闭(见 task_scope.go)。
 -- 存量任务默认 true 保持原行为;company 关联(task_scope kind=company)不受此开关影响。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEFAULT true;
+-- 二次审核(参考 AutoHunter Reviewer);补旧库。true=该任务新登记的漏洞自动进入 AI 二次审核。
+-- review_src_type 决定审核标准:edusrc(EduSRC 严格收录标准)/ enterprise(企业 SRC 高价值影响)。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_src_type TEXT NOT NULL DEFAULT 'edusrc';
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.
@@ -1119,11 +1125,26 @@ CREATE TABLE IF NOT EXISTS findings (
     status      TEXT NOT NULL DEFAULT 'pending',
     -- 漏洞详细报告(Markdown)；默认空,仅详情页读取/展示,不进列表接口以免 payload 膨胀。
     report      TEXT NOT NULL DEFAULT '',
+    review_verdict  TEXT NOT NULL DEFAULT '',
+    review_severity TEXT NOT NULL DEFAULT '',
+    review_score    DOUBLE PRECISION,
+    review_reasons  TEXT NOT NULL DEFAULT '',
+    review_notes    TEXT NOT NULL DEFAULT '',
+    reviewed_at     TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- AI 二次审核结论(参考 AutoHunter Reviewer):review_verdict 取值 ''(未审)/accepted/ignored/deepen。
+-- ignored 时由 server 自动把 status 置为 ignored,并把原因写进 review_reasons。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_verdict  TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_severity TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_score    DOUBLE PRECISION;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_reasons  TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_notes    TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS reviewed_at     TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_findings_review ON findings(review_verdict, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);

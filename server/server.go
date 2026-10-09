@@ -25,9 +25,9 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
-	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/session"
 	stagepkg "github.com/Autumn-27/artex/stage"
+	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/tunnel"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -57,6 +57,8 @@ type Server struct {
 	reverse   *PenelopeHandler    // 反弹 shell handler(期 5,见 reverse.go);nil = DB 未就绪
 	tickets   sseTicketStore      // SSE 一次性票据(F6,见 auth.go),零值可用
 	authkv    authKV              // auth 持久层注入(测试用);nil = 走 m.pg
+	// reviewer 是漏洞 AI 二次审核引擎(见 finding_review.go);nil = 未装配(DB 未就绪)。
+	reviewer *Reviewer
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -161,10 +163,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile: map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
+		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
-	s.initStage(dataDir) // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
+	s.initStage(dataDir)        // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
 	checkToolsManifest(dataDir) // 期 6 外部工具清单自检(缺失常态,只打汇总日志)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -251,6 +253,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingVerifier(); err != nil { // 反证验证 agent(需求二方案甲)
 			log.Printf("[verifier] seed: %v", err)
 		}
+		// 漏洞 AI 二次审核引擎(参考 AutoHunter Reviewer)。与 Notifier/Scheduler 并列
+		// 独立:审核要调 LLM、慢且可能失败,不能拖慢证据落库;落库钩子只做入队。
+		s.reviewer = newReviewer(s)
+		go s.reviewer.Run(s.ctx)
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
@@ -769,8 +775,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
-	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)   // 期 4:待授权网段列表
-	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide) // 期 4:审批扩 scope
+	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)        // 期 4:待授权网段列表
+	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide)    // 期 4:审批扩 scope
 	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
@@ -811,11 +817,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/groups", s.findingGroups)
 	mux.HandleFunc("GET /api/exploration/findings/asset-tree", s.findingAssetTree)
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
+	mux.HandleFunc("GET /api/exploration/reviews/stats", s.reviewStats)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/review", s.reviewFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
@@ -1549,6 +1557,8 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	ReviewEnabled        *bool    `json:"review_enabled,omitempty"`    // 二次审核开关;省略/null=默认关(false)。开启后本任务新登记的漏洞自动进入 AI 二次审核,不合格的自动置为 ignored 并注明原因(见 finding_review.go)。
+	ReviewSrcType        string   `json:"review_src_type,omitempty"`   // 审核标准:edusrc(默认,EduSRC 严格收录)/ enterprise(企业 SRC 高价值影响)。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1607,6 +1617,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
+		ReviewEnabled:   req.ReviewEnabled != nil && *req.ReviewEnabled,
+		ReviewSrcType:   req.ReviewSrcType,
 		InterceptRules:  interceptRules,
 	})
 	if err != nil {

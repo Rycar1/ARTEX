@@ -20,18 +20,25 @@ type DBFinding struct {
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
-	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	ID        int64
+	TaskID    *int64
+	NodeID    *int64
+	VulnClass string
+	Name      string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity  string
+	Summary   string
+	Evidence  string
+	Worker    string
+	AssetIDs  []int64
+	Status    string
+	Report    string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	// AI 二次审核结论(见 server/finding_review.go)。ReviewVerdict 取值 ''/accepted/ignored/deepen。
+	ReviewVerdict   string
+	ReviewSeverity  string
+	ReviewScore     *float64
+	ReviewReasons   string
+	ReviewNotes     string
+	ReviewedAt      *time.Time
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
 }
@@ -105,7 +112,9 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+ (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
+	       COALESCE(f.review_verdict,''), COALESCE(f.review_severity,''), f.review_score,
+	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -118,7 +127,8 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -159,6 +169,9 @@ type FindingFilter struct {
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
+	// Review 是「二次审核」结论筛选:空=不过滤;pending=开了审核但还没审;
+	// accepted/ignored/deepen=按审核结论过滤。只在二次审核页用,与其它筛选正交。
+	Review string
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
 	assetIDs  []int64 // 子树里所有资产 id
@@ -212,6 +225,15 @@ func (f FindingFilter) where() (string, []any) {
 	case len(f.assetIDs) > 0:
 		args = append(args, assetIDContainments(f.assetIDs))
 		conds = append(conds, fmt.Sprintf("f.asset_ids @> ANY($%d::jsonb[])", len(args)))
+	}
+	// 二次审核结论筛选(见 finding_reviews.go 的 ReviewVerdict* 常量)。
+	switch f.Review {
+	case "pending":
+		// 与 ReviewStats.Pending 口径一致:只算「开了二次审核但尚未出结论」的漏洞。
+		conds = append(conds, "COALESCE(f.review_verdict,'') = '' AND COALESCE(t.review_enabled,false)")
+	case "accepted", "ignored", "deepen":
+		args = append(args, f.Review)
+		conds = append(conds, fmt.Sprintf("f.review_verdict = $%d", len(args)))
 	}
 	if query := strings.TrimSpace(f.Query); query != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
@@ -511,7 +533,9 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+			&f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -639,7 +663,9 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+		&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+		&f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

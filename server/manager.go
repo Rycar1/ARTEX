@@ -63,6 +63,8 @@ type Task struct {
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	ReviewEnabled        bool                   `json:"review_enabled"`         // 二次审核开关(创建时定,默认关);见 finding_review.go
+	ReviewSrcType        string                 `json:"review_src_type"`        // 审核标准:edusrc | enterprise
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
@@ -1132,7 +1134,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
-		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		ReviewEnabled:   pt.ReviewEnabled, ReviewSrcType: pt.ReviewSrcType,
+		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: g, notify: make(chan struct{}, 1),
 	}
 }

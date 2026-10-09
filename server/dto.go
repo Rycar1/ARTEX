@@ -61,6 +61,8 @@ type TaskDTO struct {
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ReviewEnabled      bool               `json:"review_enabled"`   // 二次审核开关(创建时定,默认关)
+	ReviewSrcType      string             `json:"review_src_type"`  // 审核标准:edusrc | enterprise
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -134,6 +136,8 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		ReviewEnabled:      t.ReviewEnabled,
+		ReviewSrcType:      t.ReviewSrcType,
 	}
 }
 
@@ -327,6 +331,16 @@ type FindingDTO struct {
 	Inherited       bool              `json:"inherited,omitempty"`
 	Assets          []FindingAssetDTO `json:"assets,omitempty"`
 	TS              string            `json:"ts"`
+
+	// AI 二次审核结论(参考 AutoHunter Reviewer,见 server/finding_review.go)。
+	// review_verdict 取值 ''(未审)/accepted/ignored/deepen;ignored 的漏洞会被
+	// 自动置为 status=ignored,原因写在 review_reasons。
+	ReviewVerdict  string   `json:"review_verdict,omitempty"`
+	ReviewSeverity string   `json:"review_severity,omitempty"`
+	ReviewScore    *float64 `json:"review_score,omitempty"`
+	ReviewReasons  string   `json:"review_reasons,omitempty"`
+	ReviewNotes    string   `json:"review_notes,omitempty"`
+	ReviewedAt     string   `json:"reviewed_at,omitempty"`
 }
 
 // FindingAssetDTO is one asset a finding is anchored to, pre-labelled for display.
@@ -456,6 +470,14 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		Evidence:  f.Evidence,
 		Report:    f.Report,
 		TS:        rfc3339(f.CreatedAt),
+	}
+	d.ReviewVerdict = f.ReviewVerdict
+	d.ReviewSeverity = f.ReviewSeverity
+	d.ReviewScore = f.ReviewScore
+	d.ReviewReasons = f.ReviewReasons
+	d.ReviewNotes = f.ReviewNotes
+	if f.ReviewedAt != nil {
+		d.ReviewedAt = rfc3339(*f.ReviewedAt)
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {

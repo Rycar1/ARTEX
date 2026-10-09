@@ -37,6 +37,8 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Query:      q.Get("q"),
 		Sort:       q.Get("sort"),
 		AssetScope: strings.TrimSpace(q.Get("asset_scope")),
+		// review=二次审核结论筛选(pending/accepted/ignored/deepen);见 finding_reviews.go。
+		Review: normFilter(q.Get("review")),
 	}
 }
 

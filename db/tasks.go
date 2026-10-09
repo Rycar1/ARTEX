@@ -50,6 +50,12 @@ type Task struct {
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled bool `json:"coverage_enabled"`
+	// ReviewEnabled 是「二次审核」总开关(默认 false)。true 时本任务新登记的漏洞自动
+	// 进入 AI 二次审核(参考 AutoHunter Reviewer),按 ReviewSrcType 选定的 SRC 收录标准
+	// 判定;不合格的自动置为 ignored 并注明原因。见 server/finding_review.go。
+	ReviewEnabled bool `json:"review_enabled"`
+	// ReviewSrcType 是审核标准:edusrc(EduSRC 严格标准)/ enterprise(企业 SRC 高价值影响)。
+	ReviewSrcType string `json:"review_src_type"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -157,6 +163,10 @@ type TaskCreateOptions struct {
 	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
+	// ReviewEnabled 是「二次审核」开关;零值=默认关(false)。仅创建时可显式开启。
+	ReviewEnabled bool
+	// ReviewSrcType 是审核标准类型;空=默认 edusrc(见 NormalizeReviewSrcType)。
+	ReviewSrcType string
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
 }
@@ -201,6 +211,7 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	}
 	opts.PlanHeartbeatSeconds = normalizeHeartbeat(opts.PlanHeartbeatSeconds)
 	coverageEnabled := opts.CoverageEnabled == nil || *opts.CoverageEnabled
+	reviewSrcType := NormalizeReviewSrcType(opts.ReviewSrcType)
 	var categoryName string
 	if opts.CategoryID != nil {
 		if *opts.CategoryID <= 0 {
@@ -227,11 +238,12 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled,
+		ReviewEnabled:   opts.ReviewEnabled, ReviewSrcType: reviewSrcType,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, review_enabled, review_src_type)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.ReviewEnabled, reviewSrcType).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -347,11 +359,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), COALESCE(review_enabled,false), COALESCE(review_src_type,'edusrc'), first_run_at, deadline_at`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ReviewEnabled, &t.ReviewSrcType, &t.FirstRunAt, &t.DeadlineAt); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
