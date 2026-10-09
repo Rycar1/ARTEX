@@ -311,7 +311,7 @@ ON CONFLICT (name) DO NOTHING`,
 	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
-}
+	}
 	if err := d.seedDefaultInterceptRulesV4(); err != nil {
 		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
@@ -323,6 +323,9 @@ ON CONFLICT (name) DO NOTHING`,
 	}
 	if err := d.seedDefaultInterceptRulesV7(); err != nil {
 		return fmt.Errorf("seed intercept rules v7: %w", err)
+	}
+	if err := d.seedBuiltinTaskTemplates(); err != nil {
+		return fmt.Errorf("seed builtin task templates: %w", err)
 	}
 	return nil
 }

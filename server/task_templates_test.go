@@ -161,3 +161,54 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		t.Fatalf("oversized conversation create status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestBuiltinTaskTemplateProtectedOverHTTP(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	h := s.Handler()
+	token, err := signJWT(s.jwtKey, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(method, path string, body any) (int, map[string]any) {
+		var data []byte
+		if body != nil {
+			data, _ = json.Marshal(body)
+		}
+		req := httptest.NewRequest(method, path, bytes.NewReader(data))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+
+	templates, err := m.pg.ListTaskTemplates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builtin *db.TaskTemplate
+	for _, tpl := range templates {
+		if tpl.Builtin {
+			builtin = tpl
+			break
+		}
+	}
+	if builtin == nil {
+		t.Fatal("no built-in task template found")
+	}
+
+	code, _ := do(http.MethodDelete, fmt.Sprintf("/api/task-templates/%d", builtin.ID), nil)
+	if code != http.StatusConflict {
+		t.Fatalf("delete builtin status=%d, want %d", code, http.StatusConflict)
+	}
+	code, _ = do(http.MethodPatch, fmt.Sprintf("/api/task-templates/%d", builtin.ID), map[string]any{"name": "renamed-builtin"})
+	if code != http.StatusConflict {
+		t.Fatalf("rename builtin status=%d, want %d", code, http.StatusConflict)
+	}
+}

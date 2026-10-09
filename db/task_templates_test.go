@@ -129,3 +129,60 @@ func TestTaskTemplateDisjointPatchesCompose(t *testing.T) {
 		t.Fatalf("disjoint patches lost an update: %+v", got)
 	}
 }
+
+func TestBuiltinTaskTemplatesSeededAndProtected(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+
+	listed, err := d.ListTaskTemplates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ctf, src *TaskTemplate
+	for _, tpl := range listed {
+		switch tpl.Name {
+		case "CTF":
+			ctf = tpl
+		case "SRC":
+			src = tpl
+		}
+	}
+	if ctf == nil || !ctf.Builtin {
+		t.Fatalf("CTF builtin template missing: %+v", ctf)
+	}
+	if src == nil || !src.Builtin {
+		t.Fatalf("SRC builtin template missing: %+v", src)
+	}
+	if !strings.Contains(src.Goal, "边界") {
+		t.Fatalf("SRC goal lost its boundary emphasis")
+	}
+
+	// built-in presets cannot be deleted
+	if _, err := d.DeleteTaskTemplate(ctf.ID); !errors.Is(err, ErrTaskTemplateBuiltin) {
+		t.Fatalf("delete builtin err = %v, want %v", err, ErrTaskTemplateBuiltin)
+	}
+	if got, _ := d.GetTaskTemplate(ctf.ID); got == nil {
+		t.Fatal("builtin template was deleted")
+	}
+
+	// built-in presets cannot be renamed
+	renamed := "CTF-renamed"
+	if _, err := d.PatchTaskTemplate(ctf.ID, TaskTemplatePatch{Name: &renamed}); !errors.Is(err, ErrTaskTemplateBuiltin) {
+		t.Fatalf("rename builtin err = %v, want %v", err, ErrTaskTemplateBuiltin)
+	}
+
+	// but description/goal stay editable; restore via defer so it runs before d.Close()
+	originalDesc := ctf.Description
+	defer func() { _, _ = d.PatchTaskTemplate(ctf.ID, TaskTemplatePatch{Description: &originalDesc}) }()
+	desc := "custom description"
+	if _, err := d.PatchTaskTemplate(ctf.ID, TaskTemplatePatch{Description: &desc}); err != nil {
+		t.Fatalf("edit builtin description: %v", err)
+	}
+	got, err := d.GetTaskTemplate(ctf.ID)
+	if err != nil || got == nil || got.Description != desc {
+		t.Fatalf("builtin description not updated: %+v %v", got, err)
+	}
+}

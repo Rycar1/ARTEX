@@ -1315,6 +1315,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       name,
       description,
       goal,
+      builtin: false,
       created_at: now,
       updated_at: now,
     };
@@ -1325,6 +1326,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const template = mockTaskTemplates.find((item) => item.id === Number(seg[1]));
     if (!template) return {};
     const name = typeof b.name === "string" ? normalizedTemplateName(b.name) : template.name;
+    if (template.builtin && name.toLowerCase() !== normalizedTemplateName(template.name).toLowerCase()) {
+      throw new Error("内置模板不可改名");
+    }
     const description = typeof b.description === "string" ? b.description.trim() : template.description;
     const goal = typeof b.goal === "string" ? b.goal.trim() : template.goal;
     if (!name || !description || !goal) throw new Error("请填写模板名称、描述和目标");
@@ -1345,6 +1349,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "task-templates" && seg.length === 2 && m === "DELETE") {
     const id = Number(seg[1]);
     const index = mockTaskTemplates.findIndex((item) => item.id === id);
+    if (index >= 0 && mockTaskTemplates[index].builtin) {
+      throw new Error("内置模板不可删除");
+    }
     if (index >= 0) mockTaskTemplates.splice(index, 1);
     return { deleted: id };
   }
