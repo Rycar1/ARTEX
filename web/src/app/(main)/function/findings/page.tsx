@@ -10,6 +10,7 @@ import {
   ChevronRightIcon,
   ClockIcon,
   DownloadIcon,
+  GitMergeIcon,
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
@@ -253,6 +254,12 @@ export default function FindingsPage() {
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
   const [exportFormat, setExportFormat] = React.useState<"md-single" | "md-zip" | "csv" | "json">("md-single");
   const [exporting, setExporting] = React.useState(false);
+  // 四层去重:人工合并弹窗。mergeItems 是勾选项的最新详情(打开时按 id 拉取),
+  // mergeTargetId 是「保留哪一条作为主漏洞」的选择。
+  const [mergeOpen, setMergeOpen] = React.useState(false);
+  const [mergeItems, setMergeItems] = React.useState<Finding[]>([]);
+  const [mergeTargetId, setMergeTargetId] = React.useState<string>("");
+  const [merging, setMerging] = React.useState(false);
 
   const toggleSelected = React.useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
@@ -726,6 +733,64 @@ export default function FindingsPage() {
     [refreshAfterMutation, setFindings],
   );
 
+  // dismissDuplicate 人工判定「不是重复」:清掉疑似重复标记,徽标随之消失。
+  const dismissDuplicate = React.useCallback(
+    async (f: Finding) => {
+      const id = f.finding_id;
+      if (!id) return;
+      try {
+        await api.dismissFindingDuplicate(id);
+        setFindings((cur) =>
+          cur.map((x) =>
+            isSameFinding(x, f) ? { ...x, suspected_dup_of: undefined, suspected_dup_score: undefined } : x,
+          ),
+        );
+        toast.success("已标记为不是重复");
+      } catch (e) {
+        toast.error(`操作失败：${(e as Error).message}`);
+      }
+    },
+    [setFindings],
+  );
+
+  // openMerge 打开人工合并弹窗:按勾选的 finding_id 拉最新详情,默认保留第一条。
+  async function openMerge() {
+    const ids = [...selectedIds];
+    if (ids.length < 2) return;
+    try {
+      const items = await Promise.all(ids.map((id) => api.getFinding(id)));
+      setMergeItems(items);
+      setMergeTargetId(items[0]?.finding_id ?? items[0]?.id ?? "");
+      setMergeOpen(true);
+    } catch (e) {
+      toast.error(`加载勾选漏洞失败：${(e as Error).message}`);
+    }
+  }
+
+  // submitMerge 把其余勾选项合并进主漏洞(目标吸收严重度/证据,source 置重复)。
+  async function submitMerge() {
+    const target = mergeTargetId;
+    if (!target) return;
+    const sources = mergeItems
+      .map((f) => f.finding_id ?? f.id)
+      .filter((id) => id && id !== target);
+    if (sources.length === 0) return;
+    setMerging(true);
+    try {
+      const res = await api.mergeFindings(sources, target);
+      toast.success(`已合并 ${res.merged.length} 条到 #${res.target_id}`);
+      setMergeOpen(false);
+      setSelectedIds(new Set());
+      setExpanded(null);
+      const targetFinding = mergeItems.find((f) => (f.finding_id ?? f.id) === target);
+      if (targetFinding) refreshAfterMutation(targetFinding);
+    } catch (e) {
+      toast.error(`合并失败：${(e as Error).message}`);
+    } finally {
+      setMerging(false);
+    }
+  }
+
   const openDeepen = React.useCallback((f: Finding) => {
     setDeepenFinding(f);
     setDeepenDescription("");
@@ -784,6 +849,7 @@ export default function FindingsPage() {
     activeRetests,
     onDeepen: openDeepen,
     onDelete: deleteFinding,
+    onDismissDuplicate: dismissDuplicate,
   };
 
   // 平铺视图与资产视图右侧是同一张表 + 同一份分页,只是筛选条件不同。
@@ -952,6 +1018,11 @@ export default function FindingsPage() {
           <div className="ml-auto flex items-center gap-3">
             {selectedIds.size > 0 && (
               <span className="text-xs text-muted-foreground tabular-nums">已选 {selectedIds.size} 条</span>
+            )}
+            {selectedIds.size >= 2 && (
+              <Button size="sm" variant="outline" onClick={() => void openMerge()}>
+                <GitMergeIcon /> 合并重复
+              </Button>
             )}
             <Button size="sm" variant="outline" onClick={openExport}>
               <DownloadIcon /> 导出
@@ -1254,6 +1325,71 @@ export default function FindingsPage() {
             </Button>
             <Button onClick={doExport} disabled={exporting || (exportScope === "selected" && selectedIds.size === 0)}>
               <DownloadIcon /> {exporting ? "导出中…" : "导出"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={mergeOpen}
+        onOpenChange={(open) => {
+          if (!merging) setMergeOpen(open);
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>合并重复漏洞</DialogTitle>
+            <DialogDescription>
+              选择保留哪一条作为主漏洞，其余 {Math.max(0, mergeItems.length - 1)}
+              条会被标记为「重复」并并入主漏洞的严重度与证据（原文保留在证据里，可追溯）。
+            </DialogDescription>
+          </DialogHeader>
+          <RadioGroup
+            value={mergeTargetId}
+            onValueChange={setMergeTargetId}
+            className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto py-1"
+          >
+            {mergeItems.map((f) => {
+              const id = f.finding_id ?? f.id;
+              return (
+                <label
+                  key={id}
+                  htmlFor={`merge-target-${id}`}
+                  className={cn(
+                    "flex cursor-pointer items-start gap-3 rounded-md border p-3 text-sm",
+                    id === mergeTargetId && "border-primary bg-accent/40",
+                  )}
+                >
+                  <RadioGroupItem id={`merge-target-${id}`} value={id} className="mt-0.5" />
+                  <div className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="flex flex-wrap items-center gap-2 font-medium">
+                      <span className="truncate">{f.name || f.vulnclass || "未分类"}</span>
+                      <span className="shrink-0 text-xs text-muted-foreground">#{id}</span>
+                      <StatusBadge domain="severity" value={f.severity} dot />
+                    </span>
+                    <span className="line-clamp-2 text-xs text-muted-foreground">{f.summary}</span>
+                    {f.assets && f.assets.length > 0 && (
+                      <span className="flex flex-wrap gap-1">
+                        {f.assets.slice(0, 3).map((a) => (
+                          <code key={a.id} className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                            {a.label}
+                          </code>
+                        ))}
+                      </span>
+                    )}
+                  </div>
+                  {id === mergeTargetId && <span className="ml-auto shrink-0 text-xs text-primary">保留此条</span>}
+                </label>
+              );
+            })}
+          </RadioGroup>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMergeOpen(false)} disabled={merging}>
+              取消
+            </Button>
+            <Button onClick={submitMerge} disabled={merging || !mergeTargetId}>
+              <GitMergeIcon data-icon="inline-start" />
+              {merging ? "合并中…" : "合并"}
             </Button>
           </DialogFooter>
         </DialogContent>

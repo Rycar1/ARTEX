@@ -18,6 +18,7 @@ const reviewJSONContract = `
   "score": 0 到 10 的数字(价值分,越高越值得收录),
   "in_scope": true 或 false,
   "is_duplicate": true 或 false,
+  "duplicate_of": 重复目标的 finding id(整数或字符串;不重复时填空字符串 ""),
   "reproduced": true 或 false,
   "ignore_reasons": ["...", "..."],
   "downgrade_reasons": ["...", "..."],
@@ -26,6 +27,9 @@ const reviewJSONContract = `
 约束:
 - verdict=ignored 时 ignore_reasons 至少一条,写清为什么不收录。
 - verdict=deepen 时 reviewer_notes 里写明「还差什么才能打穿」。
+- 判重只看输入里的「已有漏洞清单」:清单中确实存在同一个入口的同一个洞,才把 is_duplicate 填 true,
+  并在 duplicate_of 里填那一条的 id(只能用清单里出现过的 id)。清单里没有对应项就填 false,
+  duplicate_of 填空字符串。不要凭印象编造 id。
 - severity 填你审核后的最终严重度(可与上游自评不同)。
 - 拿不准时倾向 accepted,并在 reviewer_notes 里注明「证据不足,待人工确认」;
   只有明确命中下面的忽略清单才判 ignored。

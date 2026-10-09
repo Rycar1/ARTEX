@@ -42,6 +42,7 @@ import type {
   Finding,
   FindingAssetTree,
   FindingDeepenResponse,
+  FindingDuplicatesPage,
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
@@ -67,6 +68,7 @@ import type {
   LLMRetryPolicy,
   LLMTask,
   MCPServer,
+  MergeFindingsResult,
   MCPTool,
   MissingSkill,
   ModelTokenStat,
@@ -711,6 +713,21 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  // ---- 四层去重:人工合并 / 疑似重复(见 server/finding_dedup.go)----
+  // mergeFindings 把勾选的 source 合并进 target(目标吸收严重度/证据,source 置 duplicate)。
+  mergeFindings: (sourceIds: string[], targetId: string) =>
+    post<MergeFindingsResult>("/exploration/findings/merge", { source_ids: sourceIds, target_id: targetId }),
+  // findingsDuplicates 取「疑似重复 / 已合并」分组(taskId 为空=全部任务)。
+  findingsDuplicates: (taskId?: string, limit = 200) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (taskId) p.set("task_id", taskId);
+    return get<FindingDuplicatesPage>(`/exploration/findings/duplicates?${p.toString()}`).then((r) =>
+      arr(r.items),
+    );
+  },
+  // dismissFindingDuplicate 人工判定「不是重复」:清掉疑似重复标记。
+  dismissFindingDuplicate: (id: string) =>
+    post<{ ok: boolean; id: number }>(`/exploration/findings/${encodeURIComponent(id)}/dismiss-duplicate`, {}),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),

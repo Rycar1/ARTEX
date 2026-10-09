@@ -106,6 +106,8 @@ interface FindingsTableProps {
   activeRetests: Record<string, ActiveFindingRetest>;
   onDeepen: (finding: Finding) => void;
   onDelete: (finding: Finding) => void;
+  // onDismissDuplicate 人工判定「不是重复」,清掉疑似重复标记(第四层去重)。
+  onDismissDuplicate?: (finding: Finding) => void;
   /** 全选框的无障碍标签,平铺视图与分组视图措辞不同。 */
   selectAllLabel?: string;
 }
@@ -129,6 +131,7 @@ export function FindingsTable({
   activeRetests,
   onDeepen,
   onDelete,
+  onDismissDuplicate,
   selectAllLabel = "选择当前页全部",
 }: FindingsTableProps) {
   const selectableIds = items.map((finding) => finding.finding_id).filter((id): id is string => Boolean(id));
@@ -213,7 +216,45 @@ export function FindingsTable({
                       <span className="truncate font-medium">{f.name || f.vulnclass || "未分类"}</span>
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
-                    <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
+                      {f.merged_into ? (
+                        <Badge
+                          variant="secondary"
+                          title={`这条已被人工合并到漏洞 #${f.merged_into}`}
+                        >
+                          已合并 → #{f.merged_into}
+                        </Badge>
+                      ) : null}
+                      {!f.merged_into && f.suspected_dup_of ? (
+                        <>
+                          <Badge
+                            variant="outline"
+                            className="border-amber-500/60 text-amber-600 dark:text-amber-500"
+                            title={
+                              f.suspected_dup_score != null
+                                ? `疑似与漏洞 #${f.suspected_dup_of} 重复(相似度 ${(f.suspected_dup_score * 100).toFixed(0)}%)`
+                                : `疑似与漏洞 #${f.suspected_dup_of} 重复`
+                            }
+                          >
+                            疑似重复 #{f.suspected_dup_of}
+                          </Badge>
+                          {onDismissDuplicate && (
+                            <button
+                              type="button"
+                              className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                              title="标记为不是重复,清除该提示"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDismissDuplicate(f);
+                              }}
+                            >
+                              不是重复
+                            </button>
+                          )}
+                        </>
+                      ) : null}
+                    </div>
                   </div>
                 </TableCell>
                 <TableCell>

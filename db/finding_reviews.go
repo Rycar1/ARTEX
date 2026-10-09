@@ -80,6 +80,9 @@ type FindingReview struct {
 	Score    *float64 // 0-10 价值分;nil=未给
 	Reasons  string   // 忽略/降级原因(多条以换行连接);ignored 时必填
 	Notes    string   // 审核员备注
+	// DuplicateOf 是审核模型指认的重复目标 finding id(四层去重第三层)。
+	// 非空时只打 suspected_dup_of 标记,不自动合并;nil = 模型没指认。
+	DuplicateOf *int64
 }
 
 // SetFindingReview 写入一次审核结论,并把 reviewed_at 置为 now()。

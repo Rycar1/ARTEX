@@ -526,7 +526,43 @@ export interface Finding {
   review_reasons?: string;
   review_notes?: string;
   reviewed_at?: string;
+  // 四层去重(见 db/finding_dedup.go / db/finding_merge_manual.go)。
+  // merged_into 非空 = 这条已被人工合并到该 finding(状态同时为 duplicate);
+  // suspected_dup_of = 审核模型/结构化键指认的疑似重复目标,等待人工确认。
+  merged_into?: string;
+  suspected_dup_of?: string;
+  suspected_dup_score?: number;
   ts: string;
+}
+
+// FindingDupMember 是「疑似重复 / 已合并」分组里的一条(见 db/finding_merge_manual.go)。
+export interface FindingDupMember {
+  id: string;
+  vulnclass: string;
+  name?: string;
+  status: FindingStatus;
+  score?: number;
+  merged: boolean;
+}
+
+// FindingDupGroup 是「同一目标 + 若干疑似/已合并成员」的一组。
+export interface FindingDupGroup {
+  target_id: string;
+  vulnclass: string;
+  name?: string;
+  status: FindingStatus;
+  members: FindingDupMember[];
+}
+
+export interface FindingDuplicatesPage {
+  items: FindingDupGroup[];
+}
+
+// MergeFindingsResult 是人工合并的结果:实际并入的 source 与跳过的 source。
+export interface MergeFindingsResult {
+  target_id: string;
+  merged: string[];
+  skipped: string[];
 }
 
 // FindingsPage 是发现列表的服务端分页响应。

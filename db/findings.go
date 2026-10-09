@@ -39,6 +39,12 @@ type DBFinding struct {
 	ReviewReasons   string
 	ReviewNotes     string
 	ReviewedAt      *time.Time
+	// 去重(四层方案,见 db/finding_dedup.go / db/finding_merge.go):
+	DedupKey          string   // 结构化合并键(归一化类别 + 主资产/弱锚)
+	Fingerprint       string   // 归一化正文 SHA-1
+	MergedInto        *int64   // 本行已被合并到哪条 finding(被合并时非空)
+	SuspectedDupOf    *int64   // 疑似与哪条 finding 重复(未自动合并时)
+	SuspectedDupScore *float64 // 疑似重复的相似度(0~1)
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
 }
@@ -98,11 +104,16 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if nodeID > 0 {
 		nid = &nodeID
 	}
+	// 记录结构化合并键与文本指纹:本函数刻意不做合并(保持裸插入语义,测试与
+	// 旁路调用依赖它一次调用一行),但落下的键让后续 report_finding 能命中并
+	// 合并进来,也让相似度扫描能把它当候选。
+	key := FindingDedupKey(vulnclass, assetIDs, FindingComparableText(vulnclass, name, summary, evidence))
+	fp := FindingFingerprint(vulnclass, name, summary, evidence)
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, dedup_key, fingerprint)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), key, fp,
 	).Scan(&id)
 	return id, err
 }
@@ -114,7 +125,9 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
  (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
 	       COALESCE(f.review_verdict,''), COALESCE(f.review_severity,''), f.review_score,
-	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at`
+	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at,
+	       COALESCE(f.dedup_key,''), COALESCE(f.fingerprint,''), f.merged_into,
+	       f.suspected_dup_of, f.suspected_dup_score`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -128,7 +141,8 @@ func scanFindings(rows interface {
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
-			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt); err != nil {
+			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -535,6 +549,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
 			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
 			&f.Report); err != nil {
 			return nil, err
 		}
@@ -665,6 +680,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
 		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 		&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+		&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
 		&f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil

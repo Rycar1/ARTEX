@@ -23,8 +23,19 @@ import (
 // 进来的证据段仍留在 evidence 里可审计。终态(fixed/false_positive/duplicate
 // 等)仍排除,不污染聚合。
 //
+// 合并键(四层方案第一层,见 db/finding_dedup.go):
+//   dedup_key = 归一化 vulnclass + "|a" + 主资产 id,主资产缺失时退化为
+//               + "|h" + 正文里第一个 URL 的 host(弱锚,只认带 scheme 的 URL 或裸 IP)。
+//   因此 AssetIDs 为空不再让合并整体失效 —— 只要正文里出现过目标 URL 就能判等。
+//
+// 终态行(已修复/误报/重复/忽略/风险接受)不自动合并(避免把人工结论反复推翻),
+// 但会在新行上打 suspected_dup_of「疑似重复」标记,由人工或二次审核裁决。
+// 跨任务默认不自动合并(见 FindingDedupCrossTask):静默跨任务合并会让漏洞从原
+// 任务的发现页消失,风险高于收益。
+//
 // 不参与合并的情形(均落回原有新建路径):
-//   - 无 task(TaskID<=0)或无主资产(AssetIDs 为空)——合并键不完整;
+//   - 无 task(TaskID<=0)——合并键不完整;
+//   - 既无主资产、正文里也抽不出弱锚——合并键为空;
 //   - 候选 status 为终态(fixed/false_positive/duplicate 等);
 //   - 候选无探索节点(node_id IS NULL)——合并必须保持 1节点↔1行 契约。
 
@@ -221,6 +232,11 @@ func mergeFindingFields(old DBFinding, in RecordFindingInput, now time.Time) (se
 	if iv, ov := strings.TrimSpace(in.VulnClass), strings.TrimSpace(old.VulnClass); iv != "" && ov != "" && iv != ov {
 		drift = fmt.Sprintf(", 本次 vulnclass 原文 %q", iv)
 	}
+	// 跨任务自动合并(ARTEX_FINDING_DEDUP_CROSS_TASK=1)时把来源任务写进段标记,
+	// 否则「这条漏洞到底是谁报的」在合并后无从追溯。
+	if old.TaskID != nil && *old.TaskID != in.TaskID {
+		drift += fmt.Sprintf(", 来源任务 #%d", in.TaskID)
+	}
 	appended := false
 	if ns := strings.TrimSpace(in.Summary); ns != "" && ns != strings.TrimSpace(old.Summary) {
 		if s := strings.TrimSpace(old.Summary); s != "" {
@@ -240,47 +256,183 @@ func mergeFindingFields(old DBFinding, in RecordFindingInput, now time.Time) (se
 	return
 }
 
-// findMergeCandidateTx 在事务内(调用方须已持任务级证据锁)查可合并的既有
-// finding:同 task、status IN ('confirmed','pending')(终态排除,依据见文件头
-// 注释)、归一化 vulnclass 相同、主资产对等(候选 asset_ids->0 = 输入 AssetIDs
-// 第一个)、且有探索节点。命中多行时取最新一条。
-// 主资产对等而非包含:候选 [ep,svc] 与输入 [svc] 不是同一入口(svc 只是候选的
-// 次资产),包含判等会把挂在 service 上的异入口漏洞误并进来;[ep,svc] 与 [ep]
-// 主资产相同,仍正确合并。asset_ids 为空或输入主资产为空时 ->0 为 NULL,天然
-// 不参与合并。
-func findMergeCandidateTx(tx *sql.Tx, in RecordFindingInput) (*DBFinding, error) {
-	if in.TaskID <= 0 || len(in.AssetIDs) == 0 {
-		return nil, nil
+// findMergeCandidateTx 在事务内查可自动合并的既有 finding。
+// 调用方须已持任务级证据锁(LockTaskEvidenceTx)与合并键咨询锁(见 RecordFindingTx)。
+//
+// 判定顺序(命中即返回;同任务优先,其次最新):
+//   - 结构化合并键相同 + 活跃(pending/confirmed) + 有探索节点 → 合并;
+//     跨任务命中仅当 FindingDedupCrossTask 打开;
+//   - 旧行兼容:同任务 + 归一化类别相同 + 主资产对等 + 活跃 + 有探索节点 → 合并
+//     (dedup_key 是后加的列,历史行可能为空,靠这条兜住)。
+//
+// 终态行(已修复/误报/重复/忽略/风险接受)不自动合并,作为第二个返回值交给调用方
+// 在新行上打 suspected_dup_of 标记。
+func findMergeCandidateTx(tx *sql.Tx, in RecordFindingInput, key string) (*DBFinding, *DBFinding, error) {
+	if in.TaskID <= 0 {
+		return nil, nil, nil
 	}
 	want := NormalizeVulnClass(in.VulnClass)
-	rows, err := tx.Query(`SELECT id, node_id, vulnclass, severity, summary, evidence
+	var merge, terminal *DBFinding
+
+	if key != "" {
+		rows, err := tx.Query(`SELECT id, task_id, node_id, vulnclass, severity, summary, evidence, COALESCE(status,'pending')
+FROM findings
+WHERE dedup_key = $1 AND node_id IS NOT NULL
+ORDER BY (task_id IS NOT DISTINCT FROM $2::bigint) DESC, id DESC
+LIMIT 20
+FOR UPDATE`, key, in.TaskID)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var f DBFinding
+			if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Severity, &f.Summary, &f.Evidence, &f.Status); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			sameTask := f.TaskID != nil && *f.TaskID == in.TaskID
+			active := f.Status == FindingPending || f.Status == FindingConfirmed
+			if active && (sameTask || FindingDedupCrossTask) {
+				if merge == nil {
+					cp := f
+					merge = &cp
+				}
+				continue
+			}
+			if terminal == nil {
+				cp := f
+				terminal = &cp
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		if merge != nil {
+			return merge, terminal, nil
+		}
+	}
+
+	// 旧行兼容:同任务 + 同归一化类别 + 主资产对等。
+	// 主资产对等而非包含:候选 [ep,svc] 与输入 [svc] 不是同一入口(svc 只是候选的
+	// 次资产),包含判等会把挂在 service 上的异入口漏洞误并进来。
+	if len(in.AssetIDs) > 0 {
+		rows, err := tx.Query(`SELECT id, task_id, node_id, vulnclass, severity, summary, evidence, COALESCE(status,'pending')
 FROM findings
 WHERE task_id=$1 AND status IN ($2, $3) AND node_id IS NOT NULL
   AND asset_ids->0 = to_jsonb($4::bigint)
 ORDER BY id DESC
 FOR UPDATE`, in.TaskID, FindingConfirmed, FindingPending, in.AssetIDs[0])
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var f DBFinding
-		if err := rows.Scan(&f.ID, &f.NodeID, &f.VulnClass, &f.Severity, &f.Summary, &f.Evidence); err != nil {
-			return nil, err
+		if err != nil {
+			return nil, nil, err
 		}
-		if NormalizeVulnClass(f.VulnClass) == want {
-			return &f, rows.Err()
+		for rows.Next() {
+			var f DBFinding
+			if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Severity, &f.Summary, &f.Evidence, &f.Status); err != nil {
+				rows.Close()
+				return nil, nil, err
+			}
+			if merge == nil && NormalizeVulnClass(f.VulnClass) == want {
+				cp := f
+				merge = &cp
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, nil, err
 		}
 	}
-	return nil, rows.Err()
+	return merge, terminal, nil
 }
+
+// markSuspectedDuplicateTx 在新插入的行上打「疑似重复」标记(只标记,不合并)。
+//
+// 候选来源两处,取相似度最高的一条:
+//   - 结构化同键的终态行(已修复/误报/忽略/风险接受/重复)——结构上确定同入口,
+//     分数取 max(正文相似度, 阈值),保证一定过线;
+//   - 同任务或同主资产、同 dedup_key 的近期行,按归一化正文的 bigram Dice 取最高。
+//
+// 这是启发式增强:任何失败都只放弃标记、返回错误由调用方忽略,绝不因此丢掉刚写入
+// 的漏洞。命中阈值见 FindingDupSimilarityThreshold。
+func markSuspectedDuplicateTx(tx *sql.Tx, findingID int64, in RecordFindingInput, key string, terminal *DBFinding) (int64, float64, error) {
+	myText := FindingComparableText(in.VulnClass, in.Name, in.Summary, in.Evidence)
+	bestID, bestScore := int64(0), 0.0
+	consider := func(id int64, text string, floor float64) {
+		if id <= 0 || id == findingID {
+			return
+		}
+		score := FindingSimilarity(myText, text)
+		if score < floor {
+			score = floor
+		}
+		if id == bestID && score <= bestScore {
+			return
+		}
+		if score > bestScore {
+			bestID, bestScore = id, score
+		}
+	}
+	if terminal != nil && terminal.ID != findingID {
+		consider(terminal.ID, FindingComparableText(terminal.VulnClass, terminal.Name, terminal.Summary, terminal.Evidence), FindingDupSimilarityThreshold)
+	}
+
+	var primary int64
+	if len(in.AssetIDs) > 0 {
+		primary = in.AssetIDs[0]
+	}
+	rows, err := tx.Query(`SELECT id, vulnclass, name, summary, evidence
+FROM findings
+WHERE id <> $1
+  AND COALESCE(status,'') <> $4
+  AND merged_into IS NULL
+  AND ( ($2::bigint > 0 AND asset_ids @> to_jsonb(ARRAY[$2::bigint]))
+     OR ($3::bigint > 0 AND task_id = $3)
+     OR ($5 <> '' AND dedup_key = $5) )
+ORDER BY created_at DESC, id DESC
+LIMIT $6`, findingID, primary, in.TaskID, FindingDuplicate, key, findingDupCandidateLimit)
+	if err != nil {
+		return 0, 0, err
+	}
+	for rows.Next() {
+		var id int64
+		var vc, nm, sum, ev string
+		if err := rows.Scan(&id, &vc, &nm, &sum, &ev); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		consider(id, FindingComparableText(vc, nm, sum, ev), 0)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, 0, err
+	}
+	if bestID == 0 || bestScore < FindingDupSimilarityThreshold {
+		return 0, 0, nil
+	}
+	if _, err := tx.Exec(`UPDATE findings SET suspected_dup_of=$2, suspected_dup_score=$3 WHERE id=$1`,
+		findingID, bestID, bestScore); err != nil {
+		return 0, 0, err
+	}
+	return bestID, bestScore, nil
+}
+
 
 // mergeFindingTx 执行合并:更新既有 finding 行与节点 payload,追加血缘边与
 // 流量快照,返回指向既有记录的 RecordedFinding(Merged=true)。
 func mergeFindingTx(tx *sql.Tx, cand *DBFinding, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
 	severity, summary, evidence := mergeFindingFields(*cand, in, time.Now())
-	if _, err := tx.Exec(`UPDATE findings SET severity=$2, summary=$3, evidence=$4 WHERE id=$1`,
-		cand.ID, severity, summary, evidence); err != nil {
+	key := FindingDedupKey(in.VulnClass, in.AssetIDs, FindingComparableText(in.VulnClass, in.Name, in.Summary, in.Evidence))
+	fp := FindingFingerprint(in.VulnClass, in.Name, in.Summary, in.Evidence)
+	// 合并键/指纹只在非空时覆盖,避免把既有键冲成空(合并进来的一次上报可能
+	// 没有 asset_ids 也没有 URL)。
+	if _, err := tx.Exec(`UPDATE findings SET severity=$2, summary=$3, evidence=$4,
+		dedup_key = CASE WHEN $5 <> '' THEN $5 ELSE dedup_key END,
+		fingerprint = CASE WHEN $6 <> '' THEN $6 ELSE fingerprint END
+		WHERE id=$1`,
+		cand.ID, severity, summary, evidence, key, fp); err != nil {
 		return nil, err
 	}
 	// 节点 payload 同步(与 setFindingCol 同款 jsonb_set),保持按任务 发现 Tab

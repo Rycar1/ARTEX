@@ -1151,6 +1151,21 @@ CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DE
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
 
+-- 漏洞去重(四层方案):写入时合并键 + 文本指纹 + 合并关系 + 疑似重复标记。
+-- 全部可空/默认空,旧行零迁移成本;dedup_key 与 fingerprint 由 Go 侧
+-- (db/finding_dedup.go)计算。刻意不加唯一约束:线上历史数据可能已存在同键多行,
+-- 建唯一索引会在启动期直接失败;并发双插由 RecordFindingTx 内的
+-- pg_advisory_xact_lock(合并键) 串行化兜底。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedup_key           TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint         TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS merged_into         BIGINT;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS suspected_dup_of    BIGINT;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS suspected_dup_score DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_findings_dedup_key ON findings(dedup_key) WHERE dedup_key <> '';
+CREATE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint) WHERE fingerprint <> '';
+CREATE INDEX IF NOT EXISTS idx_findings_merged_into ON findings(merged_into) WHERE merged_into IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_findings_suspected ON findings(suspected_dup_of) WHERE suspected_dup_of IS NOT NULL;
+
 -- 手动复测属于独立会话；结论与原漏洞处置状态分开保存。
 CREATE TABLE IF NOT EXISTS finding_retests (
     id BIGSERIAL PRIMARY KEY,

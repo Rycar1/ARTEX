@@ -112,3 +112,53 @@ func TestParseReviewJSONKeepsValidAccepted(t *testing.T) {
 		t.Fatalf("严重度应归一为 critical,得到 %q", got.Severity)
 	}
 }
+
+func TestParseReviewJSONCapturesDuplicateTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{"数字", `{"verdict":"accepted","is_duplicate":true,"duplicate_of":12}`, 12},
+		{"字符串", `{"verdict":"accepted","is_duplicate":true,"duplicate_of":"34"}`, 34},
+		{"带前缀文本", `{"verdict":"accepted","is_duplicate":true,"duplicate_of":"finding #56"}`, 56},
+		{"未指认", `{"verdict":"accepted","is_duplicate":true,"duplicate_of":""}`, 0},
+	}
+	for _, c := range cases {
+		got, err := parseReviewJSON(c.raw, db.ReviewSrcEduSRC)
+		if err != nil {
+			t.Fatalf("%s: 解析失败: %v", c.name, err)
+		}
+		if got.Verdict != db.ReviewVerdictIgnored {
+			t.Fatalf("%s: is_duplicate=true 应强制 ignored,得到 %q", c.name, got.Verdict)
+		}
+		if c.want == 0 {
+			if got.DuplicateOf != nil {
+				t.Fatalf("%s: 不该有重复目标,得到 %d", c.name, *got.DuplicateOf)
+			}
+			continue
+		}
+		if got.DuplicateOf == nil || *got.DuplicateOf != c.want {
+			t.Fatalf("%s: 重复目标应为 %d,得到 %v", c.name, c.want, got.DuplicateOf)
+		}
+	}
+}
+
+func TestParseReviewJSONNotDuplicateHasNoTarget(t *testing.T) {
+	got, err := parseReviewJSON(`{"verdict":"accepted","is_duplicate":false,"duplicate_of":""}`, db.ReviewSrcEnterprise)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if got.DuplicateOf != nil {
+		t.Fatalf("非重复不该有目标: %d", *got.DuplicateOf)
+	}
+}
+
+func TestApplyReviewFallbackKeepsDuplicateIgnored(t *testing.T) {
+	dup := int64(9)
+	f := &db.DBFinding{VulnClass: "RCE", Name: "命令注入", Evidence: "sleep 5 延时"}
+	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, DuplicateOf: &dup}
+	if got := applyReviewFallback(f, rev, db.ReviewSrcEduSRC); got.Verdict != db.ReviewVerdictIgnored {
+		t.Fatalf("已判重复不该被兜底转 deepen,得到 %q", got.Verdict)
+	}
+}

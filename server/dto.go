@@ -341,6 +341,13 @@ type FindingDTO struct {
 	ReviewReasons  string   `json:"review_reasons,omitempty"`
 	ReviewNotes    string   `json:"review_notes,omitempty"`
 	ReviewedAt     string   `json:"reviewed_at,omitempty"`
+
+	// 四层去重(见 db/finding_dedup.go / db/finding_merge_manual.go)。
+	// merged_into 非空表示这条已被合并到另一条;status 同时为 duplicate。
+	// suspected_dup_of 是审核模型/结构化键给出的「疑似重复」指向,等待人工确认。
+	MergedInto        string   `json:"merged_into,omitempty"`
+	SuspectedDupOf    string   `json:"suspected_dup_of,omitempty"`
+	SuspectedDupScore *float64 `json:"suspected_dup_score,omitempty"`
 }
 
 // FindingAssetDTO is one asset a finding is anchored to, pre-labelled for display.
@@ -479,6 +486,13 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 	if f.ReviewedAt != nil {
 		d.ReviewedAt = rfc3339(*f.ReviewedAt)
 	}
+	if f.MergedInto != nil {
+		d.MergedInto = i64s(*f.MergedInto)
+	}
+	if f.SuspectedDupOf != nil {
+		d.SuspectedDupOf = i64s(*f.SuspectedDupOf)
+	}
+	d.SuspectedDupScore = f.SuspectedDupScore
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
 		d.TaskID = i64s(*f.TaskID)
