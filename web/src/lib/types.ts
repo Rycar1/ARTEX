@@ -1719,6 +1719,8 @@ export interface IntranetNode {
   alive_sessions: number;
   /** 平台自身（回连端）节点，图上特殊标记。 */
   is_callback: boolean;
+  /** 该主机探测到的开放服务（来自资产 open_ports）；拓扑图在主机点外圈展开。 */
+  services?: { port: number; service?: string }[];
 }
 
 /** GET /api/intranet/topology 的边（隧道链路）。state: alive / stopped / error。 */
@@ -1812,6 +1814,8 @@ export interface Credential {
   created_at: string;
   /** 归属任务 id（后端 JSON number；0 = 未关联）。 */
   task_id?: number;
+  /** 归属主机（拓扑节点 id / 资产 id / IP），用于把凭据映射到主机。 */
+  host_asset_id?: string | number;
 }
 
 // Original execution selected from an approval, never submitted to the reviewer.

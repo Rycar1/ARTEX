@@ -193,6 +193,9 @@ export default function IntranetPage() {
           <div className="h-[46vh] min-h-[340px] w-full overflow-hidden rounded-xl">
             <TopologyGraph
               data={topology}
+              sessions={sessions}
+              tunnels={tunnels}
+              credentials={credentials}
               loading={loadingTopology}
               onRefresh={loadTopology}
               onSelectHost={onSelectHost}
