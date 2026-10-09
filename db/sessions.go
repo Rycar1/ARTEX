@@ -203,6 +203,24 @@ func (s *SessionStore) List(ctx context.Context, status string) ([]*SessionRecor
 	return out, rows.Err()
 }
 
+// ListByTask 返回某任务登记的全部立足点会话（按 id 升序，含 secret 明文）。
+func (s *SessionStore) ListByTask(ctx context.Context, taskID int64) ([]*SessionRecord, error) {
+	rows, err := s.d.QueryContext(ctx, `SELECT `+sessionCols+` FROM sessions WHERE created_by_task=$1 ORDER BY id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*SessionRecord{}
+	for rows.Next() {
+		r, err := s.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // UpdateStatus 更新 alive/dead 状态。
 func (s *SessionStore) UpdateStatus(ctx context.Context, id int64, status string) error {
 	if status != SessionAlive && status != SessionDead {

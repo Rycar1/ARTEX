@@ -211,6 +211,9 @@ function deleteDetails(result: DeleteCounts): string[] {
   if (result.files_deleted) details.push("删除任务文件");
   if (result.findings_deleted > 0) details.push(`删除漏洞 ${result.findings_deleted} 条`);
   if (result.llm_records_deleted > 0) details.push(`删除 LLM 请求/响应记录 ${result.llm_records_deleted} 条`);
+  if (result.sessions_deleted > 0) details.push(`删除立足点会话 ${result.sessions_deleted} 条`);
+  if (result.tunnels_deleted > 0) details.push(`删除隧道 ${result.tunnels_deleted} 条`);
+  if (result.credentials_deleted > 0) details.push(`删除凭据 ${result.credentials_deleted} 条`);
   return details;
 }
 
@@ -622,6 +625,9 @@ export default function TasksPage() {
         files_deleted: false,
         findings_deleted: 0,
         llm_records_deleted: 0,
+        sessions_deleted: 0,
+        tunnels_deleted: 0,
+        credentials_deleted: 0,
       };
       const deleted: string[] = [];
       const failed: { id: string; message: string }[] = [];
@@ -636,6 +642,9 @@ export default function TasksPage() {
           total.files_deleted = total.files_deleted || r.files_deleted;
           total.findings_deleted += r.findings_deleted;
           total.llm_records_deleted += r.llm_records_deleted;
+          total.sessions_deleted += r.sessions_deleted;
+          total.tunnels_deleted += r.tunnels_deleted;
+          total.credentials_deleted += r.credentials_deleted;
           if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
           deleted.push(id);
         } catch (e) {
@@ -2017,6 +2026,7 @@ const emptyDeleteOptions = (): DeleteTaskOptions => ({
   delete_files: false,
   delete_findings: false,
   delete_llm_records: false,
+  delete_intranet: false,
 });
 
 const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
@@ -2025,6 +2035,7 @@ const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
   "delete_files",
   "delete_findings",
   "delete_llm_records",
+  "delete_intranet",
 ];
 
 // DeleteOptionFields renders the「同时清理关联数据」checkbox block shared by the
@@ -2060,6 +2071,7 @@ function DeleteOptionFields({
       delete_files: checked,
       delete_findings: checked,
       delete_llm_records: checked,
+      delete_intranet: checked,
     });
   };
 
@@ -2075,7 +2087,7 @@ function DeleteOptionFields({
           />
           <FieldContent>
             <FieldLabel htmlFor={`delete-all-${idPrefix}`}>全部删除</FieldLabel>
-            <FieldDescription>选中下方全部关联数据，包括资产、流量、文件、漏洞和 LLM 请求/响应记录。</FieldDescription>
+            <FieldDescription>选中下方全部关联数据，包括资产、流量、文件、漏洞、LLM 请求/响应记录和内网会话/隧道/凭据。</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2131,6 +2143,17 @@ function DeleteOptionFields({
           <FieldContent>
             <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>LLM 请求/响应记录</FieldLabel>
             <FieldDescription>永久删除该任务录制的 LLM 请求、响应、Token 与错误详情。</FieldDescription>
+          </FieldContent>
+        </Field>
+        <Field orientation="horizontal">
+          <Checkbox
+            id={`delete-intranet-${idPrefix}`}
+            checked={options.delete_intranet}
+            onCheckedChange={(checked) => updateOption("delete_intranet", checked === true)}
+          />
+          <FieldContent>
+            <FieldLabel htmlFor={`delete-intranet-${idPrefix}`}>内网模块（会话/隧道/凭据）</FieldLabel>
+            <FieldDescription>回收该任务的立足点会话与隧道运行时，并永久删除会话、隧道、凭据台账记录。</FieldDescription>
           </FieldContent>
         </Field>
       </FieldGroup>

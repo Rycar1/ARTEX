@@ -204,18 +204,24 @@ type DeleteTaskOptions struct {
 	DeleteFiles      bool `json:"delete_files"`
 	DeleteFindings   bool `json:"delete_findings"`
 	DeleteLLMRecords bool `json:"delete_llm_records"`
+	// DeleteIntranet 清理内网模块台账：立足点会话(sessions)、凭据(credentials)、
+	// 隧道(tunnels)按任务归属删除，并回收活会话/活隧道运行时。
+	DeleteIntranet bool `json:"delete_intranet"`
 }
 
 // DeleteTaskResult makes destructive cleanup auditable to API callers.
 type DeleteTaskResult struct {
-	Deleted           string `json:"deleted"`
-	AssetsDeleted     int64  `json:"assets_deleted"`
-	AssetsDetached    int64  `json:"assets_detached"`
-	TrafficDeleted    int64  `json:"traffic_deleted"`
-	FilesDeleted      bool   `json:"files_deleted"`
-	FindingsDeleted   int64  `json:"findings_deleted"`
-	LLMRecordsDeleted int64  `json:"llm_records_deleted"`
-	CleanupWarning    string `json:"cleanup_warning,omitempty"`
+	Deleted            string `json:"deleted"`
+	AssetsDeleted      int64  `json:"assets_deleted"`
+	AssetsDetached     int64  `json:"assets_detached"`
+	TrafficDeleted     int64  `json:"traffic_deleted"`
+	FilesDeleted       bool   `json:"files_deleted"`
+	FindingsDeleted    int64  `json:"findings_deleted"`
+	LLMRecordsDeleted  int64  `json:"llm_records_deleted"`
+	SessionsDeleted    int64  `json:"sessions_deleted"`
+	TunnelsDeleted     int64  `json:"tunnels_deleted"`
+	CredentialsDeleted int64  `json:"credentials_deleted"`
+	CleanupWarning     string `json:"cleanup_warning,omitempty"`
 }
 
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration
@@ -1107,8 +1113,8 @@ func newTarpitConfig(pg *pgdb.DB, store *pgdb.ExplorationStore) guard.TarpitConf
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor, pg *pgdb.DB, eg *guard.EgressGuard) *Task {
 	g := guard.NewWithInterceptor(ic)
-	g.SetRoE(newRoEConfig(pg))          // RoE 范围强制(F5):worker 的 Bash/HTTP 目标与 task_scope 比对
-	g.SetEgress(eg)                     // 批 5 B2 出口审查:进程级共享指纹集合
+	g.SetRoE(newRoEConfig(pg))              // RoE 范围强制(F5):worker 的 Bash/HTTP 目标与 task_scope 比对
+	g.SetEgress(eg)                         // 批 5 B2 出口审查:进程级共享指纹集合
 	g.SetTarpit(newTarpitConfig(pg, store)) // 批 5 B3 tarpit 熔断(每任务计数,重启清零)
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
@@ -1761,7 +1767,7 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	}
 
 	dbResult, err := m.pg.DeleteTaskCascadePrepared(
-		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
+		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, opts.DeleteIntranet, prepare,
 	)
 	if err != nil {
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
@@ -1770,6 +1776,9 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	result.AssetsDetached = dbResult.AssetsDetached
 	result.FindingsDeleted = dbResult.FindingsDeleted
 	result.LLMRecordsDeleted = dbResult.LLMRecordsDeleted
+	result.SessionsDeleted = dbResult.SessionsDeleted
+	result.TunnelsDeleted = dbResult.TunnelsDeleted
+	result.CredentialsDeleted = dbResult.CredentialsDeleted
 
 	// PostgreSQL is now authoritative: finalize the staged external deletion and
 	// forget the live task even if a final purge reports an error. Such errors are

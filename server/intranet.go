@@ -419,6 +419,36 @@ func (s *Server) intranetWriteFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "bytes": len(data)})
 }
 
+// teardownTaskIntranet 在删除任务前回收该任务的内网模块活运行时：
+//  1. 逐条 teardown 该任务名下未终结的隧道（经会话杀目标侧 client 进程、杀平台侧
+//     server、清 stage 投递条目与 authfile、台账标 stopped）；
+//  2. 把该任务登记的立足点会话从注册表摘除（Remove 内部关闭底层连接）。
+//
+// 台账行（sessions/tunnels/credentials）随后由 DeleteTaskCascadePrepared 在同一事务
+// 里硬删除。best-effort：单条回收失败只记日志，绝不阻塞任务删除。
+func (s *Server) teardownTaskIntranet(ctx context.Context, taskID string) {
+	n, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || n <= 0 {
+		return
+	}
+	if s.tunnels != nil {
+		s.tunnels.Cleanup(ctx, n)
+	}
+	if s.sessStore == nil || s.sessReg == nil {
+		return
+	}
+	recs, err := s.sessStore.ListByTask(ctx, n)
+	if err != nil {
+		log.Printf("[intranet] 删除任务 %d 前读取会话失败： %v", n, err)
+		return
+	}
+	for _, rec := range recs {
+		if s.sessReg.Remove(rec.ID) {
+			log.Printf("[intranet] 删除任务 %d：已关闭活会话 %d", n, rec.ID)
+		}
+	}
+}
+
 // DELETE /api/sessions/{id} — 关闭并从注册表/DB 移除(幂等:已不存在也 ok)。
 func (s *Server) intranetDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if !s.intranetSessionsReady(w) {

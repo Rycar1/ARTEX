@@ -66,6 +66,7 @@ export interface DeleteTaskOptions {
   delete_files: boolean;
   delete_findings: boolean;
   delete_llm_records: boolean;
+  delete_intranet: boolean;
 }
 
 export interface DeleteTaskResult {
@@ -76,6 +77,9 @@ export interface DeleteTaskResult {
   files_deleted: boolean;
   findings_deleted: number;
   llm_records_deleted: number;
+  sessions_deleted: number;
+  tunnels_deleted: number;
+  credentials_deleted: number;
   cleanup_warning?: string;
 }
 

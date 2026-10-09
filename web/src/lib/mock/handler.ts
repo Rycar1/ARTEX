@@ -1414,6 +1414,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       files_deleted: Boolean(b.delete_files),
       findings_deleted: findingsDeleted,
       llm_records_deleted: llmRecordsDeleted,
+      sessions_deleted: 0,
+      tunnels_deleted: 0,
+      credentials_deleted: 0,
     };
   }
   if (seg[0] === "tasks" && seg[2] === "llm" && m === "PUT") {

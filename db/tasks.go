@@ -55,10 +55,13 @@ type Task struct {
 // TaskDeleteResult reports optional related-data cleanup performed in the same
 // transaction as the task/exploration delete.
 type TaskDeleteResult struct {
-	AssetsDeleted     int64
-	AssetsDetached    int64
-	FindingsDeleted   int64
-	LLMRecordsDeleted int64
+	AssetsDeleted      int64
+	AssetsDetached     int64
+	FindingsDeleted    int64
+	LLMRecordsDeleted  int64
+	SessionsDeleted    int64
+	TunnelsDeleted     int64
+	CredentialsDeleted int64
 }
 
 // TaskDeletePreparation is produced inside the PostgreSQL deletion transaction
@@ -535,7 +538,7 @@ func (d *DB) DeleteTask(id int64) error {
 // optional to preserve callers of the original two-option API.
 func (d *DB) DeleteTaskCascade(id int64, deleteAssets, deleteFindings bool, deleteLLMRecords ...bool) (TaskDeleteResult, error) {
 	deleteRecords := len(deleteLLMRecords) > 0 && deleteLLMRecords[0]
-	return d.DeleteTaskCascadePrepared(id, deleteAssets, deleteFindings, deleteRecords, nil)
+	return d.DeleteTaskCascadePrepared(id, deleteAssets, deleteFindings, deleteRecords, false, nil)
 }
 
 // DeleteTaskCascadePrepared coordinates reversible external deletion with the
@@ -549,7 +552,7 @@ func (d *DB) DeleteTaskCascade(id int64, deleteAssets, deleteFindings bool, dele
 // external work that its callback staged successfully.
 func (d *DB) DeleteTaskCascadePrepared(
 	id int64,
-	deleteAssets, deleteFindings, deleteLLMRecords bool,
+	deleteAssets, deleteFindings, deleteLLMRecords, deleteIntranet bool,
 	prepare func(TaskDeletePreparation) error,
 ) (TaskDeleteResult, error) {
 	var result TaskDeleteResult
@@ -641,6 +644,25 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 			return result, err
 		}
 		result.LLMRecordsDeleted, _ = res.RowsAffected()
+	}
+	if deleteIntranet {
+		// 内网模块台账（立足点会话/凭据/隧道）归属本任务，随任务在同一事务里硬删除。
+		// 活会话/活隧道的运行时回收由调用方在事务外先行完成（见 server.teardownTaskIntranet）。
+		if res, err := tx.Exec(`DELETE FROM tunnels WHERE task_id=$1`, id); err != nil {
+			return result, err
+		} else {
+			result.TunnelsDeleted, _ = res.RowsAffected()
+		}
+		if res, err := tx.Exec(`DELETE FROM credentials WHERE task_id=$1`, id); err != nil {
+			return result, err
+		} else {
+			result.CredentialsDeleted, _ = res.RowsAffected()
+		}
+		if res, err := tx.Exec(`DELETE FROM sessions WHERE created_by_task=$1`, id); err != nil {
+			return result, err
+		} else {
+			result.SessionsDeleted, _ = res.RowsAffected()
+		}
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
