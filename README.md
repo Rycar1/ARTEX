@@ -12,13 +12,17 @@ AI 自主渗透测试系统 · 二开版（Go 后端 + Next.js 前端 + PostgreS
 
 | 子系统 | 内容 |
 | --- | --- |
-| **内网作战** | webshell 加密会话管理（PHP/JSP)、反弹 shell(penelope 受管）、立足点被动侦察（`session_recon`)、多层代理隧道（suo5/chisel 自动选型、任务级 MITM 热切换）、内网拓扑图（按任务过滤）、凭据库 |
+| **内网作战** | webshell 加密会话管理（PHP/JSP)、反弹 shell(penelope 受管）、立足点被动侦察（`session_recon`)、多层代理隧道（suo5/chisel 自动选型、任务级 MITM 热切换）、内网拓扑图（按 /24 网段分框、按主机聚合、服务自主机点展开，**红=已拿下 / 绿=未拿下**）、凭据库 |
 | **阶段编排** | 待授权网段审批（侦察发现 scope 外网段 → 人工批准扩 scope)、外网→内网任务移交（handoff 模板建子任务）、内网 worker 提示词变体（有立足点自动切换） |
 | **安全与反测绘** | 伪装门控（未过门控一律返回逐字节固定 nginx 欢迎页，随机入口路径）、一键放行（2/4/8h 时限审批豁免，deny 不豁免）、RoE 范围强制三态（off/warn/strict) |
 | **蜜罐识别与反 AI 蜜罐防护** | 静态签名识别层（`honeydetect/`，内嵌签名库覆盖 Cowrie/OpenCanary/Kippo/Glastopf/HFish/Dionaea)、资产蜜罐评分与 UI 徽标、planner 处置纪律；针对"以 AI 攻击代理为猎物"的新型陷阱：worker 红线（永不自证）、出口敏感信息拦截、tarpit 抓取熔断、UA 池。设计见 `HONEYPOT-DETECTION-DESIGN.md` |
 | **chains 场景化** | 九类反问思维链骨架按意图自动注入、按漏洞类别的反证判据（误报写 fact、真漏洞才落图）、类别化转向提示 |
 | **武器库与部署链** | 17 项外部工具钉版清单（`packaging/tools-manifest.json`，启动自检 sha256)、`artex doctor` 部署预检、systemd unit |
 | **稳定性** | 任务 deadline 冻结感知（宿主机睡眠不烧任务）、LLM 调用硬墙钟、会话探活与启动卫生 |
+| **漏洞二次审核** | 新建任务时可开启；AI 按**企业 SRC / EduSRC** 收录标准复核每条 finding，规则层兜底（如 CORS 误配等对面不收的类别直接忽略）+ 审核失败冷却 + 判重，不符合收录标准自动标记「忽略」并注明原因 |
+| **漏洞去重** | 四层去重：写入扩展键 → DB 兜底查重 → 审核阶段语义判重 → 人工合并，解决同一漏洞重复上报 |
+| **任务模板** | 内置 **CTF** / **SRC** 两套模板，建任务时可选；SRC 模板明确边界，强调不得越界深入利用 |
+| **任务管理** | 删除任务时可选一并清理内网模块（会话 / 隧道 / 凭据） |
 
 详细二开说明见 `README-FORK.md`；分布式演进评估见 `FUTURE.md`。
 
@@ -143,6 +147,10 @@ docker compose up -d --build
 1. 启动日志会打印入口路径，形如 `[gate] 伪装门控已启用,入口路径: /g-xxxxxxxx`（也写入 `data/gate.path`);
 2. 浏览器访问 `http://<IP>:8787/g-xxxxxxxx`，输入门控口令（默认同入口路径随机串）;
 3. 首次进入 `/setup` 设置管理员密码。
+
+> - 门控 cookie 由 `gate.key` 签名，该文件默认不在 `data/` 下：**换二进制或重建容器会重新生成 key，旧 cookie 失效**，重输一次口令即可；入口路径存在 `data/gate.path`，重启不会变。
+> - `8788` 是内置流量代理口（直连返回 `407 Proxy Authentication Required` 属正常），前端端口是 `8787`。
+> - 页面提示 **「前端未内嵌到此二进制」** 时，是编译漏了 `-tags embedui`（见「方式二」第 3 步）。
 
 ## 外部工具（军火库）与部署自检
 

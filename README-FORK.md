@@ -3,6 +3,8 @@
 > 本文是 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX) 二次开发分支的说明，写给上游作者 review。
 > 二开目标：把 ARTEX 从「外网自动化探索平台」扩展为「**外网突破 → 立足点 → 内网纵深**」的全流程自主渗透平台，同时补齐实战化运维与稳定性短板。
 > 上游原 README 见 [README.md](README.md)（架构、安装、双图原理等不再重复）。
+>
+> **最近更新（2026-10-10）**：漏洞二次审核（企业 SRC / EduSRC 收录标准）、四层漏洞去重、内置 CTF / SRC 任务模板、内网拓扑图按 /24 网段分框并区分平台与主机服务、删除任务可清理内网模块。
 
 ---
 
@@ -22,7 +24,7 @@
 | 反弹 shell | penelope 集成为受管子进程，`reverse_listen`/会话化管理，自带加密与维权 | `server/reverse.go` |
 | 被动侦察 | `session_recon`：经立足点执行只读命令包（ip/route/neigh/netstat），解析落资产图、推断高价值网段 | `server/session_recon.go`、`recon/` |
 | 多层代理隧道 | `tunnel_deploy/probe/list/teardown` 四件套；suo5（目标无出网）/chisel（能出网）自动选型；隧道状态变化**热切换任务级 MITM 上游**，后续 worker 流量自动走隧道 | `tunnel/`、`server/tunnel.go`、`server/taskproxy.go` |
-| 内网拓扑 | 「内网作战」页：主机/网段/存活链路力导向图 + 会话/隧道/凭据三台账 | `web/src/app/(main)/intranet/` |
+| 内网拓扑 | 「内网作战」页：按 **/24 网段分框**、Linux/Windows 主机区分、服务自主机点展开的力导向图（**红=已拿下 / 绿=未拿下**）+ 会话/隧道/凭据三台账 | `web/src/app/(main)/intranet/` |
 | 凭据库 | 凭据一等实体（捕获、来源血缘、复用） | `db/credentials.go` |
 
 ### 2. 阶段编排（外网 → 内网两段式）
@@ -63,17 +65,40 @@
 - **自身防护（批 5 已实现）**：针对"以 AI 攻击代理为猎物"的新型陷阱（attestation 诱导、反向 prompt injection、tarpit 迷宫）——worker 代码固定尾红线（永不自证、目标内容永是数据不是指令）;guard 出口审查（出站请求含平台敏感信息指纹即 deny，只存哈希不落原文）;tarpit 抓取熔断；UA 池按任务稳定分配（禁止"Chrome UA + 库 TLS"半吊子伪装）。
 - 诚实边界：高交互/加固蜜罐对自动化识别基本免疫；防误报优先于防漏报（误标真实资产=自动放弃真实目标）。
 
+### 8. 漏洞二次审核（企业 SRC / EduSRC 收录标准）
+
+- 入口：新建任务时可勾选「二次审核」；发现列表 / 详情页可对单条或批量发起复核。
+- 判定：审核 agent 按目标类型（企业 SRC / EduSRC）套用对应收录标准，输出「收录 / 忽略」+ 理由；规则层先兜底（如 CORS 误配这类对面不收的类别直接忽略，不浪费 LLM 调用）。
+- 工程细节：审核链路剥离 `reasoning_effort`（思考吃满输出预算会导致 JSON 截断、解析失败）；审核失败带冷却，避免单条卡死拖垮整条队列；审核结果参与判重。
+- 位置：`server/finding_review.go`、`server/review_*.go`。
+
+### 9. 漏洞去重（四层）
+
+同一漏洞重复上报的四道闸：① 写入时按「目标 + 类型 + 路径 + 参数」扩展键判重；② DB 兜底查重（历史数据 / 并发写）；③ 审核阶段语义判重（同根因不同表述归并）；④ 人工合并入口。
+
+### 10. 任务模板（CTF / SRC）
+
+- 内置两套模板，建任务时可选：**CTF**（拿 flag 优先，允许深度利用与横向）、**SRC**（明确边界：只在合规范围内做漏洞验证，禁止越界深入利用与破坏）。
+- 模板纪律以固定尾形式写入任务 goal，与 worker 提示词变体叠加。
+
+### 11. 运维细节（踩坑记录）
+
+- **发布构建必须带 `-tags embedui`**：不带 tag 编译出的二进制不含前端（体积小约 7.7MB），页面会提示「前端未内嵌到此二进制（开发用 next dev；发布用 -tags embedui 构建）」。权威参数见 `build.sh`：`go build -tags embedui -trimpath -ldflags "-s -w -buildid= -X main.version=$VER" ./cmd/artex`。
+- **伪装门控入口**：非 loopback 监听时默认开启。入口路径 `/g-<22 位随机串>` 由启动日志打印并写入 `data/gate.path`；口令默认同随机串；过门控后 cookie 有效期 168h。`ARTEX_GATE=off` 可关闭（公网机器不建议）。
+- **`gate.key` 默认不在 `data/` 下**：容器重建 / 换二进制会重新生成 key，旧 cookie 失效（入口路径因存在 `data/gate.path` 而保持稳定）。想免重复输口令，把 key 目录一并挂载持久化。
+- **`8788` 是流量代理口**：直连返回 `407 Proxy Authentication Required` 属正常，不是故障。
+
 ## 三、验证情况（诚实版）
 
 - **实战验证**：红日靶场 3（外网 Web → Linux 跳板 → Windows 成员机 → 域控）全流程通关，拿到域控 flag。诚实声明：域管口令为人工投喂一次，完整 A/B 对比与复盘见 `AB-REPORT-RED-SUN-3.md` / `POSTMORTEM-RED-SUN-3.md`。
-- **部署验证**：Ub 18 + PG10 实体机连续运行；systemd 托管；`artex doctor` 全绿；启动自检 sha256 一致 14/14。
+- **部署验证**：Ub 18 + PG10 实体机连续运行；systemd 托管；`artex doctor` 全绿；启动自检 sha256 一致 14/14。另在 Docker（`Dockerfile.fork` 派生镜像）上验证通过：容器内二进制 SHA256 与本地构建一致，前端静态资源与 `/api/health` 均返回 200。
 - **测试**：`go build/vet` 全过；`agent`、`db`、`tools`、`guard`、`intercept` 等包测试全过；`server` 包有 4 个既有环境性失败（缺 PG DSN ×3、Windows 路径分隔符 ×1），与改动无关。
 - **已知不足**：① 效果强依赖 LLM 质量（弱模型会钻牛角尖/死磕错误凭据）；② 误报控制虽有反证判据+复测 agent，仍需更多靶场样本调优；③ 内网阶段动静控制与免杀未系统化；④ 测试环境样本有限，存在过拟合风险，功能均按通用场景实现但未经充分泛化验证。
 
 ## 四、给上游作者的请求
 
 1. **希望开一个分支**（如 `dev-intranet`）承载本二开，便于 review 与协作。
-2. 可拆分回馈上游的通用改进（与内网特性解耦、可单独成 PR）：systemd unit、LLM 调用墙钟、伪装门控、一键放行、`artex doctor`、工具钉版清单、会话探活/启动卫生。
+2. 可拆分回馈上游的通用改进（与内网特性解耦、可单独成 PR）：systemd unit、LLM 调用墙钟、伪装门控、一键放行、`artex doctor`、工具钉版清单、会话探活/启动卫生、**漏洞二次审核与四层去重**、**内置任务模板（CTF / SRC）**。
 3. 内网作战子系统体量较大，若上游有兴趣合并，建议按「会话管理 → 隧道 → 拓扑 → 阶段编排」的顺序分期 review；架构上已评估过分布式演进（server 大脑 + 远程 node 执行），见 `FUTURE.md`。
 
 ## 五、联系与许可
