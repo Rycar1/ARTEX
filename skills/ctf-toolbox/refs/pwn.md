@@ -18,6 +18,7 @@ ropper --file ./chall --search "pop rdi; ret"
 one_gadget ./libc.so.6                            # 一血 gadget（需 libc 版本匹配）
 seccomp-tools dump ./chall                        # 有沙箱时看允许哪些 syscall
 patchelf --set-interpreter /path/ld.so --set-rpath /path ./chall   # 换 libc 打通本地
+nc -lvnp 4444                                     # 起监听（收反弹 shell / 手搓协议）
 ```
 
 ## 2. 常用片段

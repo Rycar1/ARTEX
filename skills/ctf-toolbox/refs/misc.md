@@ -24,6 +24,7 @@ outguess -r pic.jpg out.txt         # JPG 隐写
 identify -verbose pic.png           # ImageMagick：色彩/尺寸/直方图
 convert pic.png -channel RGB -separate ch_%d.png   # 拆通道
 zbarimg -q pic.png                  # 图片里的二维码/条码
+tesseract pic.png - -l eng+chi_sim  # OCR 取字（截图/验证码/扫描件类 misc）
 ```
 
 其他常见手法（用 python3 + PIL，已装）：
@@ -44,6 +45,7 @@ ffmpeg -i in.wav -af "volume=5" loud.wav  # 音量放大
 
 ```sh
 7z x -oout pkg.7z                  # 通用解压（含嵌套）
+unar pkg.rar                       # RAR（7z 无 rar 插件时用它）
 fcrackzip -u -D -p rockyou.txt a.zip      # zip 口令爆破（-u 只试可解压的）
 pdfcrack -w rockyou.txt doc.pdf           # PDF 口令爆破
 zip2john a.zip > h.txt && john --wordlist=rockyou.txt h.txt   # zip 哈希交给 john

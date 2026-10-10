@@ -9,22 +9,24 @@
 #   misc/取证：file xxd binwalk foremost sleuthkit testdisk steghide outguess
 #              pngcheck exiftool zbar poppler qpdf pdfcrack fcrackzip 7z bzip2
 #              xz cpio hashcat john tshark tcpdump ffmpeg sox imagemagick
+#              netcat-openbsd unar tesseract-ocr
 #              sqlite3 gawk
 #   RE      ：binutils(objdump/readelf/strings/nm) gdb gdb-multiarch strace
 #              ltrace nasm patchelf
-#              + pip: capstone keystone-engine unicorn z3-solver sympy
+#              + pip: capstone keystone-engine unicorn z3-solver sympy pyelftools lief
 #   Pwn     ：build-essential(编 exp) qemu-user qemu-user-static patchelf
 #              + pip: pwntools ROPgadget ropper
+#              + pip(CTF_EXTRA=1): angr
 #              + gem: one_gadget seccomp-tools zsteg
 #
 # 环境变量（全部可选，默认走官方源；国内构建强烈建议给 APT_MIRROR/PIP_MIRROR）：
 #   APT_MIRROR   apt 镜像主机名，例 mirrors.tuna.tsinghua.edu.cn
 #   PIP_MIRROR   pip index-url，例 https://mirrors.aliyun.com/pypi/simple
 #   GEM_SOURCE   gem source，例 https://mirrors.tuna.tsinghua.edu.cn/rubygems/
-#   CTF_EXTRA    1 = 额外装 radare2 / upx（见下）
+#   CTF_EXTRA    1 = 额外装 radare2 / upx / angr（见下）
 #   GH_PROXY     GitHub 加速前缀，例 https://ghfast.top/（github.com 直连不通时用）
 #
-# radare2 / upx 为什么单独走 GitHub：
+# radare2 / upx / angr 为什么单独走 GitHub：
 #   Debian bookworm 里两者都没有候选版本（apt-cache policy 的 Candidate 为空），
 #   只能取上游 release 的钉版二进制。sha256 写死在下面，校验不过就跳过；
 #   下载/校验失败只告警、不中断构建——核心层已经够用，装了没装以
@@ -85,7 +87,7 @@ apt-get install -y --no-install-recommends \
   p7zip-full bzip2 xz-utils cpio tshark hashcat john \
   build-essential nasm patchelf qemu-user qemu-user-static \
   ruby ruby-dev ffmpeg sox sqlite3 gawk imagemagick \
-  tcpdump socat
+  tcpdump socat netcat-openbsd unar tesseract-ocr
 
 # ---------- 2. Python 层 ----------
 PIP_ARGS="--no-cache-dir --disable-pip-version-check"
@@ -97,7 +99,7 @@ log "安装 python 层（pwntools / z3 / capstone / keystone / unicorn / ropper 
 python3 -m pip install $PIP_ARGS \
   pwntools ROPgadget ropper \
   z3-solver capstone keystone-engine unicorn \
-  pycryptodome pillow sympy numpy gmpy2
+  pycryptodome pillow sympy numpy gmpy2 pyelftools lief
 
 # ---------- 3. Ruby 层（图片/BPF 隐写与 gadget）----------
 if [ -n "$GEM_SOURCE" ]; then
@@ -105,10 +107,19 @@ if [ -n "$GEM_SOURCE" ]; then
   gem sources --remove https://rubygems.org/ >/dev/null 2>&1 || true
 fi
 log "安装 gem 层（zsteg / one_gadget / seccomp-tools）"
-gem install --no-document zsteg one_gadget seccomp-tools
+# seccomp-tools >= 1.7 用了 Ruby 3.2 才支持的匿名块参数（def f(&)），
+# bookworm 自带 ruby 3.1，装了会直接 SyntaxError 起不来（1.7.1 实测）。
+# 按 ruby 版本钉版：>=3.2 装最新，否则钉 1.6.1。
+SECCOMP_VER=""
+if ! ruby -e 'exit(RUBY_VERSION.split(".").first(2).join(".").to_f >= 3.2 ? 0 : 1)' 2>/dev/null; then
+  SECCOMP_VER="-v 1.6.1"
+fi
+gem install --no-document zsteg one_gadget
+# shellcheck disable=SC2086
+gem install --no-document seccomp-tools $SECCOMP_VER
 rm -rf /usr/local/lib/ruby/gems/*/cache/* 2>/dev/null || true
 
-# ---------- 4. 可选：radare2 / upx（bookworm 无候选包）----------
+# ---------- 4. 可选：radare2 / upx / angr（bookworm 无候选包）----------
 # 两个下载源：① GitHub release 直链（可加 GH_PROXY 前缀）② api.github.com 的
 # asset 端点（用固定 asset id，Accept: application/octet-stream）。每个源各重试
 # 3 次，任何一次 sha256 对上就停；全失败只告警不中断构建。
@@ -163,14 +174,18 @@ if [ "$CTF_EXTRA" = "1" ]; then
     fi
     rm -rf "$TMPD"
   fi
+  log "CTF_EXTRA=1：pip angr（符号执行，pwn/RE 常用）"
+  # shellcheck disable=SC2086
+  python3 -m pip install $PIP_ARGS angr || log "警告：angr 安装失败，跳过（不影响其余工具）"
 fi
 
 # ---------- 5. 收尾 ----------
 rm -rf /var/lib/apt/lists/* /root/.cache/pip 2>/dev/null || true
 
 log "完成。自检："
-for t in file xxd strings objdump gdb r2 upx binwalk zsteg hashcat john tshark ffmpeg patchelf qemu-x86_64 sqlite3 ruby; do
+for t in file xxd strings objdump gdb r2 upx binwalk zsteg seccomp-tools nc tesseract hashcat john tshark ffmpeg patchelf qemu-x86_64 sqlite3 ruby; do
   if command -v "$t" >/dev/null 2>&1; then printf '  [ok] %s\n' "$t"; else printf '  [--] %s\n' "$t"; fi
 done
-python3 -c "import pwn, z3, capstone, keystone, unicorn; print('  [ok] python: pwntools/z3/capstone/keystone/unicorn')" \
+python3 -c "import pwn, z3, capstone, keystone, unicorn, elftools, lief; print('  [ok] python: pwntools/z3/capstone/keystone/unicorn/pyelftools/lief')" \
   || echo "  [--] python ctf 库自检失败"
+command -v angr >/dev/null 2>&1 && echo "  [ok] angr" || echo "  [--] angr"

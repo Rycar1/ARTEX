@@ -46,7 +46,7 @@ RUN npm install -g @playwright/mcp@0.0.80 @playwright/cli@0.1.19 playwright@1.63
 #   docker build --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
 #                --build-arg PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple \
 #                --build-arg CTF_EXTRA=1 -t artex:local .
-# CTF_EXTRA=1 才额外装 radare2 / upx（bookworm 无候选包，走 GitHub 钉版 sha256）。
+# CTF_EXTRA=1 才额外装 radare2 / upx（GitHub 钉版 sha256）与 angr（pip）。
 ARG APT_MIRROR=
 ARG PIP_MIRROR=
 ARG GEM_SOURCE=

@@ -23,6 +23,8 @@ print(hex(e.got['printf']), hex(e.plt['puts']))
 ## 2. 静态分析
 
 - 反汇编：`objdump -d -M intel`；大函数用 `objdump -d --start-address=0x.. --stop-address=0x..`
+- 符号执行（跳过手写约束，直接跑出满足条件的输入）：`import angr`（CTF_EXTRA=1 构建时已装）
+- 读 ELF/PE 结构用 python：`from elftools.elf.elffile import ELFFile`；`import lief`（改节表/加段很顺手）
 - 交叉引用/伪代码：镜像内**没有** radare2/Ghidra/IDA；有 r2 时用 `r2 -A ./chall`（`pdf @ main`、`axt`）
 - 反汇编为 Python 对象（做自动化/解密很常用）：
 ```python

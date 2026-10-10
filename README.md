@@ -173,10 +173,10 @@ docker compose up -d --build
 
 | 分类 | 工具 |
 | --- | --- |
-| misc / 取证 | file、xxd、binwalk、foremost、sleuthkit、testdisk、steghide、outguess、pngcheck、exiftool、zbar、poppler、qpdf、pdfcrack、fcrackzip、7z、hashcat、john、tshark、tcpdump、ffmpeg、sox、imagemagick、sqlite3、gawk |
+| misc / 取证 | file、xxd、binwalk、foremost、sleuthkit、testdisk、steghide、outguess、pngcheck、exiftool、zbar、poppler、qpdf、pdfcrack、fcrackzip、7z、hashcat、john、tshark、tcpdump、ffmpeg、sox、imagemagick、sqlite3、gawk、netcat、unar、tesseract-ocr |
 | RE | binutils（objdump/readelf/strings/nm）、gdb、gdb-multiarch、strace、ltrace、nasm、patchelf；pip：capstone、keystone-engine、unicorn、z3-solver、sympy |
-| pwn | build-essential、qemu-user、qemu-user-static、patchelf；pip：pwntools、ROPgadget、ropper；gem：one_gadget、seccomp-tools、zsteg |
-| 可选（`CTF_EXTRA=1`） | radare2 6.2.4、upx 5.2.1（bookworm 无 apt 候选包，走 GitHub 钉版 + sha256 校验，校验不过自动跳过，不中断构建） |
+| pwn | build-essential、qemu-user、qemu-user-static、patchelf；pip：pwntools、ROPgadget、ropper、pyelftools、lief；gem：one_gadget、seccomp-tools（Ruby 3.1 环境自动钉 1.6.1）、zsteg |
+| 可选（`CTF_EXTRA=1`） | radare2 6.2.4、upx 5.2.1（bookworm 无 apt 候选包，走 GitHub 钉版 + sha256 校验，校验不过自动跳过，不中断构建）、angr（pip 符号执行） |
 
 - 构建参数（默认官方源，国内构建建议传）：`APT_MIRROR` / `PIP_MIRROR` / `GEM_SOURCE` / `CTF_EXTRA` / `GH_PROXY`，compose 读同名环境变量，如 `APT_MIRROR=mirrors.tuna.tsinghua.edu.cn PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple CTF_EXTRA=1 docker compose build`。
 - Agent 侧无需注册：这些是 CLI 与 Python/gem 库，Bash 工具直接可调；`skills/ctf-toolbox/` 提供「什么时候用哪个」的选型索引。

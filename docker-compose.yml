@@ -21,7 +21,7 @@ services:
       context: .
       dockerfile: Dockerfile.source
       args:
-        # 国内构建建议在 .env 里给镜像源；默认官方源。CTF_EXTRA=1 追加 radare2/upx。
+        # 国内构建建议在 .env 里给镜像源；默认官方源。CTF_EXTRA=1 追加 radare2/upx/angr。
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_MIRROR: ${PIP_MIRROR:-}
         GEM_SOURCE: ${GEM_SOURCE:-}
