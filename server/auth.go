@@ -225,8 +225,11 @@ func (s *Server) ensureRandomBasicAuth() {
 		return
 	}
 	pg := s.m.pg
-	if user, ok, _ := pg.GetSetting(authUserKey); ok && user != "" {
-		return
+	force := os.Getenv("ARTEX_RESET_AUTH") == "1"
+	if !force {
+		if user, ok, _ := pg.GetSetting(authUserKey); ok && user != "" {
+			return
+		}
 	}
 	buf := make([]byte, 12)
 	if _, err := rand.Read(buf); err != nil {
@@ -249,12 +252,11 @@ func (s *Server) ensureRandomBasicAuth() {
 		log.Printf("[auth] save username: %v", err)
 		return
 	}
-	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
-	if err != nil || !inserted {
-		log.Printf("[auth] save password: err=%v inserted=%v", err, inserted)
+	if err := pg.SetSetting(authPassKey, string(hash)); err != nil {
+		log.Printf("[auth] save password: %v", err)
 		return
 	}
-	log.Printf("[auth] first-boot credentials (printed once): user=%s pass=%s", user, pass)
+	log.Printf("[auth] generated basic-auth credentials (printed once, ARTEX_RESET_AUTH=1 to regenerate): user=%s pass=%s", user, pass)
 }
 
 // ---------- refresh token(随机 32 字节,哈希存 settings) ----------
