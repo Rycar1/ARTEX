@@ -1,0 +1,25 @@
+# 二开版派生镜像（可选构建路径）：复用 autumn27/artex:latest 的完整工具层
+# （python3.12 / node20 / playwright+chromium / nmap / ripgrep …），只替换 artex
+# 二进制 + packaging/ + skills/，再追加 CTF 工具层。适合「服务器上不方便重跑
+# apt+npm+playwright」的场景（GitHub/npm 网络不稳、磁盘紧张、CI 时长受限）。
+#
+# 用法（把 docker-compose.yml 的 artex.build.dockerfile 换成 Dockerfile.fork）：
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embedui -trimpath \
+#     -ldflags "-s -w" -o dist/amd64/artex ./cmd/artex
+#   docker compose build && docker compose up -d
+# 回滚：升级前先 docker tag artex-ymh:local artex-ymh:rollback-<日期>，出问题换回旧 tag。
+FROM autumn27/artex:latest
+COPY dist/amd64/artex /app/artex
+COPY packaging/ /app/packaging/
+COPY start.sh /app/start.sh
+COPY skills/ /app/skills/
+RUN chmod +x /app/artex /app/start.sh
+
+# CTF 工具层（misc / RE / pwn），与根 Dockerfile / Dockerfile.source 共用同一份脚本
+# packaging/ctf-tools.sh（包清单只维护一处）。构建参数见该脚本头部注释。
+ARG APT_MIRROR=
+ARG PIP_MIRROR=
+ARG GEM_SOURCE=
+ARG CTF_EXTRA=0
+ARG GH_PROXY=
+RUN sh /app/packaging/ctf-tools.sh

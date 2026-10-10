@@ -45,6 +45,7 @@
 - `artex doctor`：7 项部署预检（PG/LLM/data 可写/隧道工具/军火库/门控/回连地址），FAIL 退出码 1，只读不启动服务。
 - systemd unit（崩溃重拉、开机自启、与页面一键更新的退出码 75 换装兼容）。
 - `packaging/ctf-tools.sh`：CTF 工具层（misc/RE/pwn 常用件 + pwntools/z3/capstone/keystone/unicorn + zsteg/one_gadget/seccomp-tools），三份 Dockerfile 共用一份清单；构建参数可换镜像源，`CTF_EXTRA=1` 追加 radare2/upx（钉版 sha256，校验不过跳过）。配套 `skills/ctf-toolbox/`（SKILL.md + refs/{misc,rev,pwn}.md）供 agent 选型。
+- `Dockerfile.fork`：复用 `autumn27/artex:latest` 工具层的快速构建路径（只换二进制 + packaging/ + skills/ 再叠 CTF 层），适合服务器不便重跑 apt+npm+playwright 的场景；compose 的 `build.dockerfile` 换成它即可。
 
 ### 5. 稳定性（实战中踩出来的）
 
