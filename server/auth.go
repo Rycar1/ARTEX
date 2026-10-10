@@ -684,10 +684,19 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	if req.Username != "ARTEX" {
+	wantUser, uok, uerr := pg.GetSetting(authUserKey)
+	if uerr != nil {
+		writeErr(w, 503, errDataSourceUnavailable)
+		return
+	}
+	if !uok || wantUser == "" {
+		wantUser = "ARTEX"
+	}
+	if subtle.ConstantTimeCompare([]byte(req.Username), []byte(wantUser)) != 1 {
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
+
 	hash, ok, err := pg.GetSetting(authPassKey)
 	if err != nil {
 		writeErr(w, 503, errDataSourceUnavailable)
