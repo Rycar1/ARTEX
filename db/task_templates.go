@@ -296,7 +296,8 @@ func (d *DB) DeleteTaskTemplate(id int64) (bool, error) {
 }
 
 // builtinTaskTemplates 是随程序发布的内置任务模板正文。描述/目标可被用户改写，
-// 但名称与存在性受保护(不可改名/删除)，每次启动幂等补齐。
+// 但名称与存在性受保护(不可改名/删除)，每次启动幂等补齐；内置正文随版本升级会用
+// builtinTaskTemplatesVersion 旗标做一次性强制刷新（见 seedBuiltinTaskTemplates）。
 var builtinTaskTemplates = []struct {
 	Name        string
 	Description string
@@ -319,10 +320,18 @@ var builtinTaskTemplates = []struct {
 	},
 	{
 		Name:        "SRC",
-		Description: "SRC / 众测 / 漏洞赏金场景：只在授权范围内做漏洞验证，强调边界——证明漏洞存在即可，禁止破坏性操作与深入利用（不取数据、不上传 webshell、不横向、不驻留）。",
-		Goal: `在授权的 SRC / 众测范围内做漏洞验证与提交，核心是「边界」。
+		Description: "SRC / 众测 / 漏洞赏金场景：只在授权范围内做漏洞验证，强调边界——证明漏洞存在即可，禁止破坏性操作与深入利用（不取数据、不上传 webshell、不横向、不驻留）；但【必须遍历并测试完授权范围内的全部资产后才允许结束】，禁止挖到一半提前收尾。",
+		Goal: `在授权的 SRC / 众测范围内做漏洞验证与提交，核心是「边界」，并【必须把授权范围内的资产全部测完才能结束——禁止挖到一半就自己收尾】。
 
 【授权范围】先确认并严格遵守：允许的域名 / IP / 端口 / 子域、允许的时间窗、允许的测试类型。范围外的资产一律不碰。
+
+【结束条件（硬性红线·最高优先，先读这条）】在【授权范围内全部资产都已被测试并给出结论】之前，禁止结束任务——禁止把最后一个目标 prove_goal，禁止调用 goal_met：
+- 开局先枚举并锁定 in-scope 资产清单：用 list_assets 摸清资产，用 add_task_scope 把范围锚定到本任务；范围未锚定就先锚定，再开测。
+- 每轮规划都要核对覆盖情况：读 graph_overview 的 coverage（by_type 的 总数/已测）与 list_untested_assets（未测资产清单），把「仍有未测资产」当成必须继续派意图的待办。
+- 每个 in-scope 资产都必须落到一个明确结论：①已发现漏洞（含可复现证据）；②已按允许的测试类型覆盖且未发现漏洞；③明确排除（附原因：范围外 / 无法访问 / 与已测资产等价去重 / 受边界限制不得测试）。
+- 只要还有 in-scope 资产没有上述结论，就必须继续为它派意图补测；禁止以「拿到一个洞 / 覆盖度大体够了 / 核心资产已拿下 / 报告已经能写」为由提前收尾。
+- coverage.pct 会因容器型资产与大量枚举而偏低，不作为唯一判据；判据是「list_untested_assets 里是否还有本任务范围内、尚未给出结论的资产」，不是单纯的百分比。
+- 全部资产都已有结论后，才允许逐个 prove_goal 收尾；收尾报告必须列出资产清单与每个资产的结论（含「未发现漏洞」与「明确排除」的资产）。
 
 【验证尺度】最小化验证：用能证明漏洞存在的最少请求即可，拿到 PoC 证据就停。
 - 只读优先：SQL 注入用布尔 / 时间盲注或只读探测证明，不 dump 数据；命令执行用 id / whoami 等无害命令证明，不读敏感文件、不留后门。
@@ -340,20 +349,45 @@ var builtinTaskTemplates = []struct {
 - 记录：URL、参数、请求 / 响应片段（敏感信息脱敏）、复现步骤、影响说明、修复建议。
 - 按平台规范分级提交；不能确认或影响无法自证的问题标注为「存疑」，不夸大。
 
-【边界优先】任何一步拿不准是否越界，就先停下、只做到能证明为止，不要为了「打得深」而突破边界。`,
+【边界优先】任何一步拿不准是否越界，就先停下、只做到能证明为止，不要为了「打得深」而突破边界；确实无法测试的资产按「结束条件」第 ③ 类（明确排除）如实记录，而不是直接跳过或提前收尾。`,
 	},
 }
 
-// seedBuiltinTaskTemplates 幂等播种内置模板(CTF/SRC)：同名模板只重申 builtin 标记，
-// 不覆盖用户对描述/目标的修改；被删除后下次启动会重新补齐。
+// builtinTaskTemplatesVersion 是内置任务模板正文的版本旗标：DB 中记录的版本低于当前值时，
+// 本次启动强制把内置模板(CTF/SRC)的 description/goal 刷成新版（用于给老库补上 SRC 的
+// 「必须测完所有资产才能结束」硬约束），刷新后写入当前版本；此后只重申 builtin 标记，
+// 不再覆盖用户对正文的修改。
+const (
+	builtinTaskTemplatesVersionKey = "builtin_task_templates_version"
+	builtinTaskTemplatesVersion    = "2"
+)
+
+// seedBuiltinTaskTemplates 幂等播种内置模板(CTF/SRC)。默认只重申 builtin 标记、不覆盖
+// 用户对描述/目标的修改；当内置模板版本升级时（见上面的版本旗标）做一次性强制刷新。
 func (d *DB) seedBuiltinTaskTemplates() error {
+	v, _, err := d.GetSetting(builtinTaskTemplatesVersionKey)
+	if err != nil {
+		return fmt.Errorf("read builtin templates version: %w", err)
+	}
+	refresh := v != builtinTaskTemplatesVersion
 	for _, t := range builtinTaskTemplates {
-		if _, err := d.Exec(`
+		q := `
 INSERT INTO task_templates(name, nkey, description, goal, builtin)
 VALUES ($1,$2,$3,$4,true)
-ON CONFLICT (nkey) DO UPDATE SET builtin = true`,
-			t.Name, taskTemplateNKey(t.Name), t.Description, t.Goal); err != nil {
+ON CONFLICT (nkey) DO UPDATE SET builtin = true`
+		if refresh {
+			q = `
+INSERT INTO task_templates(name, nkey, description, goal, builtin)
+VALUES ($1,$2,$3,$4,true)
+ON CONFLICT (nkey) DO UPDATE SET description = EXCLUDED.description, goal = EXCLUDED.goal, builtin = true`
+		}
+		if _, err := d.Exec(q, t.Name, taskTemplateNKey(t.Name), t.Description, t.Goal); err != nil {
 			return fmt.Errorf("builtin template %q: %w", t.Name, err)
+		}
+	}
+	if refresh {
+		if err := d.SetSetting(builtinTaskTemplatesVersionKey, builtinTaskTemplatesVersion); err != nil {
+			return fmt.Errorf("record builtin templates version: %w", err)
 		}
 	}
 	return nil

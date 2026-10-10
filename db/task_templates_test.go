@@ -186,3 +186,71 @@ func TestBuiltinTaskTemplatesSeededAndProtected(t *testing.T) {
 		t.Fatalf("builtin description not updated: %+v %v", got, err)
 	}
 }
+
+// TestBuiltinTaskTemplatesRefreshOnVersionBump locks in the seed's one-time forced
+// refresh: when the stored version lags builtinTaskTemplatesVersion, the built-in
+// CTF/SRC bodies are overwritten with the shipped text (so an old DB picks up the
+// SRC「必须测完所有资产才能结束」hard constraint), and the version flag is bumped.
+// A second seed at the current version must NOT clobber the user's later edits.
+func TestBuiltinTaskTemplatesRefreshOnVersionBump(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	listed, err := d.ListTaskTemplates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var src *TaskTemplate
+	for _, tpl := range listed {
+		if tpl.Name == "SRC" {
+			src = tpl
+		}
+	}
+	if src == nil {
+		t.Fatal("SRC builtin template missing")
+	}
+	originalGoal, originalDesc := src.Goal, src.Description
+	t.Cleanup(func() {
+		_, _ = d.PatchTaskTemplate(src.ID, TaskTemplatePatch{Goal: &originalGoal, Description: &originalDesc})
+	})
+
+	// Simulate an old DB: stale body + an older recorded version.
+	stale := "stale SRC goal (old version)"
+	if _, err := d.PatchTaskTemplate(src.ID, TaskTemplatePatch{Goal: &stale}); err != nil {
+		t.Fatalf("seed stale goal: %v", err)
+	}
+	if err := d.SetSetting(builtinTaskTemplatesVersionKey, "1"); err != nil {
+		t.Fatalf("set old version: %v", err)
+	}
+	if err := d.seedBuiltinTaskTemplates(); err != nil {
+		t.Fatalf("seedBuiltinTaskTemplates: %v", err)
+	}
+	got, err := d.GetTaskTemplate(src.ID)
+	if err != nil || got == nil {
+		t.Fatalf("get SRC after refresh: %+v %v", got, err)
+	}
+	if got.Goal != originalGoal {
+		t.Fatalf("SRC goal was not refreshed to the shipped text")
+	}
+	if !strings.Contains(got.Goal, "结束条件") || !strings.Contains(got.Goal, "必须") {
+		t.Fatalf("SRC goal lost the must-cover-all-assets end condition")
+	}
+	if v, _, _ := d.GetSetting(builtinTaskTemplatesVersionKey); v != builtinTaskTemplatesVersion {
+		t.Fatalf("version flag = %q, want %q", v, builtinTaskTemplatesVersion)
+	}
+
+	// A second seed at the current version must NOT clobber a user's later edit.
+	edited := "user edited SRC goal"
+	if _, err := d.PatchTaskTemplate(src.ID, TaskTemplatePatch{Goal: &edited}); err != nil {
+		t.Fatalf("user edit: %v", err)
+	}
+	if err := d.seedBuiltinTaskTemplates(); err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if got, _ := d.GetTaskTemplate(src.ID); got == nil || got.Goal != edited {
+		t.Fatalf("second seed clobbered the user's edit: %+v", got)
+	}
+}
