@@ -188,7 +188,9 @@ func gateEnabled(addr string) (enabled, explicit bool) {
 	case "on", "1", "true":
 		return true, true
 	}
-	return !isLoopbackAddr(addr), false
+	// 2024-10 起 Basic Auth 已在 requireAuth 层提供认证，伪装门控不再默认开启；
+	// 仍可通过 ARTEX_GATE=on 显式启用。
+	return false, false
 }
 
 // isLoopbackAddr 判定监听地址是否只绑回环。空 host(:8787)= 全网卡,不算回环。

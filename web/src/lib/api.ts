@@ -3,8 +3,6 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
-import { auth } from "@/lib/auth";
-import { refreshAccessToken } from "@/lib/auth-refresh";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -141,16 +139,9 @@ async function httpInner<T>(path: string, init: RequestInit | undefined, retried
       ...(init?.headers as Record<string, string> | undefined),
     },
   });
+    // Basic Auth mode: 401 means the server rejected credentials. The browser
+  // handles re-authentication natively, so we just surface the error.
   if (r.status === 401) {
-    // access token(2h)过期:先凭 HttpOnly refresh cookie 换新 token 重试一次;
-    // /auth/* 自身(含 refresh)的 401 不再递归,直接算登出(F6)。
-    if (!retried && !path.startsWith("/auth/") && (await refreshAccessToken())) {
-      return httpInner<T>(path, init, true);
-    }
-    if (typeof window !== "undefined") {
-      auth.clearToken();
-      window.location.href = "/login";
-    }
     throw new Error("未授权");
   }
   if (!r.ok) {

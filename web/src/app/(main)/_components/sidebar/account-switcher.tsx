@@ -33,16 +33,7 @@ export function AccountSwitcher({
   const [pwOpen, setPwOpen] = useState(false);
 
   function handleLogout() {
-    // 先吊销服务端 refresh token(F6),再清本地登录态;refresh 已失效也照常登出。
-    void api
-      .logout()
-      .catch(() => {
-        // refresh 已失效也照常登出,本地清理在 finally 里完成。
-      })
-      .finally(() => {
-        auth.clearToken();
-        window.location.href = "/login";
-      });
+    window.location.reload();
   }
 
   if (!activeUser) {

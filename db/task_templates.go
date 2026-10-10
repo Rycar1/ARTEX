@@ -307,7 +307,7 @@ var builtinTaskTemplates = []struct {
 		Description: "CTF 竞赛 / 靶场场景：目标处于隔离比赛环境，允许为解题放开手脚做高强度利用与破坏性操作（打点、提权、横向、拿 flag），不承担业务影响。",
 		Goal: `在隔离的 CTF / 靶场环境中解题并拿到 flag。这是比赛/靶场场景，可以放开手脚：
 
-工具箱：镜像内已预装 CTF 常用件，先读 `skills/ctf-toolbox/`（SKILL.md + refs/misc.md、rev.md、pwn.md）确认该用哪个工具、惯用套路与命令，再动手，别手搓轮子。
+工具箱：镜像内已预装 CTF 常用件，先读 'skills/ctf-toolbox/'（SKILL.md + refs/misc.md、rev.md、pwn.md）确认该用哪个工具、惯用套路与命令，再动手，别手搓轮子。
 
 1. 侦察定面：枚举端口与服务、Web 路径与参数、指纹与已知漏洞版本，先把攻击面铺开。
 2. 漏洞利用：对确认的漏洞直接利用（RCE、反序列化、文件包含、SQL 注入、越权、模板注入等），必要时上传工具、写 webshell、提权。

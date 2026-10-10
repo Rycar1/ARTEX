@@ -13,9 +13,10 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { statusMeta, toneClasses, type Tone } from "@/lib/status";
-import type { Finding, ReviewStats, ReviewVerdict } from "@/lib/types";
+import type { Finding, ReviewStats, ReviewVerdict, Severity, Task } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // 二次审核页:展示 AI 二次审核的结论分布,按结论筛选发现,并支持手动重审。
@@ -46,6 +47,9 @@ function fmtTime(ts?: string): string {
 export default function FindingReviewsPage() {
   const [stats, setStats] = React.useState<ReviewStats | null>(null);
   const [filter, setFilter] = React.useState<ReviewFilter>("all");
+  const [severityFilter, setSeverityFilter] = React.useState<"all" | Severity>("all");
+  const [taskFilter, setTaskFilter] = React.useState<string>("all");
+  const [tasks, setTasks] = React.useState<Task[]>([]);
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(20);
   const [items, setItems] = React.useState<Finding[]>([]);
@@ -63,17 +67,18 @@ export default function FindingReviewsPage() {
   const loadList = React.useCallback(() => {
     setLoading(true);
     api
-      .findingsPage({ page, pageSize, review: filter })
+      .findingsPage({ page, pageSize, review: filter, severity: severityFilter, task: taskFilter })
       .then((r) => {
         setItems(r.items ?? []);
         setTotal(r.total ?? 0);
       })
       .catch((e) => toast.error("加载失败：" + (e as Error).message))
       .finally(() => setLoading(false));
-  }, [page, pageSize, filter]);
+  }, [page, pageSize, filter, severityFilter, taskFilter]);
 
   React.useEffect(() => {
     loadStats();
+    api.tasks().then((r) => setTasks(r.tasks)).catch(() => setTasks([]));
   }, [loadStats]);
 
   React.useEffect(() => {
@@ -129,7 +134,34 @@ export default function FindingReviewsPage() {
         </TabsList>
       </Tabs>
 
-      <Card className="mt-4 gap-0 overflow-hidden py-0">
+
+      <div className="mt-2 flex flex-wrap items-center gap-3">
+        <Select value={taskFilter} onValueChange={(v) => { setTaskFilter(v); setPage(1); }}>
+          <SelectTrigger className="w-56">
+            <SelectValue placeholder="全部任务" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部任务</SelectItem>
+            {tasks.map((t) => (
+              <SelectItem key={t.id} value={t.id}>
+                {t.name || t.description?.slice(0, 40) || t.id}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={severityFilter} onValueChange={(v) => { setSeverityFilter(v as "all" | Severity); setPage(1); }}>
+          <SelectTrigger className="w-36">
+            <SelectValue placeholder="全部等级" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部等级</SelectItem>
+            <SelectItem value="critical">严重</SelectItem>
+            <SelectItem value="high">高危</SelectItem>
+            <SelectItem value="medium">中危</SelectItem>
+            <SelectItem value="low">低危</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>      <Card className="mt-4 gap-0 overflow-hidden py-0">
         <CardContent className="p-0">
           <div className="overflow-x-auto">
             <Table>

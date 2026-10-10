@@ -160,33 +160,43 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-// requireAuth wraps h with access-token validation.
-// /api/auth/* and /api/health are exempt.
-// 无 Bearer 头时接受一次性 ?ticket=(SSE 专用,60s 有效、用后即焚);
-// 旧的 ?token= 形式已移除(token 不应进 URL/访问日志)。
+// requireAuth wraps h with HTTP Basic authentication.
+// /api/health stays public (uptime probes); everything else — including static
+// pages — must present valid ARTEX credentials, otherwise the server replies
+// 401 + WWW-Authenticate so the browser pops its native login dialog.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" {
+		if r.URL.Path == "/api/health" {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if tok := extractToken(r); tok != "" {
-			if !s.validAccessToken(tok) {
-				writeErr(w, 401, "token 无效或已过期")
-				return
-			}
+		if s.checkBasicAuth(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if t := r.URL.Query().Get("ticket"); t != "" && s.tickets.consume(t) {
-			h.ServeHTTP(w, r)
-			return
-		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="ARTEX", charset="UTF-8"`)
 		writeErr(w, 401, "未授权")
 	})
 }
 
+// checkBasicAuth validates the Authorization: Basic header against the bcrypt
+// password stored in settings (same hash as the old JWT login flow). Missing or
+// malformed credentials simply fail closed.
+func (s *Server) checkBasicAuth(r *http.Request) bool {
+	_, pass, ok := r.BasicAuth()
+	if !ok || pass == "" {
+		return false
+	}
+	kv := s.authSettings()
+	if kv == nil {
+		return false
+	}
+	hash, stored, err := kv.GetSetting(authPassKey)
+	if err != nil || !stored || hash == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
+}
 // ---------- refresh token(随机 32 字节,哈希存 settings) ----------
 
 // authKV 是 auth 持久层的最小接口:*db.DB 天然满足,测试注入内存实现。
@@ -382,6 +392,8 @@ func (s *Server) sseTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/auth/status — reports whether the admin password has been initialised.
+// Basic Auth mode: the browser has already passed the native credential dialog
+// by the time this route is reached, so a plain 200 is safe here.
 // 读失败必须回 503 而不是 initialized:false：前端在 initialized:false 时会把用户
 // 送到 /setup 去设置密码（login/page.tsx），把数据库故障包装成 200 等于把用户往
 // 覆盖已有密码的路上推。

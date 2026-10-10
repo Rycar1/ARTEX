@@ -32,21 +32,11 @@ export function NavUser({
   const { isMobile } = useSidebar();
   const [pwOpen, setPwOpen] = React.useState(false);
 
+    // Basic Auth mode: to "log out" we reload the page, which re-triggers the
+  // native browser credential dialog if the server sends another 401.
   function handleLogout() {
-    // 先吊销服务端 refresh token(F6),再清本地登录态;refresh 已失效也照常登出。
-    void api
-      .logout()
-      .catch(() => {
-        // refresh 已失效也照常登出,本地清理在 finally 里完成。
-      })
-      .finally(() => {
-        auth.clearToken();
-        // 硬跳转：让浏览器用已清除的 cookie 发起全新请求，
-        // middleware 才能正确读到空标记并放行 /login
-        window.location.href = "/login";
-      });
+    window.location.reload();
   }
-
   return (
     <SidebarMenu>
       <SidebarMenuItem>

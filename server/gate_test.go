@@ -233,10 +233,17 @@ func TestNewGateResolution(t *testing.T) {
 		t.Fatalf("loopback default: gate=%v err=%v", g, err)
 	}
 
-	// 非 loopback 默认开启,随机 /g- 入口,落盘 gate.path 与 gate.key。
+	// Basic Auth 模式:非 loopback 默认也关闭(不再伪装门控)。
+	g, err = NewGate("0.0.0.0:8787", dataDir, keyDir)
+	if err != nil || g != nil {
+		t.Fatalf("non-loopback default: gate=%v err=%v", g, err)
+	}
+
+	// 显式开启才生成 /g- 入口并落盘。
+	t.Setenv("ARTEX_GATE", "on")
 	g, err = NewGate("0.0.0.0:8787", dataDir, keyDir)
 	if err != nil || g == nil {
-		t.Fatalf("non-loopback default: gate=%v err=%v", g, err)
+		t.Fatalf("explicit on: gate=%v err=%v", g, err)
 	}
 	if !strings.HasPrefix(g.path, "/g-") || len(g.path) < 3+16 {
 		t.Fatalf("unexpected gate path %q", g.path)
@@ -252,6 +259,7 @@ func TestNewGateResolution(t *testing.T) {
 	if err != nil || len(strings.TrimSpace(string(kf))) < 32 {
 		t.Fatalf("gate.key file: len=%d err=%v", len(kf), err)
 	}
+	t.Setenv("ARTEX_GATE", "")
 
 	// 显式入口路径与口令。
 	t.Setenv("ARTEX_GATE_PATH", "/custom-entrance")
