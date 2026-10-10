@@ -74,6 +74,11 @@ type Server struct {
 	llmCfg    agent.Config // current LLM config (key not exposed)
 	llmOn     bool
 	llmProf   string // active LLM profile name (for llmrec tagging)
+	// revProvGlobal is the reviewer's variant of the global provider: identical to
+	// llmProv except the config's reasoning_effort is stripped (thinking forced off).
+	// Built lazily on first review call; cleared by applyLLM whenever the global
+	// config is (re)installed. Guarded by cfgMu.
+	revProvGlobal *provEntry
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -114,7 +119,14 @@ type Server struct {
 	// configured request rate. Cleared on profile edits, then repopulated by active reapply.
 	provCacheMu   sync.Mutex
 	provByProfile map[int64]*provEntry
-	provCacheGen  uint64
+	// revProvByProfile caches the reviewer's provider variant per profile id: same
+	// credentials/model as provByProfile but with reasoning_effort stripped, so the
+	// reviewer's single-JSON reply is never truncated by hidden reasoning. norma
+	// sends reasoning_effort unconditionally, so a profile-level effort re-enables
+	// thinking even when the request asks for thinking=disabled. Cleared together
+	// with provByProfile on any profile edit.
+	revProvByProfile map[int64]*provEntry
+	provCacheGen     uint64
 
 	// llmHealth is the process-wide circuit-breaker state for LLM failover (轮询).
 	// It deliberately lives OUTSIDE the provider caches: rebuilding the chain
@@ -164,7 +176,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		revProvByProfile: map[int64]*provEntry{},
+		taskAgents:       map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
 	s.initStage(dataDir)        // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
 	checkToolsManifest(dataDir) // 期 6 外部工具清单自检(缺失常态,只打汇总日志)
@@ -498,6 +511,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
+	s.revProvGlobal = nil // 全局配置换新 → 审核变体作废,下次审核调用重建
 	s.cfgMu.Unlock()
 	// LLM 轮询(默认关):把激活配置包进故障转移链,当前配置不可用时自动切下一个。
 	// 只影响「走全局激活配置」的这条路径——agent 绑定 / 任务 pin 的走 providerForProfile,
@@ -648,6 +662,114 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	return prov, cfg, true
 }
 
+// reviewVariant strips every reasoning/thinking parameter from a provider config.
+// The reviewer must answer with one compact JSON object; hidden reasoning shares the
+// same max_tokens budget and would truncate it.
+func reviewVariant(cfg agent.Config) agent.Config {
+	cfg.ReasoningEffort = ""
+	cfg.ThinkingType = "disabled"
+	return cfg
+}
+
+// providerForProfileSel picks the shared provider or, for the reviewer path, the
+// effort-free variant of the same profile. Identical selection precedence either way.
+func (s *Server) providerForProfileSel(id int64, noReasoning bool) (llm.Provider, agent.Config, bool) {
+	if noReasoning {
+		return s.reviewProviderForProfile(id)
+	}
+	return s.providerForProfile(id)
+}
+
+// globalProviderSel is providerForProfileSel for the process-wide fallback.
+func (s *Server) globalProviderSel(noReasoning bool) (llm.Provider, agent.Config, bool) {
+	if noReasoning {
+		return s.reviewGlobalProvider()
+	}
+	return s.globalProvider()
+}
+
+// reviewProviderForProfile returns a cached provider for the reviewer path that never
+// sends reasoning/thinking parameters. When the profile carries no reasoning_effort
+// the shared provider is already safe (the per-request thinking=disabled override
+// suppresses the thinking type and no effort field goes out), so it is reused as-is
+// to keep one rate limiter. Only a profile with a configured effort needs the
+// separate, effort-free instance.
+func (s *Server) reviewProviderForProfile(id int64) (llm.Provider, agent.Config, bool) {
+	s.provCacheMu.Lock()
+	if e := s.revProvByProfile[id]; e != nil {
+		s.provCacheMu.Unlock()
+		return e.prov, e.cfg, true
+	}
+	generation := s.provCacheGen
+	s.provCacheMu.Unlock()
+	cfg, ok := s.loadProfileConfig(id)
+	if !ok {
+		return nil, agent.Config{}, false
+	}
+	if cfg.ReasoningEffort == "" {
+		return s.providerForProfile(id)
+	}
+	rcfg := reviewVariant(cfg)
+	prov, err := rcfg.NewProvider()
+	if err != nil {
+		log.Printf("[engine] build review provider for LLM profile %d failed: %v", id, err)
+		return nil, agent.Config{}, false
+	}
+	if p, _ := s.m.pg.ProfileByID(id); p != nil {
+		prov = llmrec.Wrap(prov, s.m.PG(), rcfg.Model, p.Name, rcfg.ThinkingType, rcfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	}
+	s.provCacheMu.Lock()
+	if generation != s.provCacheGen {
+		s.provCacheMu.Unlock()
+		return s.reviewProviderForProfile(id)
+	}
+	if e := s.revProvByProfile[id]; e != nil { // lost the race → keep the winner
+		prov, rcfg = e.prov, e.cfg
+	} else {
+		s.revProvByProfile[id] = &provEntry{prov: prov, cfg: rcfg}
+		log.Printf("[engine] built review provider for LLM profile %d (%s / %s, thinking off)", id, rcfg.Provider(), rcfg.Model)
+	}
+	s.provCacheMu.Unlock()
+	return prov, rcfg, true
+}
+
+// reviewGlobalProvider is reviewProviderForProfile for the env/global fallback: the
+// global config rarely sets reasoning_effort, so the installed provider is reused
+// unless an effort is actually configured.
+func (s *Server) reviewGlobalProvider() (llm.Provider, agent.Config, bool) {
+	s.cfgMu.Lock()
+	if !s.llmOn || s.llmProv == nil {
+		s.cfgMu.Unlock()
+		return nil, agent.Config{}, false
+	}
+	base, profName := s.llmCfg, s.llmProf
+	if base.ReasoningEffort == "" {
+		prov := s.llmProv
+		s.cfgMu.Unlock()
+		return prov, base, true
+	}
+	if e := s.revProvGlobal; e != nil {
+		s.cfgMu.Unlock()
+		return e.prov, e.cfg, true
+	}
+	s.cfgMu.Unlock()
+	cfg := reviewVariant(base)
+	prov, err := cfg.NewProvider()
+	if err != nil {
+		log.Printf("[engine] build review provider for global config failed: %v", err)
+		return nil, agent.Config{}, false
+	}
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	s.cfgMu.Lock()
+	if s.revProvGlobal == nil { // lost the race → keep the winner
+		s.revProvGlobal = &provEntry{prov: prov, cfg: cfg}
+		log.Printf("[engine] built review provider for global config (%s / %s, thinking off)", cfg.Provider(), cfg.Model)
+	}
+	e := s.revProvGlobal
+	s.cfgMu.Unlock()
+	return e.prov, e.cfg, true
+}
+
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
@@ -689,7 +811,11 @@ func (s *Server) invalidateProfileAgents() {
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
+	s.revProvByProfile = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
+	s.cfgMu.Lock()
+	s.revProvGlobal = nil
+	s.cfgMu.Unlock()
 	s.invalidateTaskAgents()
 }
 

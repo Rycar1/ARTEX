@@ -44,6 +44,11 @@ const (
 	reviewCallTimeout = 3 * time.Minute
 	// reviewEvidenceMaxRunes 是喂给模型的正文字符上限(报告可能很长)。
 	reviewEvidenceMaxRunes = 8000
+	// reviewMaxTokens 是审核单次回复的输出上限。审核要求一段完整 JSON,1500 太小:
+	// 一旦网关把思考(thinking)计入 completion_tokens,预算会被推理吃满、JSON 从中间
+	// 截断,parseReviewJSON 拿不到闭合的 { } 就会报「未返回 JSON 对象」,并让该条永久
+	// 卡在队头阻塞整条队列。4096 给足余量(实测正常审核正文仅 250~650 token)。
+	reviewMaxTokens = 4096
 )
 
 // Reviewer 是二次审核引擎,与 Notifier/Scheduler 并列独立跑一个 goroutine。
@@ -443,22 +448,27 @@ type reviewLLMOutput struct {
 // llmReview 走该任务自己的 LLM 链(角色绑定 → 任务配置链 → 全局),一次性调用。
 // 用任务链而不是另建 profile,是为了让审核与任务跑在同一预算/故障转移语义下。
 func (r *Reviewer) llmReview(ctx context.Context, f *db.DBFinding, src string) (*db.FindingReview, error) {
-	// 四层去重第三层:把同任务/同资产的既有漏洞清单喂给模型,让它能指认重复目标。
-	// 取清单失败不算审核失败 —— 退回「无清单」,模型照常判质量与范围。
+	// 四层去重上下文:同任务/同资产的历史漏洞清单喂给模型,让它指认重复目标。
+	// 取清单失败不致命 —— 退回「无清单」,模型照常按证据与收录范围判定。
 	cands, cerr := r.pg.ListFindingDupCandidates(*f.TaskID, f.ID, f.AssetIDs, 20)
 	if cerr != nil {
-		log.Printf("[review] 取判重清单失败 finding=%d: %v", f.ID, cerr)
+		log.Printf("[review] 取候选清单失败 finding=%d: %v", f.ID, cerr)
 	}
-	runtime := &taskLLMRuntime{s: r.s, taskID: strconv.FormatInt(*f.TaskID, 10), agentKey: "reviewer"}
+	// noReasoning:审核走「不带思考参数」的 provider 变体 —— profile 上的
+	// reasoning_effort 会压过下面的 thinking=disabled,把预算烧在推理上。
+	runtime := &taskLLMRuntime{s: r.s, taskID: strconv.FormatInt(*f.TaskID, 10), agentKey: "reviewer", noReasoning: true}
 	prompt := edusrcReviewerPrompt
 	if src == db.ReviewSrcEnterprise {
 		prompt = enterpriseReviewerPrompt
 	}
 	temp := 0.0
+	user := buildReviewInput(f, cands)
+	// Thinking 必须显式 disabled:全局 profile 常开着思考,而思考 token 与正文共享
+	// 同一个 max_tokens 预算 —— 不关掉的话推理吃满预算,JSON 必然被截断。
 	req := llm.CompletionRequest{
 		System:      []string{prompt},
-		Messages:    []llm.Message{llm.UserText(buildReviewInput(f, cands))},
-		MaxTokens:   1500,
+		Messages:    []llm.Message{llm.UserText(user)},
+		MaxTokens:   reviewMaxTokens,
 		Temperature: &temp,
 		Thinking:    "disabled",
 	}
@@ -466,10 +476,38 @@ func (r *Reviewer) llmReview(ctx context.Context, f *db.DBFinding, src string) (
 	if err != nil {
 		return nil, err
 	}
-	return parseReviewJSON(strings.TrimSpace(msg.Text()), src)
+	first := strings.TrimSpace(msg.Text())
+	rev, perr := parseReviewJSON(first, src)
+	if perr == nil {
+		return rev, nil
+	}
+	// 解析失败(输出被截断、或夹带解释文字没给出 JSON)时,把上一次的原文回灌,明确
+	// 要求「只输出那一个 JSON」再试一次。多数截断/格式跑偏能在这步救回,避免该条永久
+	// 卡在队头阻塞整条审核队列。
+	log.Printf("[review] finding=%d 首次解析失败(%v),按严格 JSON 重试一次", f.ID, perr)
+	retryReq := llm.CompletionRequest{
+		System: []string{prompt, reviewJSONRetryDirective},
+		Messages: []llm.Message{
+			llm.UserText(user),
+			{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(first)}},
+			llm.UserText("你上一条回复没有给出可解析的 JSON。现在只输出那一个 JSON 对象:第一个字符必须是 { ,最后一个字符必须是 } ,不要解释、不要 Markdown 围栏、不要思考过程。"),
+		},
+		MaxTokens:   reviewMaxTokens,
+		Temperature: &temp,
+		Thinking:    "disabled",
+	}
+	msg2, _, _, err2 := runtime.Complete(ctx, retryReq)
+	if err2 != nil {
+		return nil, perr // 保留首次的解析错误,更贴近真实根因
+	}
+	return parseReviewJSON(strings.TrimSpace(msg2.Text()), src)
 }
 
-// buildReviewInput 组装喂给审核模型的漏洞上下文。漏洞文本全部来自目标侧(不可信),
+// reviewJSONRetryDirective 是「首次没给出可解析 JSON」时追加到 system 的硬约束。
+const reviewJSONRetryDirective = "补充硬约束:无论证据是否充分,你都必须只输出一个完整的 JSON 对象," +
+	"不要输出任何解释、思考过程或 Markdown 代码围栏;若证据不足以判定,也要按既定 schema 给出 " +
+	"verdict/severity/score 等全部字段(可用空数组/空字符串占位)。"
+
 // 用 WrapUntrustedData 包裹,防止里面的注入文本被当成指令。
 func buildReviewInput(f *db.DBFinding, cands []db.FindingDupCandidate) string {
 	var sb strings.Builder

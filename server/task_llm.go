@@ -51,6 +51,11 @@ type taskLLMRuntime struct {
 	s        *Server
 	taskID   string
 	agentKey string
+	// noReasoning 让这条链路解析「不带思考参数」的 provider 变体(见
+	// Server.reviewProviderForProfile)。审核调用必须输出一个紧凑 JSON,而 profile
+	// 上配的 reasoning_effort 会绕过请求级 thinking=disabled 继续生效(norma 无条件
+	// 发送 reasoning_effort),把整个 max_tokens 预算烧在隐藏推理上 → JSON 截断。
+	noReasoning bool
 }
 
 type taskLLMError struct {
@@ -122,7 +127,16 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
-	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+	// noReasoning 只改「拿到的 provider 是哪个变体」,不改 profile 选择优先级:
+	// 绑定 → 任务链 → 全局,与普通链路完全一致。
+	if r.noReasoning {
+		if id := r.s.effectiveProfileForAgent(r.agentKey, nil); id != nil {
+			if prov, cfg, ok := r.s.reviewProviderForProfile(*id); ok {
+				sel.provider, sel.retry = prov, cfg.Retry
+				return sel, nil
+			}
+		}
+	} else if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		sel.provider, sel.retry = prov, cfg.Retry
 		return sel, nil
 	}
@@ -131,14 +145,14 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
-		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
+		prov, cfg, ok := r.s.providerForProfileSel(sel.profileID, r.noReasoning)
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
 		sel.provider, sel.retry = prov, cfg.Retry
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	prov, cfg, ok := r.s.globalProviderSel(r.noReasoning)
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
