@@ -179,6 +179,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		revProvByProfile: map[int64]*provEntry{},
 		taskAgents:       map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	if m.pg != nil {
+		s.ensureRandomBasicAuth()
+	}
 	s.initStage(dataDir)        // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
 	checkToolsManifest(dataDir) // 期 6 外部工具清单自检(缺失常态,只打汇总日志)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
@@ -1162,7 +1165,7 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload)
-	root.Handle("/", s.webuiHandler())
+	root.Handle("/", s.requireAuth(s.webuiHandler()))
 	return s.gate.wrap(root)
 }
 

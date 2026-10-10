@@ -1,10 +1,12 @@
 package server
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
-	"crypto/hmac"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,6 +27,7 @@ import (
 const (
 	jwtKeyFilename = "jwt.key"
 	authPassKey    = "auth.password_hash"
+	authUserKey    = "auth.username"
 	// authKeyVersionKey 是 settings 里的密钥版本号:改密/重置密码时 +1,JWT 与
 	// refresh token 都带签发时的版本,比对不符即视为吊销(F6 改密吊销)。
 	authKeyVersionKey = "auth.key_version"
@@ -34,8 +37,8 @@ const (
 	refreshTTL        = 14 * 24 * time.Hour
 	refreshCookieName = "artex_refresh"
 	refreshCookiePath = "/api/auth"
-	baSessCookieName = "artex_ba_sess"
-	baSessTTL       = 14 * 24 * time.Hour
+	baSessCookieName  = "artex_ba_sess"
+	baSessTTL         = 14 * 24 * time.Hour
 	sseTicketTTL      = time.Minute
 	keyChars          = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -195,12 +198,16 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 // password stored in settings (same hash as the old JWT login flow). Missing or
 // malformed credentials simply fail closed.
 func (s *Server) checkBasicAuth(r *http.Request) bool {
-	_, pass, ok := r.BasicAuth()
+	user, pass, ok := r.BasicAuth()
 	if !ok || pass == "" {
 		return false
 	}
 	kv := s.authSettings()
 	if kv == nil {
+		return false
+	}
+	wantUser, uok, err := kv.GetSetting(authUserKey)
+	if err != nil || !uok || wantUser == "" || subtle.ConstantTimeCompare([]byte(user), []byte(wantUser)) != 1 {
 		return false
 	}
 	hash, stored, err := kv.GetSetting(authPassKey)
@@ -209,6 +216,47 @@ func (s *Server) checkBasicAuth(r *http.Request) bool {
 	}
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
 }
+
+// ensureRandomBasicAuth generates a random username + strong password on first
+// boot and persists them (username plaintext in settings, password bcrypt).
+// Subsequent boots reuse the stored pair; the plaintext password is logged once.
+func (s *Server) ensureRandomBasicAuth() {
+	if s.m == nil || s.m.pg == nil {
+		return
+	}
+	pg := s.m.pg
+	if user, ok, _ := pg.GetSetting(authUserKey); ok && user != "" {
+		return
+	}
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		log.Printf("[auth] random username: %v", err)
+		return
+	}
+	user := "artex-" + base64.RawURLEncoding.EncodeToString(buf)
+	pbuf := make([]byte, 18)
+	if _, err := rand.Read(pbuf); err != nil {
+		log.Printf("[auth] random password: %v", err)
+		return
+	}
+	pass := base64.RawURLEncoding.EncodeToString(pbuf)
+	hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("[auth] bcrypt: %v", err)
+		return
+	}
+	if err := pg.SetSetting(authUserKey, user); err != nil {
+		log.Printf("[auth] save username: %v", err)
+		return
+	}
+	inserted, err := pg.InsertSettingIfAbsent(authPassKey, string(hash))
+	if err != nil || !inserted {
+		log.Printf("[auth] save password: err=%v inserted=%v", err, inserted)
+		return
+	}
+	log.Printf("[auth] first-boot credentials (printed once): user=%s pass=%s", user, pass)
+}
+
 // ---------- refresh token(随机 32 字节,哈希存 settings) ----------
 
 // authKV 是 auth 持久层的最小接口:*db.DB 天然满足,测试注入内存实现。
@@ -301,7 +349,6 @@ func validateRefreshToken(kv authKV, tok string, curVer int64) (refreshRecord, b
 	}
 	return rec, true
 }
-
 
 // ---------- Basic Auth session cookie ----------
 
