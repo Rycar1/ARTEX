@@ -225,6 +225,35 @@ func (s *Server) ensureRandomBasicAuth() {
 		return
 	}
 	pg := s.m.pg
+
+	// Declarative override: when ARTEX_AUTH_USER / ARTEX_AUTH_PASSWORD are set,
+	// the stored credentials are reconciled to them on every boot, so restarts
+	// and DB wipes cannot lock the operator out.
+	envUser := strings.TrimSpace(os.Getenv("ARTEX_AUTH_USER"))
+	envPass := os.Getenv("ARTEX_AUTH_PASSWORD")
+	if envUser != "" && envPass != "" {
+		if cur, ok, _ := pg.GetSetting(authUserKey); ok && cur == envUser {
+			if hash, hok, _ := pg.GetSetting(authPassKey); hok && bcrypt.CompareHashAndPassword([]byte(hash), []byte(envPass)) == nil {
+				return
+			}
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(envPass), bcrypt.DefaultCost)
+		if err != nil {
+			log.Printf("[auth] bcrypt (env): %v", err)
+			return
+		}
+		if err := pg.SetSetting(authUserKey, envUser); err != nil {
+			log.Printf("[auth] save username (env): %v", err)
+			return
+		}
+		if err := pg.SetSetting(authPassKey, string(hash)); err != nil {
+			log.Printf("[auth] save password (env): %v", err)
+			return
+		}
+		log.Printf("[auth] credentials synced from ARTEX_AUTH_USER/ARTEX_AUTH_PASSWORD: user=%s", envUser)
+		return
+	}
+
 	force := os.Getenv("ARTEX_RESET_AUTH") == "1"
 	if !force {
 		if user, ok, _ := pg.GetSetting(authUserKey); ok && user != "" {
