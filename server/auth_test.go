@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+
+	"golang.org/x/crypto/bcrypt"
 	"testing"
 	"time"
 )
@@ -229,13 +231,37 @@ func TestRequireAuthTicketPath(t *testing.T) {
 		t.Fatalf("?token= must no longer authenticate: got %d", rec.Code)
 	}
 
-	// Bearer → 200
+	// Basic Auth → 200 + Set-Cookie
+	kv.SetSetting("auth.password_hash", string(func() []byte {
+		h, _ := bcrypt.GenerateFromPassword([]byte("testpass123"), bcrypt.MinCost)
+		return h
+	}()))
 	r = httptest.NewRequest("GET", "/api/anything", nil)
-	r.Header.Set("Authorization", "Bearer "+tokJWT)
+	r.SetBasicAuth("ARTEX", "testpass123")
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	if rec.Code != 200 || !ok {
-		t.Fatalf("bearer: want 200, got %d (ok=%v)", rec.Code, ok)
+		t.Fatalf("basic auth: want 200, got %d (ok=%v)", rec.Code, ok)
+	}
+	var sessCookie *http.Cookie
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == "artex_ba_sess" {
+			sessCookie = ck
+			break
+		}
+	}
+	if sessCookie == nil {
+		t.Fatal("basic auth success must set artex_ba_sess cookie")
+	}
+
+	// Session cookie alone → 200 (no re-prompt)
+	ok = false
+	r2 := httptest.NewRequest("GET", "/api/anything", nil)
+	r2.AddCookie(sessCookie)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, r2)
+	if rec2.Code != 200 || !ok {
+		t.Fatalf("session cookie: want 200, got %d (ok=%v)", rec2.Code, ok)
 	}
 
 	// 一次性 ticket → 200,再用 → 401

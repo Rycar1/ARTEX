@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"crypto/hmac"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,6 +34,8 @@ const (
 	refreshTTL        = 14 * 24 * time.Hour
 	refreshCookieName = "artex_refresh"
 	refreshCookiePath = "/api/auth"
+	baSessCookieName = "artex_ba_sess"
+	baSessTTL       = 14 * 24 * time.Hour
 	sseTicketTTL      = time.Minute
 	keyChars          = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -166,11 +169,20 @@ func extractToken(r *http.Request) string {
 // 401 + WWW-Authenticate so the browser pops its native login dialog.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/health" {
+		if r.URL.Path == "/api/health" || strings.HasPrefix(r.URL.Path, "/api/auth/") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if t := r.URL.Query().Get("ticket"); t != "" && s.tickets.consume(t) {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if s.verifyBASession(r) {
 			h.ServeHTTP(w, r)
 			return
 		}
 		if s.checkBasicAuth(r) {
+			setBASessionCookie(w, r, s.signBASession())
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -288,6 +300,49 @@ func validateRefreshToken(kv authKV, tok string, curVer int64) (refreshRecord, b
 		return refreshRecord{}, false
 	}
 	return rec, true
+}
+
+
+// ---------- Basic Auth session cookie ----------
+
+// signBASession returns an HMAC-signed "expiry.hmac" value keyed by jwtKey.
+func (s *Server) signBASession() string {
+	exp := time.Now().Add(baSessTTL).Unix()
+	mac := hmac.New(sha256.New, s.jwtKey)
+	fmt.Fprintf(mac, "%d", exp)
+	return fmt.Sprintf("%d.%s", exp, hex.EncodeToString(mac.Sum(nil)))
+}
+
+// verifyBASession checks cookie expiry + HMAC. Fail closed on any mismatch.
+func (s *Server) verifyBASession(r *http.Request) bool {
+	c, err := r.Cookie(baSessCookieName)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	parts := strings.SplitN(c.Value, ".", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	exp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || time.Now().Unix() >= exp {
+		return false
+	}
+	mac := hmac.New(sha256.New, s.jwtKey)
+	fmt.Fprintf(mac, "%d", exp)
+	return hmac.Equal([]byte(parts[1]), []byte(hex.EncodeToString(mac.Sum(nil))))
+}
+
+// setBASessionCookie writes the HttpOnly session cookie on successful Basic Auth.
+func setBASessionCookie(w http.ResponseWriter, r *http.Request, val string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     baSessCookieName,
+		Value:    val,
+		Path:     "/",
+		MaxAge:   int(baSessTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isHTTPS(r),
+	})
 }
 
 // setRefreshCookie 下发 HttpOnly refresh cookie:Path 收窄到 /api/auth(只有
