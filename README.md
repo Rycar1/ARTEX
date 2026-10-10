@@ -167,6 +167,20 @@ docker compose up -d --build
 - **部署预检**：装完/升级后跑 `./artex doctor`——检查 PG、LLM profile、data 可写、隧道工具、军火库、门控、回连地址，FAIL 退出码 1。
 - 工具在「工具」页注册为自定义工具（`kind=shell`）后 agent 才能调用。
 
+### CTF 工具箱（misc / RE / pwn）
+
+镜像内置一层 CTF 常用件（`packaging/ctf-tools.sh`，根 `Dockerfile` / `Dockerfile.source` / 二开 `Dockerfile.fork` 共用同一份清单）：
+
+| 分类 | 工具 |
+| --- | --- |
+| misc / 取证 | file、xxd、binwalk、foremost、sleuthkit、testdisk、steghide、outguess、pngcheck、exiftool、zbar、poppler、qpdf、pdfcrack、fcrackzip、7z、hashcat、john、tshark、tcpdump、ffmpeg、sox、imagemagick、sqlite3、gawk |
+| RE | binutils（objdump/readelf/strings/nm）、gdb、gdb-multiarch、strace、ltrace、nasm、patchelf；pip：capstone、keystone-engine、unicorn、z3-solver、sympy |
+| pwn | build-essential、qemu-user、qemu-user-static、patchelf；pip：pwntools、ROPgadget、ropper；gem：one_gadget、seccomp-tools、zsteg |
+| 可选（`CTF_EXTRA=1`） | radare2 6.2.4、upx 5.2.1（bookworm 无 apt 候选包，走 GitHub 钉版 + sha256 校验，校验不过自动跳过，不中断构建） |
+
+- 构建参数（默认官方源，国内构建建议传）：`APT_MIRROR` / `PIP_MIRROR` / `GEM_SOURCE` / `CTF_EXTRA` / `GH_PROXY`，compose 读同名环境变量，如 `APT_MIRROR=mirrors.tuna.tsinghua.edu.cn PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple CTF_EXTRA=1 docker compose build`。
+- Agent 侧无需注册：这些是 CLI 与 Python/gem 库，Bash 工具直接可调；`skills/ctf-toolbox/` 提供「什么时候用哪个」的选型索引。
+
 ## 升级
 
 - **重启即迁移**:schema 每次启动幂等重跑，升级只换程序不动数据（备份 `./data` 与数据库仍是好习惯）。

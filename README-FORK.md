@@ -44,6 +44,7 @@
 - `packaging/tools-manifest.json`：17 项外部工具（gogo/naabu/httpx/katana/fscan/impacket/nxc/mimikatz/pypykatz/laZagne/ligolo/peass/penelope/suo5/chisel）的钉版清单，启动自检 sha256（不匹配只警告），未确认哈希一律留空不编造。
 - `artex doctor`：7 项部署预检（PG/LLM/data 可写/隧道工具/军火库/门控/回连地址），FAIL 退出码 1，只读不启动服务。
 - systemd unit（崩溃重拉、开机自启、与页面一键更新的退出码 75 换装兼容）。
+- `packaging/ctf-tools.sh`：CTF 工具层（misc/RE/pwn 常用件 + pwntools/z3/capstone/keystone/unicorn + zsteg/one_gadget/seccomp-tools），三份 Dockerfile 共用一份清单；构建参数可换镜像源，`CTF_EXTRA=1` 追加 radare2/upx（钉版 sha256，校验不过跳过）。配套 `skills/ctf-toolbox/`（SKILL.md + refs/{misc,rev,pwn}.md）供 agent 选型。
 
 ### 5. 稳定性（实战中踩出来的）
 

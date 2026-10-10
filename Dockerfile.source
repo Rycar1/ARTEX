@@ -52,6 +52,22 @@ RUN npm config set registry "$NPM_REGISTRY" \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------- CTF 工具层（misc / RE / pwn 常用件）----------
+# 一份脚本三处复用（Dockerfile / Dockerfile.source / Dockerfile.fork），包清单不漂移。
+# 构建参数（全部可选，默认官方源；国内构建强烈建议传镜像源）：
+#   docker build --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
+#                --build-arg PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple \
+#                --build-arg CTF_EXTRA=1 -t artex:local .
+# CTF_EXTRA=1 才额外装 radare2 / upx（bookworm 无候选包，走 GitHub 钉版 sha256）。
+ARG APT_MIRROR=
+ARG PIP_MIRROR=
+ARG GEM_SOURCE=
+ARG CTF_EXTRA=0
+ARG GH_PROXY=
+COPY packaging/ctf-tools.sh /tmp/ctf-tools.sh
+RUN sh /tmp/ctf-tools.sh && rm -f /tmp/ctf-tools.sh
+
 WORKDIR /app
 COPY --from=gobuild /out/artex /app/artex
 COPY start.sh /app/start.sh
