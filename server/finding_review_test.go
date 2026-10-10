@@ -162,3 +162,45 @@ func TestApplyReviewFallbackKeepsDuplicateIgnored(t *testing.T) {
 		t.Fatalf("已判重复不该被兜底转 deepen,得到 %q", got.Verdict)
 	}
 }
+
+func TestCorsReviewFindingIgnoresReflectionWithoutProof(t *testing.T) {
+	// 典型误报:任意 Origin 反射 + allow-credentials,但没有跨域读到数据的证据。
+	cases := []struct{ class, name, evidence string }{
+		{"CORS 配置错误", "CORS 配置错误 https://oa.example.com/api", "Access-Control-Allow-Origin 反射任意 Origin,Allow-Credentials: true"},
+		{"CORS misconfiguration", "arbitrary Origin reflection", "evil.com 收到 ACAO: evil.com"},
+		{"跨域配置错误", "网关任意 Origin 反射", "预检返回 204,ACAO 逐字反射"},
+	}
+	for _, c := range cases {
+		f := &db.DBFinding{VulnClass: c.class, Name: c.name, Evidence: c.evidence}
+		rev := ruleReviewFinding(f)
+		if rev == nil || rev.Verdict != db.ReviewVerdictIgnored {
+			t.Fatalf("%s: 期望规则层 ignored,得到 %+v", c.name, rev)
+		}
+	}
+}
+
+func TestCorsReviewFindingPassesWhenDataTheftProven(t *testing.T) {
+	// 有真实跨域窃取敏感数据的证据时应放行给 LLM 复核,不能规则层一刀切。
+	f := &db.DBFinding{
+		VulnClass: "CORS 配置错误",
+		Name:      "CORS 任意 Origin 反射",
+		Evidence:  "用恶意页面跨域读取到用户手机号与身份证,已窃取到真实敏感数据",
+	}
+	if rev := ruleReviewFinding(f); rev != nil {
+		t.Fatalf("有真实利用证据的 CORS 不该被规则层拦截: %+v", rev)
+	}
+}
+
+func TestCorsNotRescuedToDeepen(t *testing.T) {
+	// CORS 命中 never-deepen,即使正文含「信息泄露」也不该被兜底转 deepen。
+	f := &db.DBFinding{
+		VulnClass: "CORS 配置错误",
+		Name:      "CORS 任意 Origin 反射导致信息泄露",
+		Summary:   "跨域信息泄露",
+		Evidence:  "ACAO 反射任意 Origin",
+	}
+	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, Reasons: "CORS 误配"}
+	if got := applyReviewFallback(f, rev, db.ReviewSrcEnterprise); got.Verdict != db.ReviewVerdictIgnored {
+		t.Fatalf("CORS 不该被兜底转 deepen,得到 %q", got.Verdict)
+	}
+}

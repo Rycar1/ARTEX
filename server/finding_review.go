@@ -34,6 +34,12 @@ const (
 	reviewPollInterval = 30 * time.Second
 	// reviewBatchSize 是单轮补偿扫描最多审几条(串行,限住 LLM 花费)。
 	reviewBatchSize = 10
+	// reviewScanWindow 是单轮最多从库里取多少条候选来挑。取大于批量的窗口,是为了
+	// 跳过「刚失败、处于冷却期」的条目,避免队头几条一直失败把整条队列卡死。
+	reviewScanWindow = 200
+	// reviewFailCooldown 是单条漏洞审核失败后的冷却时间。冷却期内不再重试它,让扫描
+	// 能推进到队列后面的条目(否则队头失败会无限阻塞整条队列)。
+	reviewFailCooldown = 10 * time.Minute
 	// reviewCallTimeout 是单条漏洞审核的整体超时。
 	reviewCallTimeout = 3 * time.Minute
 	// reviewEvidenceMaxRunes 是喂给模型的正文字符上限(报告可能很长)。
@@ -47,10 +53,11 @@ type Reviewer struct {
 
 	mu       sync.Mutex
 	inflight map[int64]bool
+	failed   map[int64]time.Time // id -> 上次审核失败时间(冷却用)
 }
 
 func newReviewer(s *Server) *Reviewer {
-	return &Reviewer{s: s, pg: s.m.pg, inflight: map[int64]bool{}}
+	return &Reviewer{s: s, pg: s.m.pg, inflight: map[int64]bool{}, failed: map[int64]time.Time{}}
 }
 
 // Run 循环直到 ctx 结束。由 server.New 启动一次。
@@ -73,23 +80,36 @@ func (r *Reviewer) Run(ctx context.Context) {
 // sweep 补偿扫描:把「开了审核但没审过」的漏洞补审一遍。任何失败只记日志、不中断循环。
 // 逐条串行、每轮上限 reviewBatchSize,是为了把 LLM 花费钉在一个可预期的量级。
 func (r *Reviewer) sweep(ctx context.Context) {
-	list, err := r.pg.ListFindingsAwaitingReview(reviewBatchSize)
+	cands, err := r.pg.ListFindingsAwaitingReview(reviewScanWindow)
 	if err != nil {
 		log.Printf("[review] 扫描待审漏洞失败: %v", err)
 		return
 	}
-	failed := 0
-	for _, f := range list {
+	if len(cands) == 0 {
+		return
+	}
+	tried, failed := 0, 0
+	for _, f := range cands {
 		if ctx.Err() != nil {
 			return
 		}
+		if tried >= reviewBatchSize {
+			break
+		}
+		if r.inCooldown(f.ID) {
+			continue
+		}
+		tried++
 		if err := r.runOne(ctx, f.ID); err != nil {
 			failed++
+			r.markFailed(f.ID)
 			log.Printf("[review] 补审漏洞 %d 失败: %v", f.ID, err)
+		} else {
+			r.clearFailed(f.ID)
 		}
 	}
 	if failed > 0 {
-		log.Printf("[review] 本轮补审 %d 条,失败 %d 条(下一轮重试)", len(list), failed)
+		log.Printf("[review] 本轮补审 %d 条,失败 %d 条(失败条目冷却 %s 后再试)", tried, failed, reviewFailCooldown)
 	}
 }
 
@@ -116,6 +136,28 @@ func (r *Reviewer) claim(id int64) bool {
 func (r *Reviewer) release(id int64) {
 	r.mu.Lock()
 	delete(r.inflight, id)
+	r.mu.Unlock()
+}
+
+// inCooldown 报告某条漏洞是否处于「审核失败冷却期」。
+func (r *Reviewer) inCooldown(id int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.failed[id]
+	return ok && time.Since(t) < reviewFailCooldown
+}
+
+// markFailed 记录一条漏洞审核失败,使其进入冷却期,不再阻塞队头。
+func (r *Reviewer) markFailed(id int64) {
+	r.mu.Lock()
+	r.failed[id] = time.Now()
+	r.mu.Unlock()
+}
+
+// clearFailed 在一条漏洞审核成功后清掉它的失败记录。
+func (r *Reviewer) clearFailed(id int64) {
+	r.mu.Lock()
+	delete(r.failed, id)
 	r.mu.Unlock()
 }
 
@@ -233,7 +275,50 @@ func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
 			}
 		}
 	}
+	// CORS/跨域误配:SRC 普遍不收录「任意 Origin 反射 + 允许携带凭据」本身。除非证据里
+	// 明确写了已经跨域读到受保护的敏感数据(真实利用),否则规则层直接 ignored,不再交给
+	// 不稳定的 LLM 判(实测同一类 CORS 会被 LLM 一会儿 accepted、一会儿 ignored)。
+	if r := corsReviewFinding(f); r != nil {
+		return r
+	}
 	return nil
+}
+
+// corsVulnMarkers 命中即认为是 CORS/跨域类漏洞。
+var corsVulnMarkers = []string{"cors", "跨域", "cross-origin", "cross origin", "access-control-allow-origin"}
+
+// corsExploitProofMarkers 是「CORS 已被真实利用」的强证据特征。只有证据里出现这些词才
+// 放行给 LLM 复核;否则按 SRC 通用口径直接忽略,避免把 CORS 误配当有效漏洞放过。
+var corsExploitProofMarkers = []string{
+	"窃取到", "窃取成功", "成功读取到敏感", "跨域读取到", "读取到用户数据", "读取到受害者",
+	"读取到个人信息", "读取到手机号", "读取到身份证", "exfiltrated", "data theft", "stole sensitive",
+}
+
+// corsReviewFinding 对 CORS/跨域类漏洞做规则层判定:命中 CORS 且没有真实利用证据 → ignored;
+// 有真实利用证据 → nil(交给 LLM 复核,避免误杀能跨域窃取数据的 CORS)。
+func corsReviewFinding(f *db.DBFinding) *db.FindingReview {
+	head := strings.ToLower(f.VulnClass + " " + f.Name)
+	if !containsAny(head, corsVulnMarkers) {
+		return nil
+	}
+	evidence := strings.ToLower(f.Summary + "\n" + f.Evidence + "\n" + f.Report)
+	if containsAny(evidence, corsExploitProofMarkers) {
+		return nil
+	}
+	return &db.FindingReview{
+		Verdict:  db.ReviewVerdictIgnored,
+		Severity: "low",
+		Reasons:  "CORS/跨域配置误配:仅「任意 Origin 反射/允许携带凭据」而无跨域窃取到敏感数据的 PoC,SRC 不予收录(规则层自动判定)",
+	}
+}
+
+func containsAny(hay string, keys []string) bool {
+	for _, k := range keys {
+		if strings.Contains(hay, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +333,7 @@ func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
 var reviewNeverDeepenMarkers = []string{
 	"反射型xss", "反射型 xss", "反射xss", "反射 xss", "self-xss", "self xss", "自xss", "自身xss",
 	"用户名枚举", "用户枚举", "账号枚举", "账户枚举", "user enumeration",
+	"cors", "跨域", "cross-origin", "access-control-allow-origin",
 	"phpinfo", "目录列表", "directory listing", "内网ip", "私网ip",
 	"拒绝服务", "ddos", "资源耗尽", "dos攻击",
 	"短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸", "sms bomb", "email bomb",
@@ -339,19 +425,19 @@ func applyReviewFallback(f *db.DBFinding, rev *db.FindingReview, src string) *db
 
 // reviewLLMOutput 是审核模型返回的 JSON 结构(契约见 review_prompts.go)。
 type reviewLLMOutput struct {
-	Verdict          string   `json:"verdict"`
-	Severity         string   `json:"severity"`
-	Score            *float64 `json:"score"`
-	InScope          *bool    `json:"in_scope"`
-	IsDuplicate      *bool    `json:"is_duplicate"`
+	Verdict     string   `json:"verdict"`
+	Severity    string   `json:"severity"`
+	Score       *float64 `json:"score"`
+	InScope     *bool    `json:"in_scope"`
+	IsDuplicate *bool    `json:"is_duplicate"`
 	// DuplicateOf 是模型指认的重复目标 finding id。用 RawMessage 而不是 int64:
 	// 模型可能给数字、字符串("12")或带前缀的文本("finding #12"),这里统一容错解析,
 	// 解析不出就当作没指认(不能让一个格式问题把整条审核打挂)。
-	DuplicateOf json.RawMessage `json:"duplicate_of"`
-	Reproduced       *bool    `json:"reproduced"`
-	IgnoreReasons    []string `json:"ignore_reasons"`
-	DowngradeReasons []string `json:"downgrade_reasons"`
-	ReviewerNotes    string   `json:"reviewer_notes"`
+	DuplicateOf      json.RawMessage `json:"duplicate_of"`
+	Reproduced       *bool           `json:"reproduced"`
+	IgnoreReasons    []string        `json:"ignore_reasons"`
+	DowngradeReasons []string        `json:"downgrade_reasons"`
+	ReviewerNotes    string          `json:"reviewer_notes"`
 }
 
 // llmReview 走该任务自己的 LLM 链(角色绑定 → 任务配置链 → 全局),一次性调用。
