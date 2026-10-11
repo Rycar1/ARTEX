@@ -238,6 +238,9 @@ func TestBuiltinTaskTemplatesRefreshOnVersionBump(t *testing.T) {
 	if !strings.Contains(got.Goal, "结束条件") || !strings.Contains(got.Goal, "必须") {
 		t.Fatalf("SRC goal lost the must-cover-all-assets end condition")
 	}
+	if !strings.Contains(got.Goal, "单资产多漏洞") {
+		t.Fatalf("SRC goal lost the per-asset multi-vuln exhaustive rule")
+	}
 	if v, _, _ := d.GetSetting(builtinTaskTemplatesVersionKey); v != builtinTaskTemplatesVersion {
 		t.Fatalf("version flag = %q, want %q", v, builtinTaskTemplatesVersion)
 	}
