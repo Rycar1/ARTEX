@@ -130,12 +130,23 @@ type Interceptor struct {
 	enabledTools map[string]bool // nil means not loaded yet
 	pending      *pendingManager
 	reviewer     Reviewer // nil = LLM fallback judge not wired
+	// taskOpMode 由 server 层注入:按任务 id 解析作战模式("standard"|"aggressive")。
+	// nil → 一律按 standard。见 SetTaskOpMode。
+	taskOpMode func(taskID string) string
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
 func (i *Interceptor) SetReviewer(r Reviewer) {
 	i.mu.Lock()
 	i.reviewer = r
+	i.mu.Unlock()
+}
+
+// SetTaskOpMode installs the task→op_mode resolver used by HandleAsk to auto-approve asks
+// for tasks running in aggressive mode. Passing nil disables the aggressive auto-approve.
+func (i *Interceptor) SetTaskOpMode(fn func(taskID string) string) {
+	i.mu.Lock()
+	i.taskOpMode = fn
 	i.mu.Unlock()
 }
 
@@ -303,6 +314,9 @@ type Decision struct {
 	TimeoutEnabled   bool
 	TimeoutSeconds   int
 	TimeoutAction    string // "deny" | "allow"
+	// NoAutoAllow 为 true 时该 ask 不受「一键放行 / 激进模式」自动批准豁免,仍需人工裁决。
+	// 用于 RoE 授权范围强制 —— 激进模式放宽技术限制,但资产范围边界不能自动放行。
+	NoAutoAllow bool
 }
 
 // --- LLM fallback judge ---
@@ -611,6 +625,14 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	// 仅作用于 ask 审批;deny 规则在 guard 的 deny 分支拦截,不经过这里。
 	if i.AutoAllowStatus().Enabled {
 		i.autoAllowApprove(ctx, convID, dec, toolName, input)
+		return true
+	}
+
+	// 激进模式(任务级):该任务的所有 ask 审批直接放行,不进 pending,历史记
+	// decision_source=aggressive。资产范围(RoE)强制审批带 NoAutoAllow 标记,不受此豁免,
+	// 保证「资产不打偏」的底线不被激进模式绕过。deny 规则同样不经过这里。
+	if !dec.NoAutoAllow && i.aggressiveTask(ctx) {
+		i.autoApproveAs(ctx, convID, dec, toolName, input, "aggressive", "激进模式自动批准")
 		return true
 	}
 

@@ -278,6 +278,7 @@ export const api = {
     coverageEnabled?: boolean;
     reviewEnabled?: boolean;
     reviewSrcType?: string;
+    opMode?: string;
     interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
@@ -294,6 +295,7 @@ export const api = {
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       review_enabled: input.reviewEnabled ?? false, // 默认关;true=新漏洞自动进入 AI 二次审核
       review_src_type: input.reviewSrcType ?? "edusrc", // 审核标准:edusrc(默认) | enterprise
+      op_mode: input.opMode ?? "standard", // 作战模式:standard(默认) | aggressive(激进,红色警示)
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),

@@ -41,6 +41,7 @@ export interface Task {
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
   review_enabled?: boolean; // 二次审核开关(创建时定,默认关)；true=新漏洞自动进入 AI 二次审核
   review_src_type?: string; // 审核标准:edusrc(默认) | enterprise
+  op_mode?: string; // 作战模式:standard(默认,稳健) | aggressive(激进)
 }
 
 export interface TaskCategory {

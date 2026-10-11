@@ -1116,7 +1116,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	//     pendingTriggers 只有 done/finding/goal*/cancelled),而 planner 每轮
 	//     graph overview 必读 hints(agent/tools.go graphOverviewData),这是
 	//     现有结构里检测信号进 planner 视野的既有通道(参照 add_hint 路径)。
-	hooks.det = agent.NewStuckDetector(agent.DefaultStuckConfig())
+	stuckCfg := agent.DefaultStuckConfig()
+	if db.IsAggressiveOpMode(t.OpMode) {
+		// 激进模式:抬高同质/失败触发阈值、提高每意图触发上限,深挖途中不轻易判定「信息梯度为零」。
+		stuckCfg = agent.AggressiveStuckConfig()
+	}
+	hooks.det = agent.NewStuckDetector(stuckCfg)
 	// chains L3 → L1:停滞触发时附上类别化转向建议(按意图 chain_tags 从对应类
 	// 骨架抽"转向"条目,无匹配则为空、维持通用措辞)。一次性算好,整条意图不变。
 	hooks.det.PivotHint = chainskel.PivotHintsForIntent(intent.Payload, 3)

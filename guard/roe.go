@@ -112,7 +112,9 @@ func (g *Guard) roeAsk(ctx context.Context, ev hook.Event, reason string) (hook.
 	if ctx.Err() != nil {
 		return g.block(ev.ToolName, systemBlockMessage("工作已取消，平台安全管控阻止执行"), ""), true
 	}
-	dec := intercept.Decision{Action: "ask", RuleName: "内置 RoE 范围强制", Message: reason}
+	// NoAutoAllow:RoE 范围强制审批不参与「一键放行 / 激进模式」自动批准 —— 激进模式
+	// 放宽技术限制,但资产范围边界必须人工把关(保证「资产不打偏」)。
+	dec := intercept.Decision{Action: "ask", RuleName: "内置 RoE 范围强制", Message: reason, NoAutoAllow: true}
 	convID := intercept.ConvIDFromContext(ctx)
 	if !g.interceptor.HandleAsk(ctx, convID, dec, ev.ToolName, ev.Input) {
 		return g.block(ev.ToolName, systemBlockMessage("RoE 范围外目标，人工审批未通过（用户拒绝或审批超时）"), ""), true

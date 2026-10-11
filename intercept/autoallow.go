@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 // SettingAutoAllow is the settings 键 for the one-click auto-allow switch
@@ -79,12 +81,35 @@ func (i *Interceptor) AutoAllowStatus() AutoAllowState {
 // the approval into history with decision_source = "auto_allow" (审计完整,可
 // 区分无人值守放行与人工/模型/规则裁决), then allow without creating a pending
 // record. deny 规则不经过这里(guard 的 deny 分支直接拦截,不受本开关影响)。
-func (i *Interceptor) autoAllowApprove(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) {
+// aggressiveTask 报告 ctx 所属任务是否处于激进模式(由 server 注入的解析器判定)。
+// 无任务上下文(chat 等)或未装配解析器 → false(保守)。
+func (i *Interceptor) aggressiveTask(ctx context.Context) bool {
+	taskID, _ := taskInfoFromCtx(ctx)
+	if taskID == "" {
+		return false
+	}
+	i.mu.RLock()
+	fn := i.taskOpMode
+	i.mu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	return db.IsAggressiveOpMode(fn(taskID))
+}
+
+// autoApproveAs 以给定 decision_source 记录一次「平台自动批准」的 ask(不进 pending)。
+// source="auto_allow"(一键放行)或 "aggressive"(任务激进模式)。
+func (i *Interceptor) autoApproveAs(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, source, label string) {
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, "allowed")
-	reason := fmt.Sprintf("一键放行自动批准: %s", dec.Message)
-	id, err := i.db.CreateDecidedInterceptWithSource(dec.RuleID, convID, taskID, agentName, toolName, input, "allowed", reason, "auto_allow", audit)
+	reason := fmt.Sprintf("%s: %s", label, dec.Message)
+	id, err := i.db.CreateDecidedInterceptWithSource(dec.RuleID, convID, taskID, agentName, toolName, input, "allowed", reason, source, audit)
 	if err == nil {
 		i.bindResult(ctx, id, audit)
 	}
+}
+
+// autoAllowApprove 处理一键放行启用中的 ask:历史记 decision_source="auto_allow"。
+func (i *Interceptor) autoAllowApprove(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) {
+	i.autoApproveAs(ctx, convID, dec, toolName, input, "auto_allow", "一键放行自动批准")
 }

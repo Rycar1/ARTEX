@@ -581,7 +581,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
+	workerRunSecs := s.agentRunSeconds("worker")
+	if db.IsAggressiveOpMode(t.OpMode) && workerRunSecs > 0 {
+		workerRunSecs *= 2 // 激进模式:单次 run 墙钟预算加倍,深挖不被过早截断
+	}
+	wk.SetRunTimeout(time.Duration(workerRunSecs) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetTaskProxyResolver(s.m.TaskProxyForTask) // 期 3b:按任务 MITM(经隧道时 任务实例→任务 socks)
 	wk.SetWebSearch(s.webSearchFor("worker"))

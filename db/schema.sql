@@ -527,6 +527,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
     review_enabled BOOLEAN NOT NULL DEFAULT false,
     review_src_type TEXT NOT NULL DEFAULT 'edusrc',
+    op_mode        TEXT NOT NULL DEFAULT 'standard',
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -553,6 +554,10 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEF
 -- review_src_type 决定审核标准:edusrc(EduSRC 严格收录标准)/ enterprise(企业 SRC 高价值影响)。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_enabled BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_src_type TEXT NOT NULL DEFAULT 'edusrc';
+-- 任务作战模式;补旧库。standard(默认,稳健)/ aggressive(激进):激进模式下放宽一切
+-- 技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),但保留资产范围边界与
+-- 破坏性操作底线。见 db/op_mode.go、server/op_mode.go。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS op_mode TEXT NOT NULL DEFAULT 'standard';
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.

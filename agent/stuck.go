@@ -36,6 +36,17 @@ func DefaultStuckConfig() StuckConfig {
 	}
 }
 
+// AggressiveStuckConfig 是激进模式(任务 op_mode=aggressive)的停滞检测参数:同质响应/
+// 同工具失败的触发阈值大幅抬高、冷却缩短、每意图触发上限提高,避免深挖途中被过早打断。
+// 检测本身保留(仍会注入转向指令),只是不轻易判定「信息梯度为零」。
+func AggressiveStuckConfig() StuckConfig {
+	return StuckConfig{
+		Window: 40, SigPrefix: 200,
+		SameSigTrigger: 30, FailTrigger: 40, FailSimilarity: 0.9,
+		Cooldown: 6, MaxFires: 8,
+	}
+}
+
 // 归一化规则(顺序敏感):时间戳 → 路径/URL → 长 hex → 长随机串 → 数字 → 空白折叠。
 // 目的:同一拦截页/同一崩溃输出里嵌着的时间戳、请求 id、临时路径、随机 token 不该
 // 把"同质"伪装成"不同"。

@@ -62,6 +62,7 @@ type TaskDTO struct {
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	ReviewEnabled      bool               `json:"review_enabled"`   // 二次审核开关(创建时定,默认关)
+	OpMode             string             `json:"op_mode"`          // 作战模式:standard(默认) | aggressive(激进)
 	ReviewSrcType      string             `json:"review_src_type"`  // 审核标准:edusrc | enterprise
 }
 
@@ -138,6 +139,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CoverageEnabled:    t.CoverageEnabled,
 		ReviewEnabled:      t.ReviewEnabled,
 		ReviewSrcType:      t.ReviewSrcType,
+		OpMode:             t.OpMode,
 	}
 }
 
