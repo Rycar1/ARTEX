@@ -573,6 +573,17 @@ type steerHooks struct {
 // 闸挡的是「工具 → 空转 → 推 → 工具 → 空转」这种病态循环，别让它把意图预算耗光。
 const defaultEmptyTurnNudges = 2
 
+// defaultBudgetRetryLimit 是「预算耗尽且零产出」时自动重开意图的默认次数上限。
+// 1 = 只兜底一次(「1 次就够」)：既不放过被掐死的一棒，又不会无限重开。
+const defaultBudgetRetryLimit = 1
+
+// settingBudgetRetryLimit 是 settings 表里覆盖上面默认值的键(负值=关闭兜底)。
+const settingBudgetRetryLimit = "budget_retry_limit"
+
+// toolInterruptedMarker 是 SDK(norma/harness)在预算/取消打断工具时写入 tool_result
+// 的固定文案；零产出判定据此区分「工具跑完了」与「工具被掐断」。
+const toolInterruptedMarker = "tool execution interrupted"
+
 // emptyTurnNudge 是空转回合注入的续跑指令。
 //
 // 这种回合在 harness 眼里是一次自然结束(stop_reason=end_turn 且无 tool_use)，五层
@@ -1026,6 +1037,26 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	return e.runIntent(ctx, t, name, worker, intent, "", "")
 }
 
+// budgetRetryLimit 解析零产出兜底的重开次数上限，读全局 settings 的
+// budget_retry_limit 键；未配置/非法 → defaultBudgetRetryLimit，负值 → 0(关闭)。
+func (e *Engine) budgetRetryLimit() int {
+	if e == nil || e.m == nil || e.m.pg == nil {
+		return defaultBudgetRetryLimit
+	}
+	v, ok, err := e.m.pg.GetSetting(settingBudgetRetryLimit)
+	if err != nil || !ok {
+		return defaultBudgetRetryLimit
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return defaultBudgetRetryLimit
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // runIntent executes and fully settles one already-claimed (state=running) intent.
 // Both the pool worker loop (via runWorkerStep) and the human-message handler (via
 // runDetachedIntent, a dedicated goroutine outside the worker pool) call it, so the
@@ -1038,7 +1069,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
-	emit := func(r db.Activity) { e.emitActivity(t, r) }
+	// okTools 统计本次 run 里「真正跑完」的工具调用数。SDK 因预算/取消打断的工具会
+	// 返回 "tool execution interrupted"(IsError=true)，不计入——它是「这一棒被掐死在
+	// 起跑线」的判据，供下方零产出兜底决定是否自动重开。
+	var okTools atomic.Int64
+	emit := func(r db.Activity) {
+		if r.Kind == "tool_result" && !strings.Contains(r.Summary, toolInterruptedMarker) {
+			okTools.Add(1)
+		}
+		e.emitActivity(t, r)
+	}
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
@@ -1221,6 +1261,22 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	case reason == harness.ReasonTimeout:
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
+	}
+	// 零产出兜底(C)：预算耗尽(exhausted)且这一棒没真正跑成——没有任何工具成功返回，
+	// 或整棒零写回——就自动重开一次，带着原 transcript 换个槽位继续，而不是把这一棒
+	// 直接作废。仅兜底一次(settings.budget_retry_limit，默认 1)，防止无限重开。
+	if state == "exhausted" && (okTools.Load() == 0 || wrote.Total() == 0) {
+		if limit := e.budgetRetryLimit(); limit > 0 {
+			reopened, rerr := t.Store.BumpIntentBudgetRetry(intent.ID, limit)
+			if rerr != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 零产出兜底重开失败: %v", name, t.ID, intent.ID, rerr)
+			} else if reopened {
+				log.Printf("[worker %s] task %s 意图 #%d 预算耗尽且零产出(成功工具 %d，写回 %s) → 自动重开重试",
+					name, t.ID, intent.ID, okTools.Load(), wrote)
+				e.touch(t.ID)
+				return true
+			}
+		}
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)

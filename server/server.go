@@ -357,15 +357,20 @@ func (s *Server) agentMaxTurns(key string) int {
 	return a.MaxTurns
 }
 
+// defaultAgentRunSeconds 是未显式配置时，一条意图单次 run 的墙钟预算(秒)。
+// 45 分钟：够把一批探测跑完并写回，又不至于一棒卡死太久。原为 1200(20 分钟)——
+// 实测长脚本常跑到一半被强制打断、整棒零产出(见 engine 的零产出兜底)。
+const defaultAgentRunSeconds = 2700
+
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
-// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// agent key (0 = unlimited; defaultAgentRunSeconds fallback when no DB or no row).
 func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
-		return 1200
+		return defaultAgentRunSeconds
 	}
 	a, err := s.m.pg.GetAgentByKey(key)
 	if err != nil || a == nil {
-		return 1200
+		return defaultAgentRunSeconds
 	}
 	return a.RunSecs
 }

@@ -357,6 +357,32 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 	return n > 0, nil
 }
 
+// BumpIntentBudgetRetry reopens an exhausted intent for one more run when it has
+// not yet used up its budget-retry allowance. The attempt count is stored in the
+// intent payload under "budget_retry" so the cap survives restarts. Returns
+// (true, nil) when the intent was reopened (state -> open); (false, nil) when the
+// allowance is spent or the intent is not in the retryable 'exhausted' state.
+func (s *ExplorationStore) BumpIntentBudgetRetry(id int64, maxRetries int) (bool, error) {
+	if maxRetries <= 0 {
+		return false, nil
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL,
+    content_version=content_version+1,
+    payload = jsonb_set(payload, '{budget_retry}',
+        to_jsonb(COALESCE(NULLIF(payload->>'budget_retry','')::int, 0) + 1), true)
+WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='exhausted'
+  AND COALESCE(NULLIF(payload->>'budget_retry','')::int, 0) < $3`, id, s.expID, maxRetries)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // ReopenBlockedIntents flips EVERY 'blocked' intent in this exploration back to 'open'
 // (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
 // number reopened. Workers resume from their transcripts; kept graph writes remain.
