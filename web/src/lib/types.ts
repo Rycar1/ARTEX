@@ -521,7 +521,7 @@ export interface Finding {
   assets?: FindingAsset[];
   // AI 二次审核结论(见 server/finding_review.go)。review_verdict 空串=尚未审核;
   // ignored 的漏洞已被自动置为 status=ignored,原因写在 review_reasons。
-  review_verdict?: "accepted" | "ignored" | "deepen" | "";
+  review_verdict?: "accepted" | "ignored" | "";
   review_severity?: Severity | "";
   review_score?: number;
   review_reasons?: string;
@@ -604,15 +604,14 @@ export interface FindingDeepenResponse {
 
 // ---- AI 二次审核 (finding review) ----
 // ReviewVerdict 是 AI 二次审核的结论:accepted=收录;ignored=不符合收录标准(已自动
-// 置为忽略);deepen=有价值但没打穿,建议深挖。空串=尚未审核。
-export type ReviewVerdict = "accepted" | "ignored" | "deepen";
+// 置为忽略)。空串=尚未审核。
+export type ReviewVerdict = "accepted" | "ignored";
 
 // ReviewStats 是二次审核页顶部计数(整表聚合)。
 export interface ReviewStats {
   total: number; // 已审(有结论)
   accepted: number;
   ignored: number;
-  deepen: number;
   pending: number; // 开了审核但尚未出结论
 }
 

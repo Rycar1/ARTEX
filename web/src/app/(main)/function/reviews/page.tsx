@@ -28,13 +28,11 @@ const REVIEW_TABS: { value: ReviewFilter; label: string }[] = [
   { value: "pending", label: "待审核" },
   { value: "accepted", label: "已收录" },
   { value: "ignored", label: "已忽略" },
-  { value: "deepen", label: "建议深挖" },
 ];
 
 const VERDICT_META: Record<ReviewVerdict, { label: string; tone: Tone }> = {
   accepted: { label: "收录", tone: "green" },
   ignored: { label: "忽略", tone: "neutral" },
-  deepen: { label: "深挖", tone: "violet" },
 };
 
 function fmtTime(ts?: string): string {
@@ -110,11 +108,10 @@ export default function FindingReviewsPage() {
         </p>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="已审核" value={stats?.total ?? 0} />
         <StatCard label="收录" value={stats?.accepted ?? 0} />
         <StatCard label="忽略" value={stats?.ignored ?? 0} />
-        <StatCard label="建议深挖" value={stats?.deepen ?? 0} />
         <StatCard label="待审核" value={stats?.pending ?? 0} highlight />
       </div>
 

@@ -1139,7 +1139,7 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
--- AI 二次审核结论(参考 AutoHunter Reviewer):review_verdict 取值 ''(未审)/accepted/ignored/deepen。
+-- AI 二次审核结论(参考 AutoHunter Reviewer):review_verdict 取值 ''(未审)/accepted/ignored。
 -- ignored 时由 server 自动把 status 置为 ignored,并把原因写进 review_reasons。
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_verdict  TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_severity TEXT NOT NULL DEFAULT '';

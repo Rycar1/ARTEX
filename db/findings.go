@@ -32,7 +32,7 @@ type DBFinding struct {
 	AssetIDs  []int64
 	Status    string
 	Report    string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
-	// AI 二次审核结论(见 server/finding_review.go)。ReviewVerdict 取值 ''/accepted/ignored/deepen。
+	// AI 二次审核结论(见 server/finding_review.go)。ReviewVerdict 取值 ''/accepted/ignored。
 	ReviewVerdict   string
 	ReviewSeverity  string
 	ReviewScore     *float64
@@ -184,7 +184,7 @@ type FindingFilter struct {
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
 	// Review 是「二次审核」结论筛选:空=不过滤;pending=开了审核但还没审;
-	// accepted/ignored/deepen=按审核结论过滤。只在二次审核页用,与其它筛选正交。
+	// accepted/ignored=按审核结论过滤。只在二次审核页用,与其它筛选正交。
 	Review string
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
@@ -245,7 +245,7 @@ func (f FindingFilter) where() (string, []any) {
 	case "pending":
 		// 与 ReviewStats.Pending 口径一致:只算「开了二次审核但尚未出结论」的漏洞。
 		conds = append(conds, "COALESCE(f.review_verdict,'') = '' AND COALESCE(t.review_enabled,false)")
-	case "accepted", "ignored", "deepen":
+	case "accepted", "ignored":
 		args = append(args, f.Review)
 		conds = append(conds, fmt.Sprintf("f.review_verdict = $%d", len(args)))
 	}

@@ -17,7 +17,6 @@ import "strings"
 const (
 	ReviewVerdictAccepted = "accepted" // 通过:符合所选 SRC 收录标准,进最终列表
 	ReviewVerdictIgnored  = "ignored"  // 忽略:垃圾洞/不收,自动置 status=ignored 并注明原因
-	ReviewVerdictDeepen   = "deepen"   // 打回深挖:方向有价值但没打穿
 )
 
 // 审核标准类型(tasks.review_src_type)。
@@ -29,7 +28,7 @@ const (
 // ValidReviewVerdict reports whether v is a known 二次审核结论。
 func ValidReviewVerdict(v string) bool {
 	switch v {
-	case ReviewVerdictAccepted, ReviewVerdictIgnored, ReviewVerdictDeepen:
+	case ReviewVerdictAccepted, ReviewVerdictIgnored:
 		return true
 	}
 	return false
@@ -75,7 +74,7 @@ func (d *DB) ReviewSrcType(taskID int64) string {
 
 // FindingReview 是一次二次审核的完整结论,整体写回 findings 的 review_* 列。
 type FindingReview struct {
-	Verdict  string   // accepted | ignored | deepen
+	Verdict  string   // accepted | ignored
 	Severity string   // 审核后的严重度(critical|high|medium|low);空=不改
 	Score    *float64 // 0-10 价值分;nil=未给
 	Reasons  string   // 忽略/降级原因(多条以换行连接);ignored 时必填
@@ -125,7 +124,6 @@ type ReviewStats struct {
 	Total    int `json:"total"` // 已审(有结论)
 	Accepted int `json:"accepted"`
 	Ignored  int `json:"ignored"`
-	Deepen   int `json:"deepen"`
 	Pending  int `json:"pending"` // 开了审核但尚未审的
 }
 
@@ -136,9 +134,8 @@ func (d *DB) FindingReviewStats() (*ReviewStats, error) {
 		SELECT
 			COUNT(*) FILTER (WHERE COALESCE(review_verdict,'') <> ''),
 			COUNT(*) FILTER (WHERE review_verdict='accepted'),
-			COUNT(*) FILTER (WHERE review_verdict='ignored'),
-			COUNT(*) FILTER (WHERE review_verdict='deepen')
-		FROM findings`).Scan(&s.Total, &s.Accepted, &s.Ignored, &s.Deepen); err != nil {
+			COUNT(*) FILTER (WHERE review_verdict='ignored')
+		FROM findings`).Scan(&s.Total, &s.Accepted, &s.Ignored); err != nil {
 		return nil, err
 	}
 	if err := d.QueryRow(`

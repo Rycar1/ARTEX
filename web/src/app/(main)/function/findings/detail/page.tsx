@@ -44,7 +44,6 @@ const FINDING_STATUSES: FindingStatus[] = [
 const REVIEW_VERDICT_META: Record<string, { label: string; tone: Tone }> = {
   accepted: { label: "已收录", tone: "green" },
   ignored: { label: "已忽略", tone: "neutral" },
-  deepen: { label: "建议深挖", tone: "violet" },
 };
 
 function fmtTime(ts: string) {

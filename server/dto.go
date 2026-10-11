@@ -333,7 +333,7 @@ type FindingDTO struct {
 	TS              string            `json:"ts"`
 
 	// AI 二次审核结论(参考 AutoHunter Reviewer,见 server/finding_review.go)。
-	// review_verdict 取值 ''(未审)/accepted/ignored/deepen;ignored 的漏洞会被
+	// review_verdict 取值 ''(未审)/accepted/ignored;ignored 的漏洞会被
 	// 自动置为 status=ignored,原因写在 review_reasons。
 	ReviewVerdict  string   `json:"review_verdict,omitempty"`
 	ReviewSeverity string   `json:"review_severity,omitempty"`

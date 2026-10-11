@@ -13,7 +13,7 @@ const reviewJSONContract = `
 输出格式(硬要求):
 只输出一个 JSON 对象,不要解释、不要前言、不要 Markdown 代码块围栏。字段与取值:
 {
-  "verdict": "accepted" | "ignored" | "deepen",
+  "verdict": "accepted" | "ignored",
   "severity": "critical" | "high" | "medium" | "low",
   "score": 0 到 10 的数字(价值分,越高越值得收录),
   "in_scope": true 或 false,
@@ -26,7 +26,6 @@ const reviewJSONContract = `
 }
 约束:
 - verdict=ignored 时 ignore_reasons 至少一条,写清为什么不收录。
-- verdict=deepen 时 reviewer_notes 里写明「还差什么才能打穿」。
 - 判重只看输入里的「已有漏洞清单」:清单中确实存在同一个入口的同一个洞,才把 is_duplicate 填 true,
   并在 duplicate_of 里填那一条的 id(只能用清单里出现过的 id)。清单里没有对应项就填 false,
   duplicate_of 填空字符串。不要凭印象编造 id。
@@ -38,10 +37,9 @@ const reviewJSONContract = `
 // enterpriseReviewerPrompt 是企业 SRC 的审核标准(高价值影响导向)。
 const enterpriseReviewerPrompt = `你是企业 SRC 的漏洞二次审核员。上游 worker 已提交一条漏洞,你负责判断它够不够「高价值、可收录」,并给出最终严重度。
 
-判定三档:
+判定两档:
 - accepted:符合收录标准,证据能自证。
 - ignored:不予收录(半成品、无实际影响、纯信息泄露且不敏感)。
-- deepen:方向有价值但证据链没打穿,值得打回深挖。
 
 企业 SRC 的高价值定义(命中其一才可能 accepted):
 1. 直接拿到服务器控制权:RCE、getshell、命令执行、任意文件写入后执行。
@@ -70,10 +68,9 @@ const enterpriseReviewerPrompt = `你是企业 SRC 的漏洞二次审核员。�
 // edusrcReviewerPrompt 是教育行业 SRC 的审核标准(严格收录导向)。
 const edusrcReviewerPrompt = `你是教育行业 SRC(EduSRC)的漏洞二次审核员。上游 worker 已提交一条漏洞,你负责按 EduSRC 的严格收录标准判断它是否成立、是否值得收录。
 
-判定三档:
+判定两档:
 - accepted:符合收录标准。
 - ignored:不予收录。
-- deepen:方向有价值但证据没打穿,打回深挖。
 
 EduSRC 的敏感信息只认四类,其余一律不算敏感信息:
 1. 身份证照片(人像面)。

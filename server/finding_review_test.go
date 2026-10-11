@@ -31,46 +31,6 @@ func TestRuleReviewFindingPassesRealVuln(t *testing.T) {
 	}
 }
 
-func TestApplyReviewFallbackDeepensBlindRCE(t *testing.T) {
-	f := &db.DBFinding{
-		VulnClass: "RCE",
-		Name:      "命令注入(时间盲)",
-		Summary:   "疑似无回显命令执行,已观察到响应延时",
-		Evidence:  "sleep 5 后响应时间 5.2s",
-	}
-	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, Reasons: "证据不足"}
-	got := applyReviewFallback(f, rev, db.ReviewSrcEduSRC)
-	if got.Verdict != db.ReviewVerdictDeepen {
-		t.Fatalf("盲打 RCE 应转 deepen,得到 %q", got.Verdict)
-	}
-	if got.Reasons == "" {
-		t.Fatal("deepen 必须写明深挖指引")
-	}
-}
-
-func TestApplyReviewFallbackKeepsJunkIgnored(t *testing.T) {
-	// 名称里带 RCE 关键字也不该救活反射型 XSS(never-deepen 优先)。
-	f := &db.DBFinding{VulnClass: "XSS", Name: "反射型XSS", Evidence: "页面提到 RCE 命令执行 sleep( 延时"}
-	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, Reasons: "反射型XSS"}
-	if got := applyReviewFallback(f, rev, db.ReviewSrcEduSRC); got.Verdict != db.ReviewVerdictIgnored {
-		t.Fatalf("反射型XSS 不该被兜底转 deepen,得到 %q", got.Verdict)
-	}
-}
-
-func TestApplyReviewFallbackLeavesAcceptedAlone(t *testing.T) {
-	f := &db.DBFinding{VulnClass: "RCE", Name: "命令注入", Evidence: "sleep 5 延时"}
-	rev := &db.FindingReview{Verdict: db.ReviewVerdictAccepted}
-	if got := applyReviewFallback(f, rev, db.ReviewSrcEduSRC); got.Verdict != db.ReviewVerdictAccepted {
-		t.Fatalf("accepted 不该被兜底改动,得到 %q", got.Verdict)
-	}
-}
-
-func TestApplyReviewFallbackNilSafe(t *testing.T) {
-	if got := applyReviewFallback(&db.DBFinding{}, nil, db.ReviewSrcEduSRC); got != nil {
-		t.Fatalf("nil 结论应原样返回 nil,得到 %+v", got)
-	}
-}
-
 func TestParseReviewJSONDuplicateForcesIgnored(t *testing.T) {
 	raw := `{"verdict":"accepted","severity":"high","is_duplicate":true,"reviewer_notes":"与 #12 重复"}`
 	got, err := parseReviewJSON(raw, db.ReviewSrcEduSRC)
@@ -154,15 +114,6 @@ func TestParseReviewJSONNotDuplicateHasNoTarget(t *testing.T) {
 	}
 }
 
-func TestApplyReviewFallbackKeepsDuplicateIgnored(t *testing.T) {
-	dup := int64(9)
-	f := &db.DBFinding{VulnClass: "RCE", Name: "命令注入", Evidence: "sleep 5 延时"}
-	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, DuplicateOf: &dup}
-	if got := applyReviewFallback(f, rev, db.ReviewSrcEduSRC); got.Verdict != db.ReviewVerdictIgnored {
-		t.Fatalf("已判重复不该被兜底转 deepen,得到 %q", got.Verdict)
-	}
-}
-
 func TestCorsReviewFindingIgnoresReflectionWithoutProof(t *testing.T) {
 	// 典型误报:任意 Origin 反射 + allow-credentials,但没有跨域读到数据的证据。
 	cases := []struct{ class, name, evidence string }{
@@ -188,19 +139,5 @@ func TestCorsReviewFindingPassesWhenDataTheftProven(t *testing.T) {
 	}
 	if rev := ruleReviewFinding(f); rev != nil {
 		t.Fatalf("有真实利用证据的 CORS 不该被规则层拦截: %+v", rev)
-	}
-}
-
-func TestCorsNotRescuedToDeepen(t *testing.T) {
-	// CORS 命中 never-deepen,即使正文含「信息泄露」也不该被兜底转 deepen。
-	f := &db.DBFinding{
-		VulnClass: "CORS 配置错误",
-		Name:      "CORS 任意 Origin 反射导致信息泄露",
-		Summary:   "跨域信息泄露",
-		Evidence:  "ACAO 反射任意 Origin",
-	}
-	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored, Reasons: "CORS 误配"}
-	if got := applyReviewFallback(f, rev, db.ReviewSrcEnterprise); got.Verdict != db.ReviewVerdictIgnored {
-		t.Fatalf("CORS 不该被兜底转 deepen,得到 %q", got.Verdict)
 	}
 }
