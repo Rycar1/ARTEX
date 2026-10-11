@@ -308,7 +308,7 @@ var builtinTaskTemplates = []struct {
 		Description: "CTF 竞赛 / 靶场场景：目标处于隔离比赛环境，允许为解题放开手脚做高强度利用与破坏性操作（打点、提权、横向、拿 flag），不承担业务影响。",
 		Goal: `在隔离的 CTF / 靶场环境中解题并拿到 flag。这是比赛/靶场场景，可以放开手脚：
 
-工具箱：镜像内已预装 CTF 常用件，先读 'skills/ctf-toolbox/'（SKILL.md + refs/misc.md、rev.md、pwn.md）确认该用哪个工具、惯用套路与命令，再动手，别手搓轮子。
+工具箱：镜像内已预装 CTF 常用件，先读 'skills/ctf-toolbox/' 下的说明与参考（SKILL 文档 + refs 目录里的 misc / rev / pwn 笔记）确认该用哪个工具、惯用套路与命令，再动手，别手搓轮子。
 
 1. 侦察定面：枚举端口与服务、Web 路径与参数、指纹与已知漏洞版本，先把攻击面铺开。
 2. 漏洞利用：对确认的漏洞直接利用（RCE、反序列化、文件包含、SQL 注入、越权、模板注入等），必要时上传工具、写 webshell、提权。
@@ -331,7 +331,7 @@ var builtinTaskTemplates = []struct {
 - 每个 in-scope 资产都必须落到一个明确结论：①已发现漏洞（含可复现证据）；②已按允许的测试类型穷尽该资产主要攻击面且未发现漏洞；③明确排除（附原因：范围外 / 无法访问 / 与已测资产等价去重 / 受边界限制不得测试）。
 - 只要还有 in-scope 资产没有上述结论，就必须继续为它派意图补测；禁止以「拿到一个洞 / 覆盖度大体够了 / 核心资产已拿下 / 报告已经能写」为由提前收尾。
 - 【单资产多漏洞·穷尽挖掘】一个资产不等于一个漏洞：同一域名 / IP / 主机往往同时存在多个互相独立的问题（不同参数、不同接口、不同角色权限、不同中间件 / 版本）。禁止「发现第一个漏洞就收手」——发现一个洞只说明该资产「已验证了部分攻击面」，必须继续把该资产在允许测试类型下的其余入口（其它参数 / 目录 / 接口 / 子域 / 端口 / 鉴权点 / 角色）逐个走完，每个漏洞单独取证、单独记录，直到该资产主要攻击面穷尽或已明确排除，才能给它下结论。
-- coverage.pct 会因容器型资产与大量枚举而偏低，不作为唯一判据；判据是「list_untested_assets 里是否还有本任务范围内、尚未给出结论的资产」，不是单纯的百分比。
+- 覆盖率百分比（coverage 百分比）会因容器型资产与大量枚举而偏低，不作为唯一判据；判据是「list_untested_assets 里是否还有本任务范围内、尚未给出结论的资产」，不是单纯的百分比。
 - 全部资产都已有结论后，才允许逐个 prove_goal 收尾；收尾报告必须列出资产清单与每个资产的结论（含「未发现漏洞」与「明确排除」的资产）。
 
 【验证尺度】最小化验证：用能证明漏洞存在的最少请求即可，拿到 PoC 证据就停。
@@ -360,7 +360,7 @@ var builtinTaskTemplates = []struct {
 // 不再覆盖用户对正文的修改。
 const (
 	builtinTaskTemplatesVersionKey = "builtin_task_templates_version"
-	builtinTaskTemplatesVersion    = "3"
+	builtinTaskTemplatesVersion    = "4"
 )
 
 // seedBuiltinTaskTemplates 幂等播种内置模板(CTF/SRC)。默认只重申 builtin 标记、不覆盖
