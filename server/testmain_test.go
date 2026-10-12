@@ -13,6 +13,8 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	// Keep the retry suite fast: backoff timing is unit-tested on its own.
+	judgeBackoffBase, judgeBackoffMax = 0, 0
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

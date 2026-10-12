@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -134,6 +136,16 @@ func judgeWithRetry(ctx context.Context, prov llm.Provider, profileID int64, pro
 	}
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			// Back off between attempts. The dominant live failure is the relay
+			// throttling a burst of judge calls (HTTP 400 "no valid ... subscription",
+			// 429, 5xx); firing the retry immediately just re-hits the same wall, so
+			// each retry waits longer (capped, jittered) before trying again.
+			if err := sleepJudgeBackoff(ctx, attempt); err != nil {
+				lastErr = err
+				break
+			}
+		}
 		attemptPrompt := prompt
 		if attempt > 0 {
 			attemptPrompt = prompt + judgeRepairInstruction
@@ -162,10 +174,108 @@ func judgeWithRetry(ctx context.Context, prov llm.Provider, profileID int64, pro
 // cannot flip a verdict.
 const judgeRepairInstruction = "\n\n# 上一次输出不合规，请重试\n上一次回复不是合规的 JSON 裁决。请重新输出且只输出一个 JSON 对象：第一个字符是 {、最后一个字符是 }；恰好含 decision 和 comment 两个字符串字段。comment 严格为三段、顺序固定，用全角分号连接：实际操作：…；成功后的后果：…；命中规则：…（不要用句号/逗号/换行分隔，三段都不能为空）。"
 
+// Judge retry backoff bounds. The first retry waits judgeBackoffBase; each
+// further retry doubles it, capped at judgeBackoffMax. The delay is jittered
+// ±20% so many concurrent judges do not retry in lockstep.
+var (
+	judgeBackoffBase = 700 * time.Millisecond
+	judgeBackoffMax  = 8 * time.Second
+)
+
+// sleepJudgeBackoff waits before the (attempt+1)-th judge call, where attempt is
+// the zero-based retry index about to be made (attempt >= 1). It never spends
+// more than a third of the context's remaining time sleeping, so backoff alone
+// cannot eat the retry budget, and returns the context error if the context ends
+// while waiting.
+func sleepJudgeBackoff(ctx context.Context, attempt int) error {
+	d := judgeBackoffBase
+	for i := 1; i < attempt && d < judgeBackoffMax; i++ {
+		d *= 2
+	}
+	if d > judgeBackoffMax {
+		d = judgeBackoffMax
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		remaining := time.Until(dl)
+		if remaining <= 0 {
+			return ctx.Err()
+		}
+		if d > remaining/3 {
+			d = remaining / 3
+		}
+	}
+	if span := int64(d) / 5; span > 0 {
+		d += time.Duration(rand.Int64N(2*span+1)) - time.Duration(span)
+	}
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// judgeHTTPStatus extracts the HTTP status a provider reports in its error
+// string (e.g. "openai: status 400: {...}"). 0 means no status was reported
+// (transport failure, empty reply, ...).
+func judgeHTTPStatus(err error) int {
+	if err == nil {
+		return 0
+	}
+	msg := err.Error()
+	i := strings.Index(msg, "status ")
+	if i < 0 {
+		return 0
+	}
+	j := i + len("status ")
+	k := j
+	for k < len(msg) && msg[k] >= '0' && msg[k] <= '9' {
+		k++
+	}
+	if k == j {
+		return 0
+	}
+	n, convErr := strconv.Atoi(msg[j:k])
+	if convErr != nil {
+		return 0
+	}
+	return n
+}
+
+// judgeTransientMarkers are substrings that mark a nominally client-side status
+// (400) as actually transient: the relay throttling a burst, or an upstream
+// account whose quota/subscription lapsed, recovers on its own — unlike a
+// genuinely malformed request.
+var judgeTransientMarkers = []string{
+	"subscription", "agentplan", "quota", "rate limit", "rate-limit",
+	"too many requests", "concurrency", "overloaded", "temporarily", "try again",
+	"额度", "订阅", "并发", "限流", "繁忙", "稍后重试",
+}
+
+func hasJudgeTransientMarker(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, m := range judgeTransientMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // isJudgeRetryableErr reports whether a judge call error is worth another
-// attempt. A canceled or deadline-exceeded context will not recover, so those
-// stop the retry loop immediately; every other error (upstream 5xx/429,
-// transport failure, empty reply) is treated as transient.
+// attempt.
+//
+//   - A canceled or deadline-exceeded context will not recover: stop at once.
+//   - A reported 5xx, 408/409/425/429, or a transport error (no status) is
+//     transient: retry.
+//   - A 400 is retried only when its body carries a transient marker (relay
+//     throttling / lapsed upstream quota); a genuinely malformed request is not.
+//   - Every other 4xx (401/403/404/422, ...) is permanent: do not retry.
 func isJudgeRetryableErr(err error) bool {
 	if err == nil {
 		return false
@@ -173,7 +283,18 @@ func isJudgeRetryableErr(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	return true
+	switch code := judgeHTTPStatus(err); {
+	case code == 0:
+		return true // transport failure / empty reply
+	case code == 408, code == 409, code == 425, code == 429:
+		return true
+	case code >= 500:
+		return true
+	case code == 400:
+		return hasJudgeTransientMarker(err.Error())
+	default:
+		return false
+	}
 }
 
 // classifyJudgeErr turns a judge error into a short, log-friendly label.
@@ -188,6 +309,9 @@ func classifyJudgeErr(err error) string {
 		return "调用超时"
 	}
 	msg := err.Error()
+	if hasJudgeTransientMarker(msg) && judgeHTTPStatus(err) == 400 {
+		return "上游账号额度/订阅不可用(400)"
+	}
 	switch {
 	case strings.Contains(msg, "status 429"):
 		return "上游限流(429)"
