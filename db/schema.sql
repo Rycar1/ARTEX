@@ -1561,3 +1561,87 @@ CREATE INDEX IF NOT EXISTS idx_tunnels_state ON tunnels(state);
 -- honeypot_evidence: 命中签名证据,JSON 数组文本(如 ["cowrie_default_ssh_banner(Cowrie, 0.99)"]),合并去重。
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_score REAL NOT NULL DEFAULT 0;
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_evidence TEXT NOT NULL DEFAULT '';
+
+-- =====================================================================
+-- N. 资产筛选结果(预筛/优先级评分/同款聚类)  —— 参考 AutoHunter 的资产漏斗
+-- =====================================================================
+-- insert_assets 落库时由 assetscreen 包算出的评分与聚类键写在这里,供:
+--   ① 派发排序(高分先测)  ② 同款聚类冷却(同一 cluster 的 pending 上限)
+--   ③ graph_overview 的筛选摘要(让 planner 能解释「这批资产为何没展开」)
+-- 与 assets 一对多:同一资产在不同任务下可有不同评分,按 (asset_id, task_id) 幂等覆盖。
+CREATE TABLE IF NOT EXISTS asset_screening (
+    asset_id   BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    task_id    BIGINT NOT NULL,
+    score      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    reasons    TEXT[] NOT NULL DEFAULT '{}',
+    cluster    TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (asset_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_screening_task ON asset_screening(task_id);
+CREATE INDEX IF NOT EXISTS idx_asset_screening_cluster ON asset_screening(task_id, cluster);
+
+-- 预筛跳过计数(按任务 + 原因聚合):让 planner 能解释「为什么 N 千个资产只测了几百个」。
+CREATE TABLE IF NOT EXISTS task_screening_skip (
+    task_id    BIGINT NOT NULL,
+    reason     TEXT NOT NULL,
+    count      BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_task_screening_skip_task ON task_screening_skip(task_id);
+
+-- 同款聚类派发闸门状态(schema §N):cluster → 连续失败计数 + 冷却截止时间。
+-- 与 asset_screening.cluster 同源(assetscreen.ClusterKey);由 engine 在意图
+-- 以 blocked 结束时累加,达到阈值进入冷却,冷却期内该 cluster 的意图不派发。
+CREATE TABLE IF NOT EXISTS cluster_cooldown (
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    cluster        TEXT NOT NULL,
+    dead_count     INTEGER NOT NULL DEFAULT 0,
+    cooldown_until TIMESTAMPTZ,
+    reason         TEXT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exploration_id, cluster)
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_cooldown_exp ON cluster_cooldown(exploration_id, cooldown_until);
+
+-- 声明范围(company_scope)物化的 RoE 跳过台账:被任务级/全局资产拦截挡下的规则
+-- 不物化,但必须记账——否则「未物化规则数」永远 >0,收尾闸门再也关不上。
+-- 每次物化会重估本表:规则若已不再被拦截则删除跳过记录,重新纳入物化。
+CREATE TABLE IF NOT EXISTS company_scope_materialize_skip (
+    task_id    BIGINT NOT NULL,
+    company_id BIGINT NOT NULL,
+    kind       TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, company_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_cs_materialize_skip_task ON company_scope_materialize_skip(task_id, company_id);
+
+
+-- =====================================================================
+-- O. 全局情报库(intel)  —— 参考 AutoHunter 的 intel 库
+-- =====================================================================
+-- 跨任务可复用的情报:一个任务里验证过的凭据、确认的漏洞特征、
+-- 发现的端点、目标画像,沉淀成 (kind,key) 唯一的全局条目。后续任务先查库再开打,
+-- 不必从零开始。只存可复用的说明/证据,不存明文密钥(凭据只存类型+主机+credential id)。
+--   kind: cred(凭据线索) / fingerprint(漏洞特征) / endpoint(端点) / profile(画像)
+--   key : 去重键(cred=username@domain; fingerprint=归一化 vulnclass; endpoint=method url; profile=标签)
+--   confidence: 0..1 可信度;命中/确认后上调;hits: 被检索命中次数。
+-- 全局可选关/默认开:ARTEX_INTEL=0/false/off 关闭。
+CREATE TABLE IF NOT EXISTS intel (
+    id             BIGSERIAL PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    value          TEXT NOT NULL DEFAULT '',
+    source_task_id BIGINT,
+    source         TEXT NOT NULL DEFAULT '',
+    confidence     REAL NOT NULL DEFAULT 0,
+    hits           BIGINT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_intel_kind ON intel(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intel_hits ON intel(kind, hits DESC, updated_at DESC);

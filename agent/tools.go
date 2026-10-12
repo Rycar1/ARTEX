@@ -55,6 +55,7 @@ type ToolSet struct {
 	findingRecorder FindingRecorder
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
+	is              *db.IntelStore   // 全局情报库(schema §O;可选,nil = search_intel 不可用)
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
@@ -157,6 +158,10 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+
+// SetIntelStore wires the global intel library (schema §O) so search_intel can
+// surface cross-task reusable intel. nil = the tool reports unavailable.
+func (t *ToolSet) SetIntelStore(is *db.IntelStore) { t.is = is }
 
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
 // (default enabled). Passing false makes graphOverviewData omit the coverage block
@@ -350,6 +355,14 @@ func provenFinding(status string) bool {
 // graph_overview tool and the planner's wake-up prompt (which pre-injects it so
 // the model needn't spend a turn calling the tool — every plan round starts with
 // an empty context and always needs this first).
+// 公司声明范围（company_scope）内联进 graph_overview 的阈值：
+// 小于等于 inline 时逐条列举（小公司，信息量可控）；超过则只给分类计数 + sample 条样例，
+// 避免每轮 planner 都被上万条 scope 文本淹没（实测腾讯 11390 条）。
+const (
+	companyScopeInlineLimit = 50
+	companyScopeSampleLimit = 20
+)
+
 func (t *ToolSet) graphOverviewData() map[string]any {
 	out := map[string]any{}
 	// goals summary folded in so the planner needn't call list_goals each round.
@@ -648,30 +661,63 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 							}
 							if rules, err := t.cs.GetScope(*r.CompanyID); err == nil {
 								keywords := make([]string, 0)
-								companyScope := make([]map[string]any, 0, len(rules))
-								for _, rule := range rules {
-									value := rule.Raw
-									if value == "" {
-										switch rule.Kind {
-										case "domain":
-											value = rule.Domain
-										case "ip", "cidr":
-											value = rule.Net
-										default:
-											value = rule.Value
+								if len(rules) <= companyScopeInlineLimit {
+									companyScope := make([]map[string]any, 0, len(rules))
+									for _, rule := range rules {
+										value := rule.Raw
+										if value == "" {
+											switch rule.Kind {
+											case "domain":
+												value = rule.Domain
+											case "ip", "cidr":
+												value = rule.Net
+											default:
+												value = rule.Value
+											}
+										}
+										entry := map[string]any{"kind": rule.Kind, "value": value}
+										if rule.Reason != "" {
+											entry["reason"] = rule.Reason
+										}
+										companyScope = append(companyScope, entry)
+										if rule.Kind == "keyword" && rule.Raw != "" {
+											keywords = append(keywords, rule.Raw)
 										}
 									}
-									entry := map[string]any{"kind": rule.Kind, "value": value}
-									if rule.Reason != "" {
-										entry["reason"] = rule.Reason
+									if len(companyScope) > 0 {
+										e["company_scope"] = companyScope
 									}
-									companyScope = append(companyScope, entry)
-									if rule.Kind == "keyword" && rule.Raw != "" {
-										keywords = append(keywords, rule.Raw)
+								} else {
+									// 大范围公司：整份 company_scope 逐条铺进 graph_overview 会吃掉每轮 planner
+									// 的巨量上下文（实测腾讯 11390 条），这里只给【分类计数 + 前若干条样例】。
+									// 完整范围由系统按需展开成资产；需要逐条看用 list_untested_assets。
+									counts := map[string]int{}
+									sample := make([]string, 0, companyScopeSampleLimit)
+									for _, rule := range rules {
+										counts[rule.Kind]++
+										if rule.Kind == "keyword" && rule.Raw != "" {
+											keywords = append(keywords, rule.Raw)
+											continue
+										}
+										if len(sample) < companyScopeSampleLimit {
+											value := rule.Raw
+											if value == "" {
+												switch rule.Kind {
+												case "domain":
+													value = rule.Domain
+												case "ip", "cidr":
+													value = rule.Net
+												default:
+													value = rule.Value
+												}
+											}
+											sample = append(sample, value)
+										}
 									}
-								}
-								if len(companyScope) > 0 {
-									e["company_scope"] = companyScope
+									e["company_scope_counts"] = counts
+									e["company_scope_total"] = len(rules)
+									e["company_scope_sample"] = sample
+									e["company_scope_note"] = "公司声明范围总量很大，这里只给分类计数与样例；完整范围由系统展开，不要逐条列举或据此判断已测完。"
 								}
 								if len(keywords) > 0 {
 									e["company_keywords"] = keywords
@@ -687,6 +733,31 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
 				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
 				m["host_count"] = len(hosts)
+			}
+			// screening：资产漏斗的可见性（评分分布 + 预筛跳过计数）。
+			// 目的：让 planner 能解释「为什么 N 千个资产只测了几百个」，并把高分资产排在前面。
+			if sum, err := t.as.ScreeningSummary(t.taskID); err == nil && sum.Scored > 0 {
+				sc := map[string]any{
+					"scored":    sum.Scored,
+					"low_score": sum.LowScore,
+					"clusters":  sum.Clusters,
+					"avg_score": strconv.FormatFloat(sum.AvgScore, 'f', 1, 64),
+					"note":      "评分只影响「先测谁」，负分资产仍要测，不要因为分数低就跳过目标；同一 cluster 表示同一套系统的多个域名，注意去重、避免同一漏洞重复上报。",
+				}
+				if sum.TopCluster != "" {
+					sc["top_cluster"] = sum.TopCluster
+					sc["top_cluster_count"] = sum.TopCount
+				}
+				if skips, err := t.as.ScreeningSkips(t.taskID); err == nil && len(skips) > 0 {
+					var total int64
+					for _, n := range skips {
+						total += n
+					}
+					sc["skipped_total"] = total
+					sc["skipped_by_reason"] = skips
+					sc["skipped_note"] = "这些资产在入库前被机械预筛挡掉（回环地址/敏感域/平台默认域等），不参与测试；若判定其中某条确属目标范围，用 add_task_scope 显式纳入。"
+				}
+				m["screening"] = sc
 			}
 			if len(m) > 0 {
 				out["coverage"] = m
@@ -1222,6 +1293,24 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(tags) > 0 {
 		payload["chain_tags"] = tags
 	}
+	// 同款聚类键:派发闸门(dispatch)据此做同簇并发上限 + 连续失败冷却。
+	// 取首个非空键写 payload.cluster,多资产命中多簇时全量写 payload.clusters。
+	if t.as != nil && t.taskID > 0 && len(anchors) > 0 {
+		if cm, cerr := t.as.AssetClusters(t.taskID, anchors); cerr == nil && len(cm) > 0 {
+			keys := make([]string, 0, len(cm))
+			for _, a := range anchors {
+				if k := cm[a]; k != "" {
+					keys = append(keys, k)
+				}
+			}
+			if keys = dedupeNonEmpty(keys); len(keys) > 0 {
+				payload["cluster"] = keys[0]
+				if len(keys) > 1 {
+					payload["clusters"] = keys
+				}
+			}
+		}
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
@@ -1309,6 +1398,51 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+// wouldCompleteTask 判断「若把 goal 标记为 met」是否会让本任务所有目标都达成。
+// 用于收尾闸门:只有在最后一步(会让任务收官)时才需要拦住。
+func (t *ToolSet) wouldCompleteTask(goal int64) bool {
+	if t.ts == nil {
+		return false
+	}
+	goals, err := t.ts.ListByKind(db.KindGoal, 1000)
+	if err != nil || len(goals) == 0 {
+		return false
+	}
+	for _, g := range goals {
+		if g.ID == goal {
+			continue
+		}
+		if g.State != "met" {
+			return false
+		}
+	}
+	return true
+}
+
+// wrapupScopeGate 是「收尾闸门」:任务范围内企业声明范围(company_scope)还有可物化
+// 规则未展开成本任务待测资产时,拒绝收官。
+//
+// 动机:add_company_scope 可以把一家公司声明成上万条 domain/IP 规则,但过去这些规则
+// 只用于归属认领——planner 凭几个碰巧被发现的资产就把目标判 met、把任务收掉,于是
+// 「9000 资产只测了几百个」。声明范围即待测工作:只要还有可物化的规则没并入本任务,
+// 就不允许判完成(物化在每轮规划前自动按批推进,直至清零)。
+//
+// 返回 (pending, 提示文本);pending<=0 表示放行。物化总开关关闭时直接放行。
+func (t *ToolSet) wrapupScopeGate() (int, string) {
+	if t.as == nil || t.taskID <= 0 || !db.CompanyMaterializeEnabled() {
+		return 0, ""
+	}
+	pending, err := t.as.CountPendingTaskCompanyScope(t.taskID)
+	if err != nil || pending <= 0 {
+		return 0, ""
+	}
+	return pending, fmt.Sprintf(
+		"⚠️ 收尾闸门:任务范围内仍有 %d 条企业声明范围(company_scope)未展开成待测资产。"+
+			"声明范围即待测工作,此时不能判任务完成——系统会在每轮规划前按批自动物化剩余范围,"+
+			"你需要继续推进:对新展开的资产补方向、等 worker 出结果,直到闸门清零。"+
+			"(若确认这些范围无需测试,请先调整/移除对应的 add_company_scope;或由操作员以 ARTEX_COMPANY_MATERIALIZE=0 关闭物化与闸门。)", pending)
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。（证据若是漏洞节点，必须是已确认 confirmed 的；pending 待验证/误报不算已突破，不能作证据）",
 		obj(map[string]any{
@@ -1344,6 +1478,12 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					return actool.Errorf(fmt.Sprintf("该漏洞尚未验证通过(当前状态 %s),不能作为目标达成证据;待反证验证确认为 confirmed 后再试", st)), nil
 				}
 			}
+			// 收尾闸门:本次标记若会让任务收官(所有目标 met),先确认声明范围已全部展开。
+			if t.wouldCompleteTask(goal) {
+				if pending, msg := t.wrapupScopeGate(); pending > 0 {
+					return actool.Text(fmt.Sprintf("目标 %d 暂不能标记 met；%s", goal, msg)), nil
+				}
+			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
@@ -1372,6 +1512,10 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// 收尾闸门:声明范围未展开完时不允许直接收官。
+			if pending, msg := t.wrapupScopeGate(); pending > 0 {
+				return actool.Text("暂不能结束任务；" + msg), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
@@ -2343,6 +2487,8 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// search_intel：检索全局情报库(跨任务可复用的凭据/漏洞特征/端点)。
+		t.intelTool(),
 	}
 }
 
@@ -2397,4 +2543,19 @@ func assetValue(a *db.Asset) string {
 		return a.ServiceName
 	}
 	return ""
+}
+
+// dedupeNonEmpty 去掉空串与重复项,保持首次出现顺序。
+func dedupeNonEmpty(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }

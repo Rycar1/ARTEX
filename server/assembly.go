@@ -363,6 +363,7 @@ func buildDomainReg(as *db.AssetStore) map[string]actool.CoreTool {
 	}
 	serverTS := agent.NewToolSet(nil, "")
 	serverTS.SetAssetStore(as, as.Companies())
+	serverTS.SetIntelStore(as.Intel()) // 全局情报库(schema §O)
 	reg := make(map[string]actool.CoreTool)
 	for _, t := range serverTS.AllDomainTools() {
 		reg[t.Name()] = t

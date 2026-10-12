@@ -504,6 +504,10 @@ FROM findings WHERE id=$1 FOR UPDATE`, id).
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
 		return from, true, false, false, err
 	}
+	if status == FindingConfirmed {
+		// 全局情报库(schema §O):确认后把漏洞特征/受影响端点沉淀,后续任务可复用。
+		_ = recordFindingIntelTx(ctx, tx, id)
+	}
 	var assets []int64
 	_ = json.Unmarshal(assetIDs, &assets)
 	notified = RecordNotificationEventTx(ctx, tx, notify.EventFindingStatusChanged, id, notify.Snapshot{

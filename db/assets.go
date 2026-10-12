@@ -101,6 +101,24 @@ func (d *DB) Assets() *AssetStore {
 // Companies returns the company store associated with this asset store.
 func (s *AssetStore) Companies() *CompanyStore { return s.company }
 
+// Intel returns the global intel library (schema §O) bound to the same DB.
+// nil receiver/DB is tolerated: IntelStore methods refuse with a clear error.
+func (s *AssetStore) Intel() *IntelStore {
+	if s == nil {
+		return &IntelStore{}
+	}
+	return &IntelStore{d: s.db}
+}
+
+// TaskOpMode 透传任务作战模式（db.TaskOpMode），供 agent 侧按模式调整资产预筛策略：
+// aggressive 模式下不因「敏感域/平台默认域/裸主机名」丢弃资产，只过滤回环/未指定这类纯噪声。
+func (s *AssetStore) TaskOpMode(taskID int64) string {
+	if s == nil || s.db == nil {
+		return OpModeStandard
+	}
+	return s.db.TaskOpMode(taskID)
+}
+
 // withCompanyScopeMutation serializes scope resolution and every asset write
 // that consumes its result in one transaction. Nested asset side effects reuse
 // the same transaction through the scoped store.

@@ -231,6 +231,8 @@ func (d *DB) FinishFindingCheck(id int64, status, reason string) error {
 		if _, err := tx.Exec(`UPDATE findings SET status=$1 WHERE id=$2 AND status='pending'`, FindingConfirmed, findingID); err != nil {
 			return err
 		}
+		// 全局情报库(schema §O):AI 验证通过 ⇒ 沉淀漏洞特征/端点情报。
+		_ = recordFindingIntelTx(context.Background(), tx, findingID)
 	case "false_positive":
 		var nodeID *int64
 		err = tx.QueryRow(`UPDATE findings SET status=$1 WHERE id=$2 AND status='pending' RETURNING node_id`, FindingFalsePositive, findingID).Scan(&nodeID)

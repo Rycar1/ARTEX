@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/dispatch"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -143,6 +145,7 @@ type Engine struct {
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
 	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	scopeGate    sync.Map // taskID -> int, 收尾闸门连续拦截轮数(goalless 分支)
 	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
@@ -902,6 +905,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+				// 收尾闸门(引擎侧兜底):目标虽已全 met,但任务范围内还有未展开的企业声明
+				// 范围(company_scope)时不许落 done——先物化一批,等下一轮心跳继续。
+				// 正常情况下 agent 侧 prove_goal 会拦住「所有目标 met」;这里防的是历史
+				// 数据/其他路径已把目标标 met、范围却没展开完的情况。
+				if taskIDInt, perr := strconv.ParseInt(t.ID, 10, 64); perr == nil && e.scopeGateBlocks(t, taskIDInt) {
+					return
+				}
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
 				// pause/delete/超时收尾的状态转换。
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -933,6 +943,8 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		// 声明范围物化:把 company_scope 展开成本任务的待测资产(纯 DB,不触发 LLM)。
+		e.materializeTaskCompanyScope(t, taskIDInt)
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		e.EndLLMCall(t.ID)
@@ -1290,6 +1302,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
 		}
 	}
+	// 派发闸门:意图以 blocked(传输层/模型层失败,即"5xx 类")收尾时,给它的同款
+	// 聚类各记一次失败;连续失败达阈值 → 该簇进入冷却,不再占派发水位。
+	// LLM 配额耗尽属于平台侧问题,不计入目标失败(避免误冷却)。
+	if state == "blocked" && !isTaskLLMChainExhausted(err) {
+		if cfg := dispatch.DefaultConfig(); cfg.EnabledFor(db.IsAggressiveOpMode(t.OpMode)) && cfg.DeadThreshold > 0 {
+			if cooled, cerr := t.Store.BumpClusterDead(db.ClustersFromPayload(intent.Payload), cfg.DeadThreshold, cfg.Cooldown); cerr != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 聚类失败计数出错: %v", name, t.ID, intent.ID, cerr)
+			} else if len(cooled) > 0 {
+				log.Printf("[worker %s] task %s 同款聚类进入冷却(连续失败): %v", name, t.ID, cooled)
+			}
+		}
+	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
@@ -1374,12 +1398,116 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 	}
 }
 
+// scopeGateMaxRounds 是收尾闸门(引擎侧)在 goalless 分支上连续拦截的轮数上限。
+// 超过即放行收官并告警,避免任务因闸门关不上而永久悬挂。
+const scopeGateMaxRounds = 20
+
+// scopeGateBlocks 是收尾闸门的引擎侧兜底(见 plannerLoop 的 goalless 分支)。
+// 任务范围内仍有未展开的企业声明范围(company_scope)时返回 true:先物化一批,
+// 不落 done,等下一轮心跳继续;连续超过 scopeGateMaxRounds 轮仍关不上则放行收官。
+func (e *Engine) scopeGateBlocks(t *Task, taskID int64) bool {
+	if !db.CompanyMaterializeEnabled() || taskID <= 0 {
+		return false
+	}
+	pending, err := e.m.assets.CountPendingTaskCompanyScope(taskID)
+	if err != nil || pending <= 0 {
+		e.scopeGate.Delete(taskID)
+		return false
+	}
+	n := 0
+	if v, ok := e.scopeGate.Load(taskID); ok {
+		n, _ = v.(int)
+	}
+	n++
+	e.scopeGate.Store(taskID, n)
+	e.materializeTaskCompanyScope(t, taskID)
+	if n > scopeGateMaxRounds {
+		e.scopeGate.Delete(taskID)
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("收尾闸门:仍有 %d 条企业声明范围未展开,已连续 %d 轮无法清零,放行收官(请人工复核范围)", pending, n)})
+		return false
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("收尾闸门:任务范围内仍有 %d 条企业声明范围未展开成待测资产,暂不收官(第 %d 轮)", pending, n)})
+	return true
+}
+
+// claimNext 从 frontier 领取一条可派发意图。领取前先过同款聚类派发闸门
+// (dispatch):同簇并发达上限、或处于冷却期的意图本轮跳过——避免同一套系统被
+// 一口气铺开成几百条意图,也避免持续失败的目标占满派发水位。
+// 激进模式一律不做聚类限流(EnabledFor=false)。
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
 	fr, _ := t.Store.Frontier(20)
+	if len(fr) == 0 {
+		return nil
+	}
+	cfg := dispatch.DefaultConfig()
+	gated := cfg.EnabledFor(db.IsAggressiveOpMode(t.OpMode))
+	var cooldowns map[string]time.Time
+	var running map[string]int
+	if gated {
+		cooldowns, _ = t.Store.ClusterCooldowns()
+		running, _ = t.Store.ClusterRunningCounts()
+	}
+	now := time.Now()
 	for _, in := range fr {
+		if gated {
+			if v := dispatch.Evaluate(db.ClustersFromPayload(in.Payload), cooldowns, running, cfg, now); v.Skip {
+				log.Printf("[worker %s] task %s 意图 #%d 被派发闸门跳过: %s", name, t.ID, in.ID, v.Reason)
+				continue
+			}
+		}
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
 			return in
 		}
 	}
 	return nil
+}
+
+// companyMaterializeEnabled 控制「声明范围物化」开关(默认开;ARTEX_COMPANY_MATERIALIZE=0 关闭)。
+func companyMaterializeEnabled() bool { return db.CompanyMaterializeEnabled() }
+
+// companyMaterializeBatch 是每轮规划前单家企业最多展开的规则条数。
+func companyMaterializeBatch() int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("ARTEX_COMPANY_MATERIALIZE_BATCH"))); err == nil && n > 0 {
+		return n
+	}
+	return db.DefaultCompanyMaterializeBatch
+}
+
+// materializeTaskCompanyScope 在每轮规划前把任务范围内企业声明的资产范围按批
+// 展开成本任务的待测资产(见 db/company_materialize.go)。声明范围不再只是「归属
+// 认领」——它真正进入待测漏斗,覆盖度分母随之变大,planner 也就不能凭几个碰巧
+// 被发现的资产判 100% 收官。纯 DB 操作,不触发 LLM 调用。
+func (e *Engine) materializeTaskCompanyScope(t *Task, taskID int64) {
+	if !companyMaterializeEnabled() {
+		return
+	}
+	res, err := e.m.assets.MaterializeTaskCompanyScopes(taskID, companyMaterializeBatch())
+	if err != nil {
+		log.Printf("[planner] task %s 声明范围物化失败: %v", t.ID, err)
+		return
+	}
+	total, blocked := 0, 0
+	var parts []string
+	for _, r := range res {
+		if r.Rules == 0 && r.Blocked == 0 {
+			continue
+		}
+		total += r.Rules
+		blocked += r.Blocked
+		name := r.Company
+		if name == "" {
+			name = fmt.Sprintf("#%d", r.CompanyID)
+		}
+		parts = append(parts, fmt.Sprintf("%s +%d", name, r.Rules))
+	}
+	if total == 0 && blocked == 0 {
+		return
+	}
+	summary := fmt.Sprintf("企业声明范围物化:本批新增/并入 %d 条待测资产(%s)", total, strings.Join(parts, "、"))
+	if blocked > 0 {
+		summary += fmt.Sprintf(";%d 条被拦截规则挡下未物化", blocked)
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: summary})
 }

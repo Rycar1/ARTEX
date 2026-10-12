@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/assetscreen"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/honeydetect"
 	actool "github.com/Autumn-27/norma/tool"
@@ -122,6 +123,33 @@ type assetInputItem struct {
 	Params []map[string]any `json:"params"`
 }
 
+// screeningInput 从一条待插入资产构造预筛/评分输入（主机名优先取 URL 的 host）。
+func screeningInput(item assetInputItem) assetscreen.Input {
+	in := assetscreen.Input{
+		Kind:         strings.TrimSpace(item.Type),
+		Host:         item.Domain,
+		URL:          item.URL,
+		IP:           item.IP,
+		Title:        item.PageTitle,
+		ServerHeader: item.Banner,
+		Technologies: item.Technologies,
+		Port:         item.Port,
+	}
+	if in.Host == "" {
+		in.Host = item.ServiceIP
+	}
+	if in.IP == "" {
+		in.IP = item.ServiceIP
+	}
+	if item.StatusCode != nil {
+		in.StatusCode = *item.StatusCode
+	}
+	if in.Kind == "app" {
+		in.Title = strings.TrimSpace(item.AppName + " " + item.Description)
+	}
+	return in
+}
+
 // insertAssets is the unified insert_assets agent tool.
 func (t *ToolSet) insertAssets() actool.CoreTool {
 	return writeTool(
@@ -129,7 +157,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 		"批量登记新发现的资产，一次可混合多种类型（type 见枚举）。\n"+
 			"各类型必填字段：root_domain→domain；ip→ip（须为 IPv4/IPv6，非主机名）；subdomain→domain；app→app_name；service(HTTP)→url；service(非HTTP)→service_name+port（ip/domain 至少填一个）；endpoint→url+method。其余字段含义见各自说明。\n"+
 			"auth/technologies/params 为追加合并(append)，不覆盖原值。\n"+
-			"返回：{results:[{index,id,type}], errors:[{index,error}]}",
+			"返回：{results:[{index,id,type,score,cluster}], errors:[{index,error}], skipped:[{index,label,reason}]}\n"+
+			"预筛：回环/未指定地址、敏感域(.gov/.mil 等)、第三方托管平台默认域(github.io/vercel.app 等)会被直接跳过（不入库），条目出现在 skipped 里；"+
+			"若判定它确属目标范围，请用 add_task_scope 显式纳入。score 是优先级评分（越高越值得先测，负分=降权但仍会测）。",
 		obj(map[string]any{
 			// task_id 不暴露给模型：worker 归属哪个 task 由程序经 SetTaskID 权威赋值(见 handler)。
 			"assets": map[string]any{
@@ -221,9 +251,17 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			taskID := t.taskID
 
 			type result struct {
-				Index int    `json:"index"`
-				ID    int64  `json:"id"`
-				Type  string `json:"type"`
+				Index   int     `json:"index"`
+				ID      int64   `json:"id"`
+				Type    string  `json:"type"`
+				Score   float64 `json:"score,omitempty"`
+				Cluster string  `json:"cluster,omitempty"`
+			}
+			// skipEntry 记录被机械预筛丢弃的资产（不入库），让模型知道「它被谁、按什么规则拦了」。
+			type skipEntry struct {
+				Index  int    `json:"index"`
+				Label  string `json:"label"`
+				Reason string `json:"reason"`
 			}
 			type errEntry struct {
 				Index int    `json:"index"`
@@ -232,6 +270,16 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 
 			var results []result
 			var errs []errEntry
+			var skipped []skipEntry
+
+			// 资产漏斗：机械预筛（噪声/敏感域/平台默认域）+ 优先级评分 + 同款聚类。
+			// 策略：默认走 assetscreen.DefaultPolicy（环境变量可调）；激进模式任务不做丢弃性预筛，
+			// 只保留「回环/未指定地址」这类纯噪声过滤（无论何种模式都不入库）。
+			screenPolicy := assetscreen.DefaultPolicy()
+			screenDisabled := assetscreen.Disabled()
+			if t.as != nil && t.as.TaskOpMode(taskID) == db.OpModeAggressive {
+				screenPolicy = assetscreen.Policy{}
+			}
 
 			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
 			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
@@ -245,6 +293,15 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			}
 
 			for i, item := range a.Assets {
+				// app 没有主机维度，跳过预筛（仍参与评分/聚类）。
+				var dec assetscreen.Decision
+				if !screenDisabled && strings.TrimSpace(item.Type) != "app" {
+					dec = assetscreen.EvaluateWithPolicy(screeningInput(item), screenPolicy)
+					if dec.Skip {
+						skipped = append(skipped, skipEntry{Index: i, Label: assetInputLabel(item), Reason: dec.SkipReason})
+						continue
+					}
+				}
 				// 资产闸门：先拦截后允许，被拒的资产禁止插入（跳过 Upsert 及后续副作用）。
 				domains, ips, urls := assetInterceptCandidates(item)
 				if d := db.EvaluateAssetGate(blockRules, allowRules, domains, ips, urls); !d.Allowed {
@@ -355,7 +412,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
 				}
-				results = append(results, result{Index: i, ID: id, Type: typ})
+				results = append(results, result{Index: i, ID: id, Type: typ, Score: dec.Score, Cluster: dec.Cluster})
 				t.writes.Assets++
 				t.anchorOwner(id)
 				if taskID > 0 {
@@ -370,6 +427,8 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					}
 					_ = t.as.SetTaskAssetSource(taskID, id, "agent", summary, sourceNodeID)
 				}
+				// 筛选结果落库（taskID<=0 时内部静默跳过）：供派发排序、同款聚类冷却与态势摘要消费。
+				_ = t.as.SetAssetScreening(taskID, id, dec.Score, dec.ScoreReasons, dec.Cluster)
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
 				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
 				// 与覆盖度开关无关：task_scope 是任务的范围边界(list/查询的过滤基准)，
@@ -383,10 +442,23 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 			}
 
-			return jsonResult(map[string]any{
+			// 跳过计数落库：让 planner 能解释「多少资产在入库前就被机械预筛挡掉、分别因为什么」。
+			if len(skipped) > 0 {
+				reasons := make([]string, 0, len(skipped))
+				for _, sk := range skipped {
+					reasons = append(reasons, sk.Reason)
+				}
+				_ = t.as.AddScreeningSkips(taskID, reasons)
+			}
+			out := map[string]any{
 				"results": results,
 				"errors":  errs,
-			})
+			}
+			if len(skipped) > 0 {
+				out["skipped"] = skipped
+				out["skipped_hint"] = "预筛跳过的资产未入库。若它确属目标范围，请用 add_task_scope 显式纳入，或改用激进模式任务。"
+			}
+			return jsonResult(out)
 		},
 	)
 }
@@ -669,6 +741,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
+		// search_intel：检索全局情报库(跨任务可复用的凭据/漏洞特征/端点)。
+		t.intelTool(),
 		// 以下工具【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / node_detail / list_companies /
 		// 跨 work 检索 search_all_worker_traces / list_worker_traces / get_worker_trace。
@@ -699,6 +773,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// search_intel：检索全局情报库。
+		t.intelTool(),
 	}
 }
 

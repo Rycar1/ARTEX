@@ -45,10 +45,10 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	if s.stage != nil {
 		tools = append(tools, s.stageShareTool()) // 受管文件投递(F13),默认绑 worker
 	}
-	tools = append(tools, s.sessionTools()...) // 立足点会话工具(期 1a),默认绑 worker
+	tools = append(tools, s.sessionTools()...)    // 立足点会话工具(期 1a),默认绑 worker
 	tools = append(tools, s.credentialTools()...) // 凭据工具(期 2),默认绑 worker
-	tools = append(tools, s.tunnelTools()...)    // 隧道四件套(期 3a),默认绑 worker
-	tools = append(tools, s.reverseTools()...)   // 反弹监听(期 5),默认绑 worker
+	tools = append(tools, s.tunnelTools()...)     // 隧道四件套(期 3a),默认绑 worker
+	tools = append(tools, s.reverseTools()...)    // 反弹监听(期 5),默认绑 worker
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -173,6 +173,7 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 	tsx := agent.NewToolSet(t.Store, "orchestrator")
 	if s.m.Assets() != nil {
 		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
+		tsx.SetIntelStore(s.m.Assets().Intel()) // 全局情报库(schema §O)
 	}
 	tsx.SetNotify(t.Notify) // hint writes wake this task's planner (no-op for read tools)
 	return pick(tsx).Call(ctx, inner, nil)

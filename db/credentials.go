@@ -138,7 +138,16 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id`,
 		rec.TaskID, nilIfZero(rec.HostAssetID), rec.Username, rec.CredType, enc,
 		rec.Domain, rec.Source, rec.Verified).Scan(&id)
-	return id, err
+	if err != nil {
+		return id, err
+	}
+	// 全局情报库(schema §O):凭据一经登记就沉淀成可复用情报,
+	// 后续任务碰到同一目标可直接看到该凭据线索(不含明文密钥)。
+	if IntelEnabled() {
+		rec.ID = id
+		_ = s.d.Intel().UpsertIntel(ctx, CredentialIntel(rec))
+	}
+	return id, nil
 }
 
 const credentialCols = `id, task_id, COALESCE(host_asset_id,0), username, cred_type, secret,
@@ -210,8 +219,16 @@ func (s *CredentialStore) ListAll(ctx context.Context) ([]*CredentialRecord, err
 
 // SetVerified 标记凭据是否已实测可登录(复用打分的 verified 加分依赖它)。
 func (s *CredentialStore) SetVerified(ctx context.Context, id int64, verified bool) error {
-	_, err := s.d.ExecContext(ctx, `UPDATE credentials SET verified=$2 WHERE id=$1`, id, verified)
-	return err
+	if _, err := s.d.ExecContext(ctx, `UPDATE credentials SET verified=$2 WHERE id=$1`, id, verified); err != nil {
+		return err
+	}
+	// 验证通过后提升对应情报条目的可信度(凭据可复用性更高)。
+	if verified && IntelEnabled() {
+		if rec, err := s.Get(ctx, id); err == nil && rec != nil {
+			_ = s.d.Intel().UpsertIntel(ctx, CredentialIntel(rec))
+		}
+	}
+	return nil
 }
 
 // Delete 删除一条。
