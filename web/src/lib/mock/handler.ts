@@ -2471,8 +2471,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       timeout_seconds: 15,
       fail_action: "allow",
       ask_timeout_seconds: 300,
-      ask_timeout_action: "deny",
-    };
+      ask_timeout_action: "deny", retry_attempts: 2 };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
   if (path === "/intercept/judge/usage" && m === "GET")
     return {

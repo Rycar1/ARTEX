@@ -190,16 +190,68 @@ func ParseVerdict(text string) Verdict {
 	if action != "allow" && action != "ask" && action != "deny" {
 		return Verdict{}
 	}
-	if len(reason) > 2400 || !strings.HasPrefix(reason, "实际操作：") {
-		return Verdict{}
-	}
-	operation, rest, ok := strings.Cut(strings.TrimPrefix(reason, "实际操作："), "；成功后的后果：")
-	if !ok || strings.TrimSpace(operation) == "" {
-		return Verdict{}
-	}
-	consequence, rule, ok := strings.Cut(rest, "；命中规则：")
-	if !ok || strings.TrimSpace(consequence) == "" || strings.TrimSpace(rule) == "" {
+	if len(reason) > 2400 || !wellFormedExplanation(reason) {
 		return Verdict{}
 	}
 	return Verdict{Action: action, Reason: reason}
+}
+
+// Explanation section labels. The output contract asks for the full-width
+// "：", but a reply that uses an ASCII ":" has still produced the same three
+// sections; the colon is punctuation, not part of the verdict.
+const (
+	labelOperation   = "实际操作"
+	labelConsequence = "成功后的后果"
+	labelRule        = "命中规则"
+)
+
+// commentSeparators are the characters a model may put between the three
+// explanation sections. The contract asks for "；", but a reply that writes
+// "。" (or ";" / "." / a newline) has still produced a complete, unambiguous
+// explanation - the separator carries no verdict. Rejecting "。" is what made
+// a correct DENY be reported as "模型裁决格式无效" and then fall through to the
+// model-failure action (observed on ~60% of live judge replies), so the
+// separator is normalised away rather than treated as an error.
+const commentSeparators = " \t\r\n；;。.，,、"
+
+// trimLabelPrefix returns s without a leading "<label>：" / "<label>:".
+func trimLabelPrefix(s, label string) (string, bool) {
+	for _, colon := range []string{"：", ":"} {
+		if rest, ok := strings.CutPrefix(s, label+colon); ok {
+			return rest, true
+		}
+	}
+	return "", false
+}
+
+// cutLabel splits s at the first "<label>：" / "<label>:".
+func cutLabel(s, label string) (before, after string, ok bool) {
+	for _, colon := range []string{"：", ":"} {
+		if i := strings.Index(s, label+colon); i >= 0 {
+			return s[:i], s[i+len(label)+len(colon):], true
+		}
+	}
+	return "", "", false
+}
+
+// wellFormedExplanation reports whether comment is exactly the three mandated
+// sections in order, each non-empty after trimming the separator punctuation.
+// It never inspects the decision: the action is validated separately and is
+// never inferred from prose, so relaxing the separator cannot turn a DENY into
+// a silent allow.
+func wellFormedExplanation(comment string) bool {
+	body, ok := trimLabelPrefix(comment, labelOperation)
+	if !ok {
+		return false
+	}
+	operation, rest, ok := cutLabel(body, labelConsequence)
+	if !ok {
+		return false
+	}
+	consequence, rule, ok := cutLabel(rest, labelRule)
+	if !ok {
+		return false
+	}
+	nonEmpty := func(s string) bool { return strings.Trim(s, commentSeparators) != "" }
+	return nonEmpty(operation) && nonEmpty(consequence) && nonEmpty(rule)
 }

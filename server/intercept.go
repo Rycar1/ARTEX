@@ -112,16 +112,95 @@ func (s *Server) wireInterceptReviewer() {
 		// Tag this call's usage as the "judge" lane so the config page can report
 		// how much the fallback approval has spent, separate from model profiles.
 		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
-		text, err := reviewCompletion(ctx, prov, prompt, input)
+		return judgeWithRetry(ctx, prov, profileID, prompt, input, s.m.interceptor.GetJudgeConfig().RetryAttempts)
+	})
+}
+
+// judgeWithRetry runs the fallback-judge completion and returns the first
+// parseable verdict. Models routinely drift on the mandated explanation
+// separator (observed: "。" instead of "；" on ~60% of live replies), which the
+// output contract asks for literally. A corrective re-ask recovers nearly all
+// of them. The retry only restates the output format; it never reclassifies, so
+// it cannot turn a DENY into an allow (see intercept.ParseVerdict, which
+// validates the decision and the explanation independently).
+//
+// retries is the number of extra attempts after the first; 0 disables retries.
+// A canceled or deadline-exceeded context stops the loop immediately (it cannot
+// recover), while transient upstream errors and unparseable replies are retried.
+func judgeWithRetry(ctx context.Context, prov llm.Provider, profileID int64, prompt string, input intercept.ReviewInput, retries int) (intercept.Decision, error) {
+	attempts := 1 + retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		attemptPrompt := prompt
+		if attempt > 0 {
+			attemptPrompt = prompt + judgeRepairInstruction
+		}
+		text, err := reviewCompletion(ctx, prov, attemptPrompt, input)
 		if err != nil {
-			return intercept.Decision{ProfileID: profileID}, err
+			lastErr = err
+			if !isJudgeRetryableErr(err) {
+				break
+			}
+			continue
 		}
 		v := intercept.ParseVerdict(text)
 		if v.Action == "" {
-			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("模型裁决格式无效，必须包含裁决、实际操作、成功后的后果和命中规则")
+			lastErr = fmt.Errorf("模型裁决格式无效，必须包含裁决、实际操作、成功后的后果和命中规则")
+			continue // an unparseable reply is always worth a corrective re-ask
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
-	})
+	}
+	return intercept.Decision{ProfileID: profileID}, finalJudgeErr(attempts, lastErr)
+}
+
+// judgeRepairInstruction is appended to the judge system prompt on a retry
+// after an unparseable reply. It restates the mandated output format without
+// changing the classification task, so a retry can only repair formatting — it
+// cannot flip a verdict.
+const judgeRepairInstruction = "\n\n# 上一次输出不合规，请重试\n上一次回复不是合规的 JSON 裁决。请重新输出且只输出一个 JSON 对象：第一个字符是 {、最后一个字符是 }；恰好含 decision 和 comment 两个字符串字段。comment 严格为三段、顺序固定，用全角分号连接：实际操作：…；成功后的后果：…；命中规则：…（不要用句号/逗号/换行分隔，三段都不能为空）。"
+
+// isJudgeRetryableErr reports whether a judge call error is worth another
+// attempt. A canceled or deadline-exceeded context will not recover, so those
+// stop the retry loop immediately; every other error (upstream 5xx/429,
+// transport failure, empty reply) is treated as transient.
+func isJudgeRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
+// classifyJudgeErr turns a judge error into a short, log-friendly label.
+func classifyJudgeErr(err error) string {
+	if err == nil {
+		return "未知错误"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "调用已取消"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "调用超时"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "status 429"):
+		return "上游限流(429)"
+	case strings.Contains(msg, "status 5"):
+		return "上游服务错误(5xx)"
+	}
+	return msg
+}
+
+// finalJudgeErr wraps the last judge error after every attempt failed. Judge()
+// turns this into the configured fail_action fallback (deny by default).
+func finalJudgeErr(attempts int, last error) error {
+	return fmt.Errorf("裁判模型连续 %d 次未返回有效裁决，按失败策略处理: %s", attempts, classifyJudgeErr(last))
 }
 
 func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, input intercept.ReviewInput) (string, error) {

@@ -330,6 +330,9 @@ const (
 	settingJudgeFailAction       = "llm_judge_fail_action"
 	settingJudgeAskTimeoutSecs   = "llm_judge_ask_timeout_seconds"
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
+	// settingJudgeRetryAttempts bounds how many extra judge calls are made
+	// when a reply is unparseable or the call fails for a retryable reason.
+	settingJudgeRetryAttempts = "llm_judge_retry_attempts"
 )
 
 // Judge default values. Fail-closed: a judge failure defaults to "ask" (a human
@@ -340,6 +343,14 @@ const (
 	defaultJudgeFailAction       = "ask"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
+	// defaultJudgeRetryAttempts is the number of extra attempts after the first
+	// when the judge reply is unparseable or the call errors. Models routinely
+	// drift on the explanation separator; one corrective re-ask recovers almost
+	// all of them, and the retry cannot change the verdict (see JudgeRepairInstruction).
+	defaultJudgeRetryAttempts = 2
+	// maxJudgeRetryAttempts caps the setting so a misconfiguration cannot turn a
+	// blocked tool call into an unbounded number of judge calls.
+	maxJudgeRetryAttempts = 5
 )
 
 // JudgeConfig is the resolved LLM-fallback-judge configuration. Prompt is always
@@ -352,6 +363,10 @@ type JudgeConfig struct {
 	FailAction        string `json:"fail_action"` // allow|ask|deny
 	AskTimeoutSeconds int    `json:"ask_timeout_seconds"`
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
+	// RetryAttempts is the number of extra judge calls after an unparseable
+	// reply or a retryable call error (0 disables retries). Bounded by
+	// maxJudgeRetryAttempts.
+	RetryAttempts int `json:"retry_attempts"`
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -365,6 +380,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		FailAction:        i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
 		AskTimeoutSeconds: i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
+		RetryAttempts:     clampJudgeRetryAttempts(i.getSettingInt(settingJudgeRetryAttempts, defaultJudgeRetryAttempts)),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -389,6 +405,17 @@ func (i *Interceptor) getSettingInt(key string, def int) int {
 	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil {
 		return def
+	}
+	return n
+}
+
+// clampJudgeRetryAttempts keeps the retry setting inside [0, maxJudgeRetryAttempts].
+func clampJudgeRetryAttempts(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > maxJudgeRetryAttempts {
+		return maxJudgeRetryAttempts
 	}
 	return n
 }
@@ -439,6 +466,9 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 		return err
 	}
 	if err := i.db.SetSetting(settingJudgeAskTimeoutAction, c.AskTimeoutAction); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeRetryAttempts, strconv.Itoa(clampJudgeRetryAttempts(c.RetryAttempts))); err != nil {
 		return err
 	}
 	return nil

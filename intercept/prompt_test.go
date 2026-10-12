@@ -73,3 +73,33 @@ func TestParseVerdictKeepsCompleteChineseExplanation(t *testing.T) {
 		t.Fatal("accepted unbounded explanation")
 	}
 }
+
+// The output contract asks for "；" between the three explanation sections, but
+// live models routinely write "。" instead (observed on ~60% of replies to
+// route/deepseek-v41). Rejecting those made a correct DENY report as an invalid
+// verdict and fall through to the model-failure action, so the separator is
+// normalised away. The decision itself is still validated strictly, so relaxing
+// the separator can never turn a DENY into a silent allow.
+func TestParseVerdictToleratesSeparatorVariants(t *testing.T) {
+	bodies := []string{
+		"实际操作：删除数据库；成功后的后果：业务数据丢失；命中规则：D1",
+		"实际操作：删除数据库。成功后的后果：业务数据丢失。命中规则：D1",
+		"实际操作：删除数据库;成功后的后果：业务数据丢失;命中规则：D1",
+		"实际操作：删除数据库.成功后的后果：业务数据丢失.命中规则：D1",
+		"实际操作:删除数据库；成功后的后果:业务数据丢失；命中规则:D1",
+		"实际操作：删除数据库，成功后的后果：业务数据丢失，命中规则：D1",
+		"实际操作：删除数据库\n成功后的后果：业务数据丢失\n命中规则：D1",
+	}
+	for _, b := range bodies {
+		raw, _ := json.Marshal(map[string]string{"decision": "deny", "comment": b})
+		if got := ParseVerdict(string(raw)); got.Action != "deny" {
+			t.Errorf("separator variant rejected: %q => %+v", b, got)
+		}
+	}
+	// An unknown decision value is still rejected no matter how well formed the
+	// explanation is.
+	raw, _ := json.Marshal(map[string]string{"decision": "approve", "comment": bodies[0]})
+	if got := ParseVerdict(string(raw)); got.Action != "" {
+		t.Errorf("accepted unknown decision: %+v", got)
+	}
+}

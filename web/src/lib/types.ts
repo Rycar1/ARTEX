@@ -1410,6 +1410,7 @@ export interface JudgeConfig {
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  retry_attempts: number; // 模型出错 / 无法解析时的额外重试次数(0 = 不重试)
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。

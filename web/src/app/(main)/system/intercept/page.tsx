@@ -215,6 +215,7 @@ const defaultJudge = (): JudgeConfig => ({
   fail_action: "allow",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
+  retry_attempts: 2,
 });
 
 function JudgeCard() {
@@ -395,6 +396,18 @@ function JudgeCard() {
                     onChange={(e) => {
                       const n = parseInt(e.target.value, 10);
                       if (n > 0) patch({ timeout_seconds: n });
+                    }}
+                  />
+                </Field>
+                <Field label="模型输出不合规时重试次数">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={cfg.retry_attempts}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value, 10);
+                      if (n >= 0) patch({ retry_attempts: Math.min(5, n) });
                     }}
                   />
                 </Field>
