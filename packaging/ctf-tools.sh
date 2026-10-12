@@ -176,7 +176,7 @@ if [ "$CTF_EXTRA" = "1" ]; then
   fi
   log "CTF_EXTRA=1：pip angr（符号执行，pwn/RE 常用）"
   # shellcheck disable=SC2086
-  python3 -m pip install $PIP_ARGS angr || log "警告：angr 安装失败，跳过（不影响其余工具）"
+  python3 -m pip install $PIP_ARGS angr "bitstring<5" || log "警告：angr 安装失败，跳过（不影响其余工具）"
 fi
 
 # ---------- 5. 收尾 ----------
@@ -188,4 +188,4 @@ for t in file xxd strings objdump gdb r2 upx binwalk zsteg seccomp-tools nc tess
 done
 python3 -c "import pwn, z3, capstone, keystone, unicorn, elftools, lief; print('  [ok] python: pwntools/z3/capstone/keystone/unicorn/pyelftools/lief')" \
   || echo "  [--] python ctf 库自检失败"
-command -v angr >/dev/null 2>&1 && echo "  [ok] angr" || echo "  [--] angr"
+python3 -c "import angr" >/dev/null 2>&1 && echo "  [ok] angr" || echo "  [--] angr"
