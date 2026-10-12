@@ -73,6 +73,14 @@ func TestLooksEncodedSignatures(t *testing.T) {
 		`curl -s https://shop.example.com/api/order/list?page=1`,
 		`sqlmap -u http://t/item?id=1 --batch --dump`,
 		`ls -la /tmp`,
+		// path-like tokens that match the base64 charset must NOT be treated as payloads
+		`{"command": "ls -la /app/data/tasks/40/i6295 2>/dev/null; which curl"}`,
+		`cd /app/data/tasks/40/i6296 && curl -sk -m 25 -A "$ARTEX_UA" -D paozi_hdr.txt "https://paozi.qq.com/"`,
+		`echo "UA=$ARTEX_UA"; which curl httpx nmap whatweb jq python3 2>/dev/null; pwd`,
+		// URL path segments that happen to match the base64 charset must NOT be flagged
+		`cd /app/data/tasks/40/i6295 && echo "=== GetAidListByUidV2 no-param ==="; curl -sS -k -m 25 -A "$ARTEX_UA" -D - "https://gateway.qidian.qq.com/v1/basic.account.account_web.Account/GetAidListByUidV2" 2>&1 | head -50`,
+		`curl -s https://gateway.qidian.qq.com/v1/basic.account.account_web.Account/GetAidListByUidV2`,
+		`curl -sk "https://api.example.com/v1/basic.account.account_web.Account/GetAidListByUidV2" -D -`,
 	}
 	for _, s := range benign {
 		if LooksEncoded(s) {

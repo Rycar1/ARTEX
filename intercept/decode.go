@@ -189,13 +189,60 @@ func LooksEncoded(raw string) bool {
 				return true
 			}
 		}
-		for _, m := range reB64Gate.FindAllString(s, -1) {
+		for _, loc := range reB64Gate.FindAllStringIndex(s, -1) {
+			m := s[loc[0]:loc[1]]
+			if !plausibleB64Blob(m) || !standaloneB64Token(s, loc[0]) {
+				continue
+			}
 			if strings.ContainsAny(m, "+/=") || len(m) >= 32 {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// plausibleB64Blob filters out tokens that only match the base64 charset but are
+// actually filesystem paths (or other non-encoded strings). The fail-closed ask is
+// reserved for strong signatures, so a candidate must look like real base64 output:
+// mixed case plus digits, and not a path-like token (leading "/", "~" or ".").
+func plausibleB64Blob(m string) bool {
+	if m == "" {
+		return false
+	}
+	switch m[0] {
+	case '/', '~', '.':
+		return false
+	}
+	var upper, lower, digit bool
+	for _, r := range m {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= 'a' && r <= 'z':
+			lower = true
+		case r >= '0' && r <= '9':
+			digit = true
+		}
+	}
+	return upper && lower && digit
+}
+
+// standaloneB64Token reports whether the base64-charset match that starts at
+// index start in s begins a whole shell token rather than a fragment of a
+// larger URL or filesystem path. URL path segments such as
+// ".../v1/basic.account.account_web.Account/GetAidListByUidV2" match the base64
+// charset but are not encoded payloads, so a match preceded by a path or URL
+// separator must not trigger the fail-closed ask.
+func standaloneB64Token(s string, start int) bool {
+	if start <= 0 {
+		return true
+	}
+	switch s[start-1] {
+	case '/', '.', '~', ':', '\\':
+		return false
+	}
+	return true
 }
 
 // hasReadableDecode reports whether any variant recovered readable text. The
