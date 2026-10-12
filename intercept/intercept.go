@@ -575,34 +575,86 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	if len(rules) == 0 {
 		return Decision{}, false
 	}
-	for _, r := range rules {
-		if ruleMatches(r, toolName, input) {
-			msg := r.Message
-			if msg == "" {
-				msg = defaultMessage(r.Action, r.Name)
-			}
-			configJSON, _ := json.Marshal(r.InterceptRule)
-			return Decision{
-				RuleName: r.Name, ConfigDigest: digestInput(configJSON),
-				Action:         r.Action,
-				Message:        msg,
-				RuleID:         r.ID,
-				TimeoutEnabled: r.TimeoutEnabled,
-				TimeoutSeconds: r.TimeoutSeconds,
-				TimeoutAction:  r.TimeoutAction,
-			}, true
+
+	// 编码/变换规避:把参数里藏进 base64/hex/URL/HTML/转义/反转等编码的载荷
+	// 先解码还原,再让规则在「原文 + 各解码候选」上匹配。这样「?c=<hex>」这类
+	// 明文正则看不到的写法,会以还原后的真实命令命中对应规则。
+	raw := string(input)
+	variants := DecodeVariants(raw, decodeMaxDepth)
+	subjects := make([]string, 0, len(variants)+1)
+	subjects = append(subjects, raw)
+	kindOf := make(map[string]string, len(variants))
+	for _, v := range variants {
+		subjects = append(subjects, v.Text)
+		if _, ok := kindOf[v.Text]; !ok {
+			kindOf[v.Text] = v.Kind
 		}
+	}
+
+	for _, r := range rules {
+		if r.MatchTarget == "tool_name" {
+			if ruleMatchesSubject(r, toolName, toolName) {
+				return i.decisionForRule(r, ""), true
+			}
+			continue
+		}
+		for _, subj := range subjects {
+			if !ruleMatchesSubject(r, toolName, subj) {
+				continue
+			}
+			kind := ""
+			if subj != raw {
+				kind = kindOf[subj]
+			}
+			return i.decisionForRule(r, kind), true
+		}
+	}
+
+	// fail-closed:参数里存在明确的编码/变换特征,但所有解码器都还原不出可读
+	// 内容(疑似加密/压缩/自定义编码)。无法判读的载荷一律转人工,不放行。
+	if len(input) <= decodeMaxInput && LooksEncoded(raw) && !hasReadableDecode(variants) {
+		return Decision{
+			RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
+			Action:   "ask",
+			Message:  obfuscationUndecodableHint,
+		}, true
 	}
 	return Decision{}, false
 }
 
+// decisionForRule builds the Decision for a matched rule. kind is the encoding
+// that had to be decoded before the rule matched ("" when the raw input matched),
+// and is appended to the message so the operator can see why it fired.
+func (i *Interceptor) decisionForRule(r compiledRule, kind string) Decision {
+	msg := r.Message
+	if msg == "" {
+		msg = defaultMessage(r.Action, r.Name)
+	}
+	if kind != "" {
+		msg += "(命中经解码还原后的内容,编码方式:" + kind + ")"
+	}
+	configJSON, _ := json.Marshal(r.InterceptRule)
+	return Decision{
+		RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+		Action:         r.Action,
+		Message:        msg,
+		RuleID:         r.ID,
+		TimeoutEnabled: r.TimeoutEnabled,
+		TimeoutSeconds: r.TimeoutSeconds,
+		TimeoutAction:  r.TimeoutAction,
+	}
+}
+
 func ruleMatches(r compiledRule, toolName string, input []byte) bool {
-	var subject string
+	return ruleMatchesSubject(r, toolName, string(input))
+}
+
+func ruleMatchesSubject(r compiledRule, toolName, subject string) bool {
 	switch r.MatchTarget {
 	case "tool_name":
 		subject = toolName
 	case "tool_input":
-		subject = string(input)
+		// subject already holds the tool input (raw or decoded)
 	default:
 		return false
 	}

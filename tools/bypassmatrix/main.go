@@ -321,6 +321,19 @@ func main() {
 	cases = append(cases, sqlCasesExtra()...)
 	cases = append(cases, httpCasesExtra()...)
 	cases = append(cases, sessionCasesExtra()...)
+	cases = append(cases, bizDeleteCases()...)
+	cases = append(cases, encEvasionCases()...)
+
+	if g := strings.TrimSpace(os.Getenv("ARTEX_MATRIX_GROUP")); g != "" {
+		var f []Case
+		for _, c := range cases {
+			if c.Group == g || strings.HasPrefix(c.Group, g) {
+				f = append(f, c)
+			}
+		}
+		cases = f
+		fmt.Printf("group filter=%s cases=%d\n", g, len(cases))
+	}
 
 	var sb strings.Builder
 	sb.WriteString("id,group,tool,technique,layer1_action,layer1_rule,layer2_action,layer2_raw,final_blocked,command\n")
