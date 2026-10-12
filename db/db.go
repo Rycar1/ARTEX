@@ -324,6 +324,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV7(); err != nil {
 		return fmt.Errorf("seed intercept rules v7: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV8(); err != nil {
+		return fmt.Errorf("seed intercept rules v8: %w", err)
+	}
 	if err := d.seedBuiltinTaskTemplates(); err != nil {
 		return fmt.Errorf("seed builtin task templates: %w", err)
 	}
@@ -799,6 +802,56 @@ ON CONFLICT DO NOTHING`,
 		}
 	}
 	return d.SetSetting("intercept_default_rules_v6", "done")
+}
+
+// builtinObfuscationRules 拦「把真实载荷藏在编码/变换之后」的规避写法。这类命令的
+// 最终执行内容在参数里读不出来:正则看不到真命令,模型也可能只看管道就放行
+// (bypass 矩阵实测 rev|bash、嵌套 base64 -d|sh 曾被放行)。一律 ask,由人工确认
+// 解码后的内容无害再放行;已确认无害的场景可在规则页禁用单条。
+var builtinObfuscationRules = []struct {
+	name    string
+	pattern string
+}{
+	{
+		name:    "[内置] 解码/变换后管道执行(疑似规避检测): base64/xxd/rev/tr",
+		pattern: `(?i)\b(?:base64|xxd|od|rev|tr|openssl)\b[^\n|]{0,40}\|\s*(?:bash|sh|zsh|dash)\b`,
+	},
+	{
+		name:    "[内置] 转义字符/printf 构造后执行(疑似规避检测)",
+		pattern: `(?i)\$\'\\x[0-9a-f]{2}|\$\'\\[0-7]{3}|\bprintf\b[^\n|]{0,200}(?:\\x[0-9a-f]{2}|\\[0-7]{3})[^\n|]{0,80}\|\s*(?:bash|sh|zsh|dash)\b`,
+	},
+	{
+		name:    "[内置] eval 命令替换 / herestring 投喂解释器(疑似规避检测)",
+		pattern: `(?i)\beval\b[^\n]{0,60}\$\(|\b(?:bash|sh|zsh|dash)\b\s*<<<`,
+	},
+	{
+		name:    "[内置] 命令替换内解码执行(疑似规避检测)",
+		pattern: `(?i)\$\([^\n)]{0,200}(?:base64[^\n)]{0,30}(?:-d|--decode)|xxd[^\n)]{0,20}-r|\brev\b)[^\n)]{0,60}\)`,
+	},
+}
+
+// obfuscationHint 是「解码后执行」类写法被 ask 拦截时给人工的提示。
+const obfuscationHint = "检测到「解码/变换后再执行」的规避写法,真实载荷无法从参数直接读出(rev/base64 -d/xxd -r/printf 转义/eval $( ) 等)。" +
+	"请让 worker 以可读形式重发命令;确认解码后内容无破坏性后再放行。"
+
+// seedDefaultInterceptRulesV8 拦「编码/变换规避检测后执行」的写法(ask)。V7 之前的
+// 规则只匹配明文命令,明文之外的变换写法靠模型兜底,实测存在漏放;此版本用确定性
+// 规则补上,保证这类调用一定落到人工审批。
+func (d *DB) seedDefaultInterceptRulesV8() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v8"); v == "done" {
+		return nil
+	}
+	for _, r := range builtinObfuscationRules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, builtin)
+VALUES ($1, true, 89, 'tool_input', 'regex', $2, 'ask', $3, false, 60, 'deny', true)
+ON CONFLICT DO NOTHING`,
+			r.name, r.pattern, obfuscationHint,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v8", "done")
 }
 
 // seedDefaultInterceptRulesV5 拦「裸用隧道二进制」(内网期 3):隧道是长寿命受管资源,
