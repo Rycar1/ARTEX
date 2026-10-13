@@ -153,13 +153,26 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
 	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
 	if !matched {
-		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
-		// or unwired, keep current behavior and allow.
+		// No rule matched. Ask the LLM fallback judge (if enabled). Encoded
+		// payloads that no decoder could recover are routed here too, so the
+		// judge decides them instead of always going to a human.
 		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)
 		if !judged {
-			return hook.Result{}
+			// No judge available. Preserve fail-closed for a payload whose
+			// strong encoding signature cannot be decoded: route it to human
+			// approval rather than silently allowing it.
+			if intercept.UndecodableEncodedPayload(string(ev.Input)) {
+				dec = intercept.Decision{
+					RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
+					Action:   "ask",
+					Message:  intercept.ObfuscationUndecodableHint,
+				}
+			} else {
+				return hook.Result{}
+			}
+		} else {
+			dec = d
 		}
-		dec = d
 	}
 	switch dec.Action {
 	case "deny":

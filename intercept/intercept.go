@@ -561,7 +561,10 @@ func judgeActionLabel(action string) string {
 // (Decision{}, false) if no rule matches. Fail-closed: a rule-load error is NOT
 // treated as "no rules" — it returns an explicit deny decision (and logs),
 // while an empty rule list (len==0, no error) still falls through to the LLM
-// judge / caller default.
+// judge / caller default. An encoded payload that no decoder can recover is
+// NOT auto-escalated here; it falls through to the judge like any other
+// unmatched call (the guard keeps a fail-closed human ask only when no judge
+// is available).
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
 	if err != nil {
@@ -610,15 +613,9 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 		}
 	}
 
-	// fail-closed:参数里存在明确的编码/变换特征,但所有解码器都还原不出可读
-	// 内容(疑似加密/压缩/自定义编码)。无法判读的载荷一律转人工,不放行。
-	if len(input) <= decodeMaxInput && LooksEncoded(raw) && !hasReadableDecode(variants) {
-		return Decision{
-			RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
-			Action:   "ask",
-			Message:  obfuscationUndecodableHint,
-		}, true
-	}
+	// 编码载荷无法解码时不再直接转人工:保持「未命中」,由调用方走 Judge(),
+	// 让 LLM 裁判自行判定(guard 层仅在无裁判可用时才用
+	// UndecodableEncodedPayload 兜底转人工)。
 	return Decision{}, false
 }
 

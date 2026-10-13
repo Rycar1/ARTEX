@@ -260,9 +260,20 @@ func hasReadableDecode(vs []DecodedVariant) bool {
 	return false
 }
 
-// obfuscationUndecodableHint 是「参数含编码特征但无法还原」被 fail-closed 转人工
-// 时给人工的提示。
-const obfuscationUndecodableHint = "检测到参数中存在编码/变换后的载荷(base64/hex/URL/HTML/转义等特征),但平台解码后仍无法还原出可读内容(疑似加密、压缩或自定义编码)。" +
+// UndecodableEncodedPayload reports whether raw carries a strong encoding
+// signature whose plaintext no decoder can recover. Callers use it as a
+// fail-closed fallback ONLY when no LLM judge is available: the normal path
+// routes such calls to the judge, which decides allow/ask/deny itself.
+func UndecodableEncodedPayload(raw string) bool {
+	if len(raw) > decodeMaxInput || !LooksEncoded(raw) {
+		return false
+	}
+	return !hasReadableDecode(DecodeVariants(raw, decodeMaxDepth))
+}
+
+// ObfuscationUndecodableHint 是「参数含编码特征但无法还原」时给人工的提示。
+// 仅在没有任何 LLM 裁判可用时兜底使用(正常路径由裁判自行判定)。
+const ObfuscationUndecodableHint = "检测到参数中存在编码/变换后的载荷(base64/hex/URL/HTML/转义等特征),但平台解码后仍无法还原出可读内容(疑似加密、压缩或自定义编码)。" +
 	"无法判读真实执行内容时按 fail-closed 转人工。请让 worker 以可读的明文形式重发命令,或说明该编码载荷的真实内容与用途。"
 
 // SelectVariantsForReview returns the variants worth sending to the judge,
