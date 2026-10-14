@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 )
@@ -107,15 +109,48 @@ func (s *Server) wireInterceptReviewer() {
 		if profileID == 0 {
 			return intercept.Decision{}, fmt.Errorf("未配置可用的裁判模型")
 		}
-		prov, _, ok := s.providerForProfile(profileID)
+		prov, cfg, ok := s.providerForProfile(profileID)
 		if !ok {
 			return intercept.Decision{ProfileID: profileID}, fmt.Errorf("裁判模型 profile %d 不可用", profileID)
 		}
 		// Tag this call's usage as the "judge" lane so the config page can report
 		// how much the fallback approval has spent, separate from model profiles.
 		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
-		return judgeWithRetry(ctx, prov, profileID, prompt, input, s.m.interceptor.GetJudgeConfig().RetryAttempts)
+		dec, err := judgeWithRetry(ctx, prov, profileID, prompt, input, s.m.interceptor.GetJudgeConfig().RetryAttempts)
+		if err == nil {
+			return dec, nil
+		}
+		// 裁判是最后一道门:单个上游故障不该直接变成「按失败策略 deny」。主配置这一轮
+		// 全失败后,按轮询链换到下一个可用配置再判一轮(链上只有它自己时保持原语义)。
+		if next := s.judgeFailoverMember(profileID, prov, cfg); next != nil {
+			log.Printf("[judge] 裁判配置 %d 失败(%s),故障转移到 %q(%s)",
+				profileID, classifyJudgeErr(err), next.Name, next.Model)
+			if d2, err2 := judgeWithRetry(ctx, next.Prov, next.ID, prompt, input, s.m.interceptor.GetJudgeConfig().RetryAttempts); err2 == nil {
+				return d2, nil
+			}
+		}
+		return dec, err
 	})
+}
+
+// judgeFailoverMember picks the next member of the LLM failover chain to judge
+// with after headID already failed this round. Returns nil when failover is off,
+// when the chain has no other usable member, or when the only candidate is the
+// head itself (in which case the caller keeps the original failure semantics).
+func (s *Server) judgeFailoverMember(headID int64, headProv llm.Provider, headCfg agent.Config) *llmpool.Member {
+	if s == nil || s.m == nil {
+		return nil
+	}
+	pool := s.poolChain(headID, headProv, headCfg)
+	if pool == nil {
+		return nil
+	}
+	for _, m := range pool.Members() {
+		if m.ID != headID {
+			return m
+		}
+	}
+	return nil
 }
 
 // judgeWithRetry runs the fallback-judge completion and returns the first
@@ -160,13 +195,32 @@ func judgeWithRetry(ctx context.Context, prov llm.Provider, profileID int64, pro
 		}
 		v := intercept.ParseVerdict(text)
 		if v.Action == "" {
+			// 原始返回此前完全不可见(llm_records 默认关闭),线上只能看到
+			// 「格式无效」四个字,无法判断是截断、串格式还是模型跑偏。打一条带上
+			// 返回原文预览的日志,让这类失败可复盘。
+			log.Printf("[judge] 第 %d/%d 次裁决无法解析(返回 %d 字符): %s",
+				attempt+1, attempts, len(text), judgeReplyPreview(text))
 			lastErr = fmt.Errorf("模型裁决格式无效，必须包含裁决、实际操作、成功后的后果和命中规则")
 			continue // an unparseable reply is always worth a corrective re-ask
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
 	}
+	log.Printf("[judge] 连续 %d 次未取得有效裁决: %s", attempts, classifyJudgeErr(lastErr))
 	return intercept.Decision{ProfileID: profileID}, finalJudgeErr(attempts, lastErr)
 }
+
+// judgeReplyPreview renders a bounded single-line preview of a raw judge reply for
+// the log (maxJudgeReplyPreview bytes, then a truncation note with the full size).
+func judgeReplyPreview(text string) string {
+	s := strings.Join(strings.Fields(text), " ")
+	if len(s) <= maxJudgeReplyPreview {
+		return s
+	}
+	return s[:maxJudgeReplyPreview] + "…(截断,原文 " + strconv.Itoa(len(s)) + " 字符)"
+}
+
+// maxJudgeReplyPreview bounds the raw judge reply echoed into the server log.
+const maxJudgeReplyPreview = 400
 
 // judgeRepairInstruction is appended to the judge system prompt on a retry
 // after an unparseable reply. It restates the mandated output format without
@@ -340,12 +394,19 @@ func reviewCompletion(ctx context.Context, prov llm.Provider, prompt string, inp
 // streamCollectText runs a single non-streaming-style completion (thinking off,
 // low temperature, bounded output) and returns the concatenated text. The
 // budget includes the explanation and complete closing JSON delimiters.
+//
+// judgeMaxTokens must be large enough for the mandated three-part explanation:
+// at 1024 the longest live verdicts were cut mid-JSON (1930 of 56018 judge calls
+// in one 30h window hit the old ceiling exactly), which surfaced as
+// "模型裁决格式无效" and then as a fail-action deny.
+const judgeMaxTokens = 2048
+
 func streamCollectText(ctx context.Context, prov llm.Provider, system, user string) (string, error) {
 	temp := 0.0
 	req := llm.CompletionRequest{
 		System:      []string{system},
 		Messages:    []llm.Message{llm.UserText(user)},
-		MaxTokens:   1024,
+		MaxTokens:   judgeMaxTokens,
 		Temperature: &temp,
 		Thinking:    "disabled",
 	}
@@ -608,9 +669,9 @@ func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
 		return filter, fmt.Errorf("status 必须是 pending、allowed、denied 或 timeout")
 	}
 	switch filter.DecisionSource {
-	case "", "model", "rule", "unknown", "aggressive":
+	case "", "model", "rule", "builtin", "unknown", "aggressive", "auto_allow":
 	default:
-		return filter, fmt.Errorf("decision_source 必须是 model、rule、unknown 或 aggressive")
+		return filter, fmt.Errorf("decision_source 必须是 model、rule、builtin、unknown、aggressive 或 auto_allow")
 	}
 	return filter, nil
 }

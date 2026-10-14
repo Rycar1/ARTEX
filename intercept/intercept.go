@@ -317,6 +317,11 @@ type Decision struct {
 	// NoAutoAllow 为 true 时该 ask 不受「一键放行 / 激进模式」自动批准豁免,仍需人工裁决。
 	// 用于 RoE 授权范围强制 —— 激进模式放宽技术限制,但资产范围边界不能自动放行。
 	NoAutoAllow bool
+	// Source 是该裁决的来源,写入 intercept_pending.decision_source 供审核页筛选:
+	// "rule"(命中拦截规则)| "model"(LLM 裁判)| "builtin"(平台内置兜底:
+	// 编码无法解码转人工、RoE 范围强制、规则加载失败 fail-closed)| "aggressive"|
+	// "auto_allow"。空值回退到按 ruleID / 消息前缀的旧推断。
+	Source string
 }
 
 // --- LLM fallback judge ---
@@ -339,7 +344,11 @@ const (
 // decides; unattended asks time out to deny — see defaultJudgeAskTimeoutAction),
 // never silently to "allow".
 const (
-	defaultJudgeTimeoutSecs      = 15
+	// defaultJudgeTimeoutSecs 是「整段裁判流程」的墙钟预算:Judge 用它建一个总
+	// deadline,重试与退避都从这个预算里扣(见 Judge/judgeWithRetry)。15s 时
+	// 纠格式的重试被饿死,超时被记成「调用超时」→ 按失败策略 deny(单 30 小时窗口
+	// 1317 条)。60s 足够覆盖 3 次尝试 × 实测 3–10s 的调用延迟。
+	defaultJudgeTimeoutSecs      = 60
 	defaultJudgeFailAction       = "ask"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
@@ -540,6 +549,9 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		out.TimeoutSeconds = cfg.AskTimeoutSeconds
 		out.TimeoutAction = cfg.AskTimeoutAction
 	}
+	// Every verdict out of Judge() is a model decision (including the model-failure
+	// fallback), so the history row is attributed to the judge, not "unknown".
+	out.Source = "model"
 	return out, true
 }
 
@@ -573,6 +585,7 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 			RuleName: "rule-load-error",
 			Action:   "deny",
 			Message:  "拦截规则加载失败,平台按 fail-closed 策略禁止执行此工具",
+			Source:   "builtin",
 		}, true
 	}
 	if len(rules) == 0 {
@@ -639,6 +652,7 @@ func (i *Interceptor) decisionForRule(r compiledRule, kind string) Decision {
 		TimeoutEnabled: r.TimeoutEnabled,
 		TimeoutSeconds: r.TimeoutSeconds,
 		TimeoutAction:  r.TimeoutAction,
+		Source:         "rule",
 	}
 }
 
@@ -681,10 +695,27 @@ func defaultMessage(action, name string) string {
 func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, status string) {
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, status)
-	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, audit)
+	id, err := i.db.CreateDecidedInterceptWithSource(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, decisionSource(dec), audit)
 	if err == nil {
 		i.bindResult(ctx, id, audit)
 	}
+}
+
+// decisionSource resolves the decision_source column value for a Decision: an
+// explicit Source set at the decision site wins (builtin/model/rule/aggressive/
+// auto_allow), otherwise it falls back to the legacy ruleID/message inference so
+// older callers keep their previous labeling.
+func decisionSource(dec Decision) string {
+	if dec.Source != "" {
+		return dec.Source
+	}
+	if dec.RuleID != 0 {
+		return "rule"
+	}
+	if strings.HasPrefix(dec.Message, "[模型]") {
+		return "model"
+	}
+	return "unknown"
 }
 
 // HandleAsk creates a pending approval record and blocks until the user decides
@@ -720,7 +751,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	taskEmit := taskEmitFromCtx(ctx)
 
 	audit := auditFor(ctx, dec, input, "pending")
-	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, input, dec.Message, audit)
+	pendingID, err := i.db.CreateInterceptPendingWithSource(ruleID, convID, taskID, agentName, toolName, input, dec.Message, decisionSource(dec), audit)
 	if err != nil {
 		return false
 	}

@@ -2440,10 +2440,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const status = q.get("status") || "";
     const decisionSource = q.get("decision_source") || "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
-    if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    if (decisionSource && !["model", "rule", "builtin", "unknown", "aggressive", "auto_allow"].includes(decisionSource))
+      throw new Error("无效判定来源");
     const filtered = mockInterceptHistory.filter((row) => {
       const source =
-        row.decision_source || (row.rule_id ? "rule" : row.reason?.startsWith("[模型]") ? "model" : "unknown");
+        row.decision_source ||
+        (row.rule_id
+          ? "rule"
+          : row.reason?.startsWith("[模型]")
+            ? "model"
+            : row.reason?.includes("内置")
+              ? "builtin"
+              : "unknown");
       return (
         (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
         (!status || row.status === status) &&

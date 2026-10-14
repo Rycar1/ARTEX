@@ -138,8 +138,16 @@ func (d *DB) ToggleInterceptRule(id int64, enabled bool) error {
 
 // CreateInterceptPending inserts a pending approval record and returns its ID.
 // convID == 0 → conversation_id stored as NULL (background task).
-// taskID == "" → task_id stored as NULL.
+// taskID == "" → task_id stored as NULL. decision_source is inferred from the
+// owning rule / message prefix; use CreateInterceptPendingWithSource to set it
+// explicitly (builtin/model/aggressive/...).
 func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason string, audits ...*InterceptAudit) (int64, error) {
+	return d.CreateInterceptPendingWithSource(ruleID, convID, taskID, agentName, toolName, input, reason, interceptSource(ruleID, reason), audits...)
+}
+
+// CreateInterceptPendingWithSource is CreateInterceptPending with an explicit
+// decision_source (e.g. "builtin" for the platform built-in fail-closed ask).
+func (d *DB) CreateInterceptPendingWithSource(ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason, source string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
 		raw = json.RawMessage("{}")
@@ -161,7 +169,7 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 	err := d.QueryRow(`
 INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, reason, decision_source, audit)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, source, firstAudit(audits)).Scan(&id)
 	return id, err
 }
 

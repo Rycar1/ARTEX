@@ -75,7 +75,8 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 	if len(hosts) == 0 {
 		return hook.Result{}, false // 提取不出目标 = 无目标,不拦截(保守取向)
 	}
-	matcher := NewScopeMatcher(cfg.Scope(taskID))
+	scope := cfg.Scope(taskID)
+	matcher := NewScopeMatcher(scope)
 	var out []string
 	unknown := false
 	for _, h := range hosts {
@@ -93,13 +94,16 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 		// 部分目标出了已登记范围、部分无规则可依 —— 按 Out 处理已有的违规即可。
 		log.Printf("[guard][roe] task %d 部分目标无范围规则可依: %v", taskID, hosts)
 	}
-	reason := roeMessage(out, cfg.Scope(taskID))
+	reason := roeMessage(out, scope)
 	if mode == "strict" {
 		return g.roeAsk(ctx, ev, reason)
 	}
-	// warn:放行,但写 guard 审计 + 日志。
+	// warn:放行,但写 guard 审计 + 日志。日志只打命中的目标与范围条目数 ——
+	// reason 内嵌完整范围列表(腾讯任务 11390 条 → 单行 17 万字符),直接打会刷爆
+	// docker logs;完整 reason 仍进 guard 审计,可查。
 	g.record(ev.ToolName, "allow", reason, cmd)
-	log.Printf("[guard][roe] task %d 范围外目标(warn 放行): %s", taskID, reason)
+	log.Printf("[guard][roe] task %d 范围外目标(warn 放行): %s(登记范围 %d 条)",
+		taskID, strings.Join(out, ", "), len(scope))
 	return hook.Result{}, false
 }
 
@@ -114,7 +118,7 @@ func (g *Guard) roeAsk(ctx context.Context, ev hook.Event, reason string) (hook.
 	}
 	// NoAutoAllow:RoE 范围强制审批不参与「一键放行 / 激进模式」自动批准 —— 激进模式
 	// 放宽技术限制,但资产范围边界必须人工把关(保证「资产不打偏」)。
-	dec := intercept.Decision{Action: "ask", RuleName: "内置 RoE 范围强制", Message: reason, NoAutoAllow: true}
+	dec := intercept.Decision{Action: "ask", RuleName: "内置 RoE 范围强制", Message: reason, NoAutoAllow: true, Source: "builtin"}
 	convID := intercept.ConvIDFromContext(ctx)
 	if !g.interceptor.HandleAsk(ctx, convID, dec, ev.ToolName, ev.Input) {
 		return g.block(ev.ToolName, systemBlockMessage("RoE 范围外目标，人工审批未通过（用户拒绝或审批超时）"), ""), true
@@ -130,11 +134,22 @@ func roeMessage(out []string, rules []ScopeRule) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "RoE 授权范围检查:目标 %s 不在本任务已登记范围内", strings.Join(out, ", "))
 	if len(rules) > 0 {
-		parts := make([]string, 0, len(rules))
-		for _, r := range rules {
+		// 大任务的范围表可达上万条(单条消息 17 万字符),只列前 maxShownRules 条 + 总数,
+		// 保证人工审批弹窗与审计记录都可读。
+		const maxShownRules = 8
+		shown := rules
+		if len(shown) > maxShownRules {
+			shown = shown[:maxShownRules]
+		}
+		parts := make([]string, 0, len(shown))
+		for _, r := range shown {
 			parts = append(parts, r.Kind+"="+r.Value)
 		}
-		fmt.Fprintf(&sb, "（登记范围: %s）", strings.Join(parts, ", "))
+		if rest := len(rules) - len(shown); rest > 0 {
+			fmt.Fprintf(&sb, "（登记范围: %s 等共 %d 条）", strings.Join(parts, ", "), len(rules))
+		} else {
+			fmt.Fprintf(&sb, "（登记范围: %s）", strings.Join(parts, ", "))
+		}
 	}
 	sb.WriteString("。如需放行:把目标加入任务范围(add_task_scope),或在系统设置把 roe_enforcement 改为 warn(仅告警)/off(关闭)。")
 	return sb.String()

@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -101,5 +102,28 @@ func TestRoEWebFetch(t *testing.T) {
 	blocked, _, _ := g.Hooks().PreToolUse(context.Background(), "WebFetch", input)
 	if !blocked {
 		t.Error("WebFetch 的 URL host 同样受 RoE 检查")
+	}
+}
+
+// P1-3 回归:大任务的范围表(腾讯 11390 条)不得让审批/审计消息膨胀到 17 万字符。
+func TestRoEMessageCapsScopeList(t *testing.T) {
+	rules := make([]ScopeRule, 0, 11390)
+	for i := 0; i < 11390; i++ {
+		rules = append(rules, ScopeRule{Kind: "domain", Value: fmt.Sprintf("h%d.example.com", i)})
+	}
+	msg := roeMessage([]string{"out.example.net"}, rules)
+	if len(msg) > 1000 {
+		t.Errorf("范围列表应被截断, got %d 字符", len(msg))
+	}
+	if !strings.Contains(msg, "共 11390 条") {
+		t.Errorf("应写明范围总条数, got: %s", msg)
+	}
+	if !strings.Contains(msg, "out.example.net") {
+		t.Errorf("应写明命中目标, got: %s", msg)
+	}
+	// 小范围表保持原样(全量列出,不带「共 N 条」)。
+	small := roeMessage([]string{"a.example.net"}, rules[:2])
+	if !strings.Contains(small, "h0.example.com") || !strings.Contains(small, "h1.example.com") || strings.Contains(small, "共") {
+		t.Errorf("小范围表应完整列出, got: %s", small)
 	}
 }

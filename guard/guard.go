@@ -166,6 +166,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 					RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
 					Action:   "ask",
 					Message:  intercept.ObfuscationUndecodableHint,
+					Source:   "builtin",
 				}
 			} else {
 				return hook.Result{}

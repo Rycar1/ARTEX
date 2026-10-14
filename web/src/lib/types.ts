@@ -1386,7 +1386,7 @@ export interface AssetInterceptRule {
 }
 
 export interface InterceptPending {
-  decision_source?: "rule" | "model" | "unknown" | "";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "auto_allow" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1454,7 +1454,7 @@ export interface PendingScopeRow {
 
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
-  decision_source?: "rule" | "model" | "unknown";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "auto_allow";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.

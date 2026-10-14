@@ -78,7 +78,32 @@ func TestReviewCompletionSendsCurrentCallWithoutHistory(t *testing.T) {
 	if strings.Contains(body, "file created") || strings.Contains(body, `"path"`) {
 		t.Fatal("history leaked into actual model request")
 	}
-	if got.Version != 4 || got.Background == nil || got.Background.Source != intercept.BackgroundUserMessage || got.Background.Text != "清理本次测试文件" || got.WorkingDir != "/tmp/review-fixture" || string(got.Arguments) != string(args) || strings.Contains(body, "worker speculation") || strings.Contains(body, "GLOBAL_OVERVIEW_SENTINEL") {
+	if got.Version != 5 || got.Background == nil || got.Background.Source != intercept.BackgroundUserMessage || got.Background.Text != "清理本次测试文件" || got.WorkingDir != "/tmp/review-fixture" || string(got.Arguments) != string(args) || strings.Contains(body, "worker speculation") || strings.Contains(body, "GLOBAL_OVERVIEW_SENTINEL") {
 		t.Fatalf("wrong model input: %s", body)
+	}
+}
+
+// The judge must be able to emit the mandated three-part explanation plus closing
+// JSON delimiters: at 1024 the longest live verdicts were truncated mid-JSON and
+// surfaced as "模型裁决格式无效" → fail-action deny.
+func TestJudgeOutputBudgetFitsExplanation(t *testing.T) {
+	if judgeMaxTokens < 2048 {
+		t.Fatalf("judgeMaxTokens=%d 太小,长裁决会被截断成非法 JSON", judgeMaxTokens)
+	}
+}
+
+// A raw judge reply that fails to parse must be visible in the log (bounded), so
+// "格式无效" can be diagnosed without llm_records.
+func TestJudgeReplyPreviewIsBounded(t *testing.T) {
+	long := strings.Repeat("x", maxJudgeReplyPreview*3)
+	got := judgeReplyPreview(long)
+	if len(got) > maxJudgeReplyPreview+64 {
+		t.Fatalf("preview 未被截断: %d 字符", len(got))
+	}
+	if !strings.Contains(got, "截断") || !strings.Contains(got, "字符") {
+		t.Fatalf("截断提示缺失: %s", got)
+	}
+	if got := judgeReplyPreview("a\nb\tc  d"); got != "a b c d" {
+		t.Fatalf("preview 应压成单行: %q", got)
 	}
 }
