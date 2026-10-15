@@ -133,6 +133,9 @@ type Interceptor struct {
 	// taskOpMode 由 server 层注入:按任务 id 解析作战模式("standard"|"aggressive")。
 	// nil → 一律按 standard。见 SetTaskOpMode。
 	taskOpMode func(taskID string) string
+	// policy 是拦截策略缓存(规则模式 + 裁判是否启用);nil 表示未加载。
+	// 见 reviewPolicy()。
+	policy *reviewPolicy
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -173,7 +176,75 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.policy = nil
 	i.mu.Unlock()
+}
+
+// settingRuleMode 选择拦截判定链:命中规则即终态(默认),还是把每一次调用都交给
+// LLM 裁判(纯模型审核)。
+const settingRuleMode = "intercept_rule_mode"
+
+const (
+	// RuleModeRules:规则优先,命中即终态,未命中才交裁判(历史行为)。
+	RuleModeRules = "rules"
+	// RuleModeJudgeOnly:纯 LLM 审核 —— 跳过全部拦截规则(含内置规则),每一次
+	// 进入拦截范围的调用都由裁判模型判定。规则仍在库里,切回即可恢复。
+	RuleModeJudgeOnly = "judge_only"
+)
+
+// reviewPolicy is the cached interception policy: which decision chain to run and
+// whether a judge is actually available. Read through reviewPolicy().
+type reviewPolicy struct {
+	mode         string
+	judgeEnabled bool
+}
+
+// reviewPolicy loads (and caches) the interception policy. It is invalidated by
+// Invalidate() — called by the rule/tool/judge config writers — so a settings
+// change takes effect without a restart.
+func (i *Interceptor) reviewPolicy() reviewPolicy {
+	i.mu.RLock()
+	if p := i.policy; p != nil {
+		out := *p
+		i.mu.RUnlock()
+		return out
+	}
+	i.mu.RUnlock()
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if p := i.policy; p != nil {
+		return *p
+	}
+	p := reviewPolicy{mode: RuleModeRules, judgeEnabled: i.db.GetBool(settingJudgeEnabled, false)}
+	if v, ok, err := i.db.GetSetting(settingRuleMode); err == nil && ok && strings.TrimSpace(v) == RuleModeJudgeOnly {
+		p.mode = RuleModeJudgeOnly
+	}
+	i.policy = &p
+	return p
+}
+
+// RuleMode reports the active interception chain ("rules" | "judge_only").
+func (i *Interceptor) RuleMode() string { return i.reviewPolicy().mode }
+
+// SetRuleMode persists the interception chain. Unknown values fall back to
+// RuleModeRules. Pure-judge mode is refused when no judge is enabled: without
+// rules AND without a judge the platform would have no decision layer at all.
+func (i *Interceptor) SetRuleMode(mode string) error {
+	switch strings.TrimSpace(mode) {
+	case RuleModeJudgeOnly:
+		if !i.db.GetBool(settingJudgeEnabled, false) {
+			return fmt.Errorf("纯模型审核需要先启用裁判模型（系统 → 拦截审批 → 模型配置）")
+		}
+		mode = RuleModeJudgeOnly
+	default:
+		mode = RuleModeRules
+	}
+	if err := i.db.SetSetting(settingRuleMode, mode); err != nil {
+		return err
+	}
+	i.Invalidate()
+	return nil
 }
 
 func (i *Interceptor) loadLocked() error {
@@ -480,6 +551,8 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := i.db.SetSetting(settingJudgeRetryAttempts, strconv.Itoa(clampJudgeRetryAttempts(c.RetryAttempts))); err != nil {
 		return err
 	}
+	// 裁判开关是审核策略的一部分(纯模型审核模式要求裁判可用),缓存必须失效。
+	i.Invalidate()
 	return nil
 }
 
@@ -596,16 +669,7 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	// 先解码还原,再让规则在「原文 + 各解码候选」上匹配。这样「?c=<hex>」这类
 	// 明文正则看不到的写法,会以还原后的真实命令命中对应规则。
 	raw := string(input)
-	variants := DecodeVariants(raw, decodeMaxDepth)
-	subjects := make([]string, 0, len(variants)+1)
-	subjects = append(subjects, raw)
-	kindOf := make(map[string]string, len(variants))
-	for _, v := range variants {
-		subjects = append(subjects, v.Text)
-		if _, ok := kindOf[v.Text]; !ok {
-			kindOf[v.Text] = v.Kind
-		}
-	}
+	subjects, kindOf := matchSubjects(raw)
 
 	for _, r := range rules {
 		if r.MatchTarget == "tool_name" {
@@ -631,6 +695,67 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	// UndecodableEncodedPayload 兜底转人工)。
 	return Decision{}, false
 }
+
+// matchSubjects returns the texts every rule is evaluated against, in order, plus
+// the transform kind that produced each non-raw subject ("" for the raw input).
+//
+// The first entry is the raw tool_input JSON, then its JSON-unescaped view, then
+// the decoding/obfuscation variants. The unescaped view exists because rules are
+// authored against the *logical* command text, while the wire form escapes it —
+// see jsonUnescapeView for the two ways that silently disabled rules on live
+// traffic. It is only added when it actually differs from the raw input.
+func matchSubjects(raw string) ([]string, map[string]string) {
+	variants := DecodeVariants(raw, decodeMaxDepth)
+	subjects := make([]string, 0, len(variants)+2)
+	kindOf := make(map[string]string, len(variants)+1)
+	subjects = append(subjects, raw)
+	if unescaped, ok := jsonUnescapeView(raw); ok && unescaped != raw {
+		subjects = append(subjects, unescaped)
+		kindOf[unescaped] = "json_unescape"
+	}
+	for _, v := range variants {
+		subjects = append(subjects, v.Text)
+		if _, ok := kindOf[v.Text]; !ok {
+			kindOf[v.Text] = v.Kind
+		}
+	}
+	return subjects, kindOf
+}
+
+// Review is the single decision entry point for one tool call. It runs the
+// configured interception chain:
+//
+//   - RuleModeRules (default): Match() first — the first matching rule is
+//     terminal — and only an unmatched call goes to Judge().
+//   - RuleModeJudgeOnly (纯模型审核): every call goes straight to Judge();
+//     the rule table is skipped entirely (rules stay in the DB, so switching
+//     back restores them).
+//
+// decided=false means no decision layer produced a verdict (rules matched
+// nothing and no judge is wired). Callers keep their own fail-closed fallback.
+func (i *Interceptor) Review(ctx context.Context, toolName string, input []byte) (Decision, bool) {
+	if i.reviewPolicy().mode == RuleModeJudgeOnly {
+		if dec, judged := i.Judge(ctx, toolName, input); judged {
+			return dec, true
+		}
+		// 纯模型审核模式下裁判不可用 = 平台没有任何判定层。fail-closed 转人工:
+		// 既不能放行(等于零审核),也不直接 deny(那会把整条任务链硬停)。
+		return Decision{
+			RuleName: "[内置] 纯模型审核:裁判不可用",
+			Action:   "ask",
+			Message:  JudgeUnavailableHint,
+			Source:   "builtin",
+		}, true
+	}
+	if dec, matched := i.Match(toolName, input); matched {
+		return dec, true
+	}
+	return i.Judge(ctx, toolName, input)
+}
+
+// JudgeUnavailableHint 是「纯模型审核模式已开启但裁判模型不可用」时给人工的提示。
+const JudgeUnavailableHint = "平台已切换为纯模型审核(拦截规则不参与判定),但裁判模型当前不可用(未启用 / 未配置 / 调用失败)。" +
+	"此时没有任何判定层能给出结论,按 fail-closed 转人工。请到 系统 → 拦截审批 → 模型配置 启用裁判模型,或把审核模式切回「规则 + 模型」。"
 
 // decisionForRule builds the Decision for a matched rule. kind is the encoding
 // that had to be decoded before the rule matched ("" when the raw input matched),

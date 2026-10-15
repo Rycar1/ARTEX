@@ -812,6 +812,40 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// interceptGetMode returns the active interception chain. judge_available tells
+// the UI whether pure-model mode can be selected at all (it needs a judge).
+func (s *Server) interceptGetMode(w http.ResponseWriter, r *http.Request) {
+	ic := s.m.interceptor
+	writeJSON(w, 200, map[string]any{
+		"mode":            ic.RuleMode(),
+		"judge_available": ic.GetJudgeConfig().Enabled,
+	})
+}
+
+// interceptSetMode switches between rule-first and pure-model review. Pure-model
+// mode is rejected while no judge is enabled: without rules AND without a judge
+// the platform would have no decision layer at all.
+func (s *Server) interceptSetMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	switch req.Mode {
+	case intercept.RuleModeRules, intercept.RuleModeJudgeOnly:
+	default:
+		writeErr(w, 400, "mode 必须是 rules 或 judge_only")
+		return
+	}
+	if err := s.m.interceptor.SetRuleMode(req.Mode); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "mode": s.m.interceptor.RuleMode()})
+}
+
 // interceptJudgeUsage returns the fallback judge's cumulative token spend plus a
 // recent daily series, for the config page. ?days bounds the daily series (default 30).
 func (s *Server) interceptJudgeUsage(w http.ResponseWriter, r *http.Request) {

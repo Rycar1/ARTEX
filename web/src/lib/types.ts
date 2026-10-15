@@ -1401,9 +1401,18 @@ export interface InterceptPending {
   created_at: string;
 }
 
+// InterceptRuleMode: 拦截判定链。
+//   rules      = 规则优先:命中规则即终态,未命中才交模型(默认)
+//   judge_only = 纯模型审核:跳过全部拦截规则,每次调用都交模型判定
+export type InterceptRuleMode = "rules" | "judge_only";
+
+export interface InterceptModeState {
+  mode: InterceptRuleMode;
+  judge_available: boolean; // 纯模型审核要求裁判模型已启用
+}
+
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
-export interface JudgeConfig {
-  enabled: boolean;
+export interface JudgeConfig {  enabled: boolean;
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时

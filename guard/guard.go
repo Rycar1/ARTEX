@@ -151,28 +151,21 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	// Review 按配置的判定链给出结论:默认「规则优先,未命中才交裁判」,或
+	// 「纯模型审核」(跳过全部拦截规则,每次调用都交裁判)。
+	dec, matched := g.interceptor.Review(ctx, ev.ToolName, ev.Input)
 	if !matched {
-		// No rule matched. Ask the LLM fallback judge (if enabled). Encoded
-		// payloads that no decoder could recover are routed here too, so the
-		// judge decides them instead of always going to a human.
-		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)
-		if !judged {
-			// No judge available. Preserve fail-closed for a payload whose
-			// strong encoding signature cannot be decoded: route it to human
-			// approval rather than silently allowing it.
-			if intercept.UndecodableEncodedPayload(string(ev.Input)) {
-				dec = intercept.Decision{
-					RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
-					Action:   "ask",
-					Message:  intercept.ObfuscationUndecodableHint,
-					Source:   "builtin",
-				}
-			} else {
-				return hook.Result{}
+		// 没有任何判定层给出结论(规则未命中,且没有可用裁判)。保持 fail-closed:
+		// 强编码特征但无法还原的载荷转人工,其余放行(与历史行为一致)。
+		if intercept.UndecodableEncodedPayload(string(ev.Input)) {
+			dec = intercept.Decision{
+				RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
+				Action:   "ask",
+				Message:  intercept.ObfuscationUndecodableHint,
+				Source:   "builtin",
 			}
 		} else {
-			dec = d
+			return hook.Result{}
 		}
 	}
 	switch dec.Action {

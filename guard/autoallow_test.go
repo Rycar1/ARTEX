@@ -47,6 +47,9 @@ func TestAutoAllowKeepsDenyEnforced(t *testing.T) {
 		_ = d.DeleteInterceptRule(askRule.ID)
 		_, _ = d.Exec(`DELETE FROM intercept_pending WHERE tool_input::text LIKE '%' || $1 || '%'`, marker)
 	})
+	// 规则是直接写库的(没走 server 的 CRUD 处理器),必须手动失效 interceptor 的
+	// 规则缓存 —— 否则前面 IsToolEnabled 触发的那次加载会把这两条新规则挡在缓存外。
+	ic.Invalidate()
 
 	g := NewWithInterceptor(ic)
 	call := func(cmd string) bool {

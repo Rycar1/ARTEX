@@ -65,7 +65,9 @@ import { api } from "@/lib/api";
 import type {
   AutoAllowState,
   InterceptAction,
+  InterceptModeState,
   InterceptRule,
+  InterceptRuleMode,
   JudgeConfig,
   JudgeDayUsage,
   JudgeUsage,
@@ -199,6 +201,100 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
         {label}
       </Label>
       {children}
+    </div>
+  );
+}
+
+// ---- review-mode card (判定链:规则优先 / 纯模型审核) ----
+
+function ReviewModeCard() {
+  const [st, setSt] = React.useState<InterceptModeState | null>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    try {
+      setSt(await api.interceptGetMode());
+    } catch {
+      // 状态条非关键,失败静默
+    }
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  async function select(mode: InterceptRuleMode) {
+    setBusy(true);
+    try {
+      await api.interceptSetMode(mode);
+      await load();
+      toast.success(mode === "judge_only" ? "已切换为纯模型审核(拦截规则不参与判定)" : "已切换为规则优先 + 模型兜底");
+    } catch (e) {
+      toast.error("切换失败: " + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const mode = st?.mode ?? "rules";
+  const pure = mode === "judge_only";
+  const judgeAvailable = st?.judge_available ?? false;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        className={`flex flex-col gap-3 rounded-lg border px-4 py-3 ${
+          pure ? "border-violet-400/50 bg-violet-50/40 dark:bg-violet-950/20" : "bg-muted/40"
+        }`}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlertIcon className={`h-5 w-5 shrink-0 ${pure ? "text-violet-600" : "text-muted-foreground"}`} />
+            <div>
+              <p className="text-sm font-semibold leading-tight">审核判定链</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {pure
+                  ? "纯模型审核:跳过全部拦截规则,每一次工具调用都由裁判模型判定"
+                  : "规则优先:命中拦截规则即生效,未命中才交给裁判模型兜底"}
+              </p>
+            </div>
+          </div>
+          <Badge variant={pure ? "default" : "secondary"} className="shrink-0">
+            {pure ? "纯模型" : "规则 + 模型"}
+          </Badge>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant={pure ? "outline" : "default"}
+            disabled={busy || st === null || mode === "rules"}
+            onClick={() => select("rules")}
+          >
+            规则优先 + 模型兜底
+          </Button>
+          <Button
+            size="sm"
+            variant={pure ? "default" : "outline"}
+            disabled={busy || st === null || mode === "judge_only" || !judgeAvailable}
+            onClick={() => select("judge_only")}
+            title={judgeAvailable ? undefined : "需要先在「模型配置」启用裁判模型"}
+          >
+            纯模型审核
+          </Button>
+          {!judgeAvailable && (
+            <span className="text-xs text-amber-600 dark:text-amber-500">
+              纯模型审核需要先在「模型配置」启用裁判模型
+            </span>
+          )}
+        </div>
+
+        {pure && (
+          <p className="text-xs text-muted-foreground">
+            规则仍在库中(未删除),随时切回即可恢复;裁判不可用时按 fail-closed 转人工,不会静默放行。
+          </p>
+        )}
+      </div>
     </div>
   );
 }
@@ -917,7 +1013,8 @@ export default function InterceptPage() {
         </TabsContent>
 
         {/* ---- tab: 模型配置 ---- */}
-        <TabsContent value="judge" className="mt-4">
+        <TabsContent value="judge" className="mt-4 flex flex-col gap-4">
+          <ReviewModeCard />
           <JudgeCard />
         </TabsContent>
       </Tabs>

@@ -58,6 +58,8 @@ import type {
   IntranetTopology,
   JudgeConfig,
   JudgeUsage,
+  InterceptModeState,
+  InterceptRuleMode,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -1301,6 +1303,10 @@ export const api = {
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
   interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
+
+  // ---- intercept review mode (拦截判定链:规则优先 / 纯模型审核) ----
+  interceptGetMode: () => get<InterceptModeState>("/intercept/mode"),
+  interceptSetMode: (mode: InterceptRuleMode) => put<{ ok: boolean; mode: InterceptRuleMode }>("/intercept/mode", { mode }),
 
   // ---- guard auto-allow (一键放行,带时限的 ask 自动批准) ----
   getAutoAllow: () => get<AutoAllowState>("/guard/auto-allow"),

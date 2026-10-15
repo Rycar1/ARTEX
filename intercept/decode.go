@@ -440,6 +440,79 @@ func decodeBackslashEscapes(s string) (string, bool) {
 	return out, true
 }
 
+// jsonUnescapeView rewrites the JSON string escapes that the tool_input JSON
+// envelope puts around the command text (\n \" \\ \t \r \b \f \/ \uXXXX) into the
+// characters they denote — the "logical text" a rule author reads when looking at
+// a command.
+//
+// Rules are written against that text, but Match() feeds them the raw JSON wire
+// form, where two things silently break:
+//
+//   - a preceding \n escape ends in the word character "n", so a `\b` anchor can
+//     never fire: `\brequests\.delete\(` misses
+//     {"content":"import requests\nrequests.delete(...)"} entirely;
+//   - a following \" is a backslash, not a quote, so separator classes miss:
+//     rule 20's `[/?#"'\s]` never sees the `"` after `"$B/command/delete"`.
+//
+// Both were measured on live traffic: 6 of 16 real destructive calls had no rule
+// coverage at all against the JSON view, versus 2 of 16 against this view.
+func jsonUnescapeView(raw string) (string, bool) {
+	if !strings.Contains(raw, `\`) {
+		return "", false
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	changed := false
+	for i := 0; i < len(raw); {
+		if raw[i] != '\\' || i+1 >= len(raw) {
+			b.WriteByte(raw[i])
+			i++
+			continue
+		}
+		switch raw[i+1] {
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case 'r':
+			b.WriteByte('\r')
+		case 'b':
+			b.WriteByte('\b')
+		case 'f':
+			b.WriteByte('\f')
+		case '"', '\\', '/':
+			b.WriteByte(raw[i+1])
+		case 'u':
+			// \uXXXX: skip surrogate halves (a lone \uD800 is not a valid rune).
+			if i+5 < len(raw) {
+				if v, err := strconv.ParseUint(raw[i+2:i+6], 16, 32); err == nil && !(v >= 0xD800 && v <= 0xDFFF) {
+					b.WriteRune(rune(v))
+					i += 6
+					changed = true
+					continue
+				}
+			}
+			b.WriteByte(raw[i])
+			i++
+			continue
+		default:
+			b.WriteByte(raw[i])
+			i++
+			continue
+		}
+		i += 2
+		changed = true
+	}
+	if !changed {
+		return "", false
+	}
+	out := b.String()
+	if !utf8.ValidString(out) {
+		return "", false
+	}
+	return out, true
+}
+
 func decodeUnicodeEscapes(s string) (string, bool) {
 	if !strings.Contains(s, `\u`) {
 		return "", false

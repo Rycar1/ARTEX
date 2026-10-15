@@ -1134,6 +1134,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
+	mux.HandleFunc("GET /api/intercept/mode", s.interceptGetMode)           // 拦截判定链:规则优先 / 纯模型
+	mux.HandleFunc("PUT /api/intercept/mode", s.interceptSetMode)
 
 	// 一键放行(guard auto-allow):带时限的 ask 审批自动放行开关
 	mux.HandleFunc("GET /api/guard/auto-allow", s.guardAutoAllowGet)

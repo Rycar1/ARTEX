@@ -156,3 +156,79 @@ func TestSelectVariantsForReview(t *testing.T) {
 		}
 	}
 }
+
+// --- JSON 反转义视图:规则在「逻辑文本」上匹配,而不是 JSON 线格式 ---
+
+func TestJSONUnescapeView(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{"newline", `{"content":"a\nb"}`, "{\"content\":\"a\nb\"}", true},
+		{"escaped quote", `{"command":"echo \"x\""}`, `{"command":"echo "x""}`, true},
+		{"tab/cr/bs/f", `a\tb\rc\bd\fe`, "a\tb\rc\bd\fe", true},
+		{"unicode", `\u0072m -rf /`, "rm -rf /", true},
+		{"doubled backslash stays literal", `\\n`, `\n`, true},
+		{"nothing to do", `{"command":"ls -la"}`, "", false},
+		{"lone surrogate untouched", `\uD800`, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := jsonUnescapeView(tc.in)
+			if ok != tc.ok {
+				t.Fatalf("jsonUnescapeView(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+			}
+			if ok && got != tc.want {
+				t.Fatalf("jsonUnescapeView(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 线上实测的 4 条「真实破坏性调用」样本:它们此前对规则完全隐形,因为规则吃到的是
+// JSON 转义文本 —— \n 转义让 \b 词边界失效, \" 让分隔符类失效。
+func TestRuleMatchesThroughJSONEscapeView(t *testing.T) {
+	r15 := compiledRule{ // [内置] Python HTTP 客户端 DELETE
+		InterceptRule: db.InterceptRule{MatchTarget: "tool_input", MatchType: "regex"},
+		re:            regexp.MustCompile(`(?:\b(?:requests|httpx|aiohttp|urllib\.request)\.delete\s*\(|session\.delete\s*\(|client\.delete\s*\()`),
+	}
+	r20 := compiledRule{ // [内置] 删除类接口路径
+		InterceptRule: db.InterceptRule{MatchTarget: "tool_input", MatchType: "regex"},
+		re:            regexp.MustCompile(`(?i)/(?:(?:delete|remove|unlink|erase|destroy)[-\w]*|del)(?:[/?#"'\s]|$)`),
+	}
+	cases := []struct {
+		name string
+		rule compiledRule
+		raw  string
+	}{
+		{"write 脚本里的 requests.delete", r15,
+			`{"content":"import requests\nrequests.delete('https://api.target.com/api/users/10231')"}`},
+		{"heredoc 里的 requests.delete", r15,
+			`{"command":"python3 - <<'EOF'\nimport requests\nrequests.delete(\"https://api.target.com/api/v1/projects/7788\")\nEOF"}`},
+		{"引号结尾的删除接口路径", r20,
+			`{"command":"B=\"https://cpcmd.tencent.com/api\"; curl -sk -X POST -d '{}' \"$B/command/delete\""}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if ruleMatchesSubject(tc.rule, "Bash", tc.raw) {
+				t.Fatal("precondition: 原始 JSON 视图本不该命中(这正是被修的 bug)")
+			}
+			subjects, kindOf := matchSubjects(tc.raw)
+			hit := false
+			for _, s := range subjects {
+				if ruleMatchesSubject(tc.rule, "Bash", s) {
+					hit = true
+					if s != tc.raw && kindOf[s] != "json_unescape" && kindOf[s] == "" {
+						t.Fatalf("命中视图缺少来源标注: %q", s)
+					}
+					break
+				}
+			}
+			if !hit {
+				t.Fatalf("反转义视图必须让规则命中: %s", tc.raw)
+			}
+		})
+	}
+}
