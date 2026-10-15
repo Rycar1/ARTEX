@@ -1562,7 +1562,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			"is_public_interface":        boolean("该接口是否本就面向公众公开(是则访问它不构成漏洞)"),
 			"info_leak_hits_strict_list": boolean("若属信息泄露类:泄露数据是否命中本 SRC 的敏感数据口径"),
 		}, "is_reflected_xss", "needs_admin_login", "needs_mitm", "is_pure_info_leak", "scanner_only_no_poc", "is_public_interface", "info_leak_hits_strict_list"),
-	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+	}, "vulnclass", "severity", "summary", "self_check"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
 			IntentID                                     json.RawMessage   `json:"intent_id"`
