@@ -725,6 +725,10 @@ export const api = {
     }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),
+  // 人工发起「扩大危害」:在已确认据点上纵向升级(与审核自动派单同一套回路,
+  // 每个漏洞最多一轮)。notes 可选,用于指定优先尝试的升级方向。
+  escalateFinding: (id: string, notes: string) =>
+    post<FindingDeepenResponse>(`/exploration/findings/${id}/escalate`, { notes }),
   intents: (task?: string) => get<TaskNode[]>(`/exploration/intents${tq(task)}`).then(arr),
   tokenStats: (task?: string) =>
     get<{ workers: TokenUsage[]; sessions: SessionTokenUsage[]; total: TokenTotal }>(

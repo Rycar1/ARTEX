@@ -155,6 +155,9 @@ export default function FindingsPage() {
   const [page, setPage] = React.useState(1);
   const [pageSize, setPageSize] = React.useState(10);
   const [deepenFinding, setDeepenFinding] = React.useState<Finding | null>(null);
+  const [escalateFinding, setEscalateFinding] = React.useState<Finding | null>(null);
+  const [escalateNotes, setEscalateNotes] = React.useState("");
+  const [escalating, setEscalating] = React.useState(false);
   const [retestFinding, setRetestFinding] = React.useState<Finding | null>(null);
   const [activeRetests, setActiveRetests] = React.useState<Record<string, ActiveFindingRetest>>({});
   const activeRetestFingerprint = Object.values(activeRetests)
@@ -796,6 +799,31 @@ export default function FindingsPage() {
     setDeepenDescription("");
   }, []);
 
+  const openEscalate = React.useCallback((f: Finding) => {
+    setEscalateFinding(f);
+    setEscalateNotes("");
+  }, []);
+
+  async function submitEscalate() {
+    if (!escalateFinding?.finding_id || escalating) return;
+    setEscalating(true);
+    try {
+      const result = await api.escalateFinding(escalateFinding.finding_id, escalateNotes.trim());
+      toast.success(
+        result.queued
+          ? `「扩大危害」意图 #${result.intent_id} 已进入任务队列`
+          : `已派「扩大危害」意图 #${result.intent_id}，worker 将按 A–I 手册纵向升级`,
+      );
+      refreshAfterMutation(escalateFinding);
+      setEscalateFinding(null);
+      setEscalateNotes("");
+    } catch (error) {
+      toast.error(`发起失败：${(error as Error).message}`);
+    } finally {
+      setEscalating(false);
+    }
+  }
+
   async function submitDeepen() {
     if (!deepenFinding?.finding_id || !deepenDescription.trim() || deepening) return;
     setDeepening(true);
@@ -848,6 +876,7 @@ export default function FindingsPage() {
     onRetest: setRetestFinding,
     activeRetests,
     onDeepen: openDeepen,
+    onEscalate: openEscalate,
     onDelete: deleteFinding,
     onDismissDuplicate: dismissDuplicate,
   };
@@ -1267,6 +1296,59 @@ export default function FindingsPage() {
             <Button onClick={submitDeepen} disabled={deepening || !deepenDescription.trim()}>
               {deepening && <Spinner data-icon="inline-start" />}
               创建深入意图
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 人工发起「扩大危害」:在已确认据点上纵向升级(与审核自动派单同一套回路)。 */}
+      <Dialog
+        open={escalateFinding !== null}
+        onOpenChange={(open) => {
+          if (open || escalating) return;
+          setEscalateFinding(null);
+          setEscalateNotes("");
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>扩大危害</DialogTitle>
+            <DialogDescription>
+              将按 A–I 升级手册在已确认据点上继续利用,把危害等级与影响面顶上去:
+              {escalateFinding?.name || escalateFinding?.vulnclass || escalateFinding?.summary}
+            </DialogDescription>
+          </DialogHeader>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="finding-escalate-notes">升级方向(可选)</FieldLabel>
+              <Textarea
+                id="finding-escalate-notes"
+                value={escalateNotes}
+                onChange={(event) => setEscalateNotes(event.target.value)}
+                maxLength={4000}
+                placeholder="留空则由 worker 按手册自行选择;也可指定优先尝试的路径,例如「把读接口换成写接口试越权改」"
+                disabled={escalating}
+              />
+              <FieldDescription className="flex justify-between gap-3">
+                <span>升级结果会写回原漏洞(不新建),并重新送交审核复核;每个漏洞最多一轮。</span>
+                <span className="shrink-0 tabular-nums">{escalateNotes.length} / 4000</span>
+              </FieldDescription>
+            </Field>
+          </FieldGroup>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setEscalateFinding(null);
+                setEscalateNotes("");
+              }}
+              disabled={escalating}
+            >
+              取消
+            </Button>
+            <Button onClick={submitEscalate} disabled={escalating}>
+              {escalating && <Spinner data-icon="inline-start" />}
+              派发扩大危害
             </Button>
           </DialogFooter>
         </DialogContent>

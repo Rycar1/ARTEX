@@ -85,6 +85,17 @@ func (d *DB) RevertFindingSeverity(id int64) error {
 	return err
 }
 
+// ClearFindingEscalation 撤销升级占位(人工发起升级但派单失败时用,让用户能重试)。
+// 与 ApplyEscalationFailure 的区别:后者是「升级跑过但没成立」的终态,本函数是
+// 「升级根本没跑起来」的回滚 —— 必须把 escalated_at 清掉,否则「每个漏洞一轮」的
+// 原子占位会把这个漏洞永久锁死。
+func (d *DB) ClearFindingEscalation(id int64) error {
+	_, err := d.Exec(`UPDATE findings
+		SET escalated_at = NULL, escalate_status = '', base_severity = ''
+		WHERE id = $1`, id)
+	return err
+}
+
 // FindingEscalationState 是一次升级的当前状态(供 API/UI 展示)。
 type FindingEscalationState struct {
 	EscalatedAt    *string `json:"escalated_at,omitempty"`

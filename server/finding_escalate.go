@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -262,4 +265,127 @@ func severityRank(sev string) int {
 		return 1
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// 人工发起「扩大危害」(POST /api/exploration/findings/{id}/escalate)
+//
+// 与自动升级的分工:
+//   - 自动:审核采纳 low/medium 后按 severity + 预算 + 原子占位自动派单;
+//   - 人工:不受 severity / 预算 / 审核状态限制(人判断该挖),但**仍遵守
+//     「每个漏洞最多一轮」** —— 已升级过的返回 409,想继续深入请用「深入利用」。
+//
+// 派单失败会把升级占位一起回滚,否则该漏洞会被永久锁死再也升不了。
+// ---------------------------------------------------------------------------
+
+func (s *Server) escalateFindingManual(w http.ResponseWriter, r *http.Request) {
+	id := int64(atoiDefault(r.PathValue("id"), 0))
+	if id <= 0 {
+		writeErr(w, 400, "bad finding id")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
+	var req struct {
+		Notes string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "请求正文过大")
+		} else {
+			writeErr(w, 400, "bad json: "+err.Error())
+		}
+		return
+	}
+	notes := strings.TrimSpace(req.Notes)
+	if utf8.RuneCountInString(notes) > maxFindingFollowUpRunes {
+		writeErr(w, 400, fmt.Sprintf("补充说明最多 %d 个字符", maxFindingFollowUpRunes))
+		return
+	}
+
+	finding, err := s.m.pg.GetFinding(id)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if finding == nil {
+		writeErr(w, 404, "finding not found")
+		return
+	}
+	if finding.TaskID == nil || finding.NodeID == nil {
+		writeErr(w, 409, "finding origin task or node is no longer available")
+		return
+	}
+	t, ok := s.m.Task(i64s(*finding.TaskID))
+	if !ok || t == nil {
+		writeErr(w, 409, "finding origin task is no longer available")
+		return
+	}
+	// 已经升级过一轮的拒绝再派(与自动路径同一套「每个漏洞一轮」规则)。
+	if finding.EscalatedAt != nil {
+		writeErr(w, 409, "该漏洞已发起过「扩大危害」(每个漏洞最多一轮);如需继续深入请用「深入利用」")
+		return
+	}
+	if !s.engine.beginTaskOperation(t.ID) {
+		writeErr(w, 409, "task is being deleted")
+		return
+	}
+	defer s.engine.decInflight(t.ID)
+
+	sev := effectiveSeverity(finding, nil)
+	// 原子占位:抢不到说明并发已派过。
+	claimed, err := s.m.pg.MarkFindingEscalated(finding.ID, sev)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if !claimed {
+		writeErr(w, 409, "该漏洞已发起过「扩大危害」")
+		return
+	}
+
+	desc := buildEscalationIntent(finding, sev)
+	if notes != "" {
+		desc += "\n\n# 人工补充的升级方向(优先考虑)\n" + notes
+	}
+	audit := db.Activity{
+		Worker:  "human",
+		Kind:    "text",
+		Summary: fmt.Sprintf("人工发起「扩大危害」(漏洞 #%d)", finding.ID),
+		Detail:  notes,
+	}
+	intentID, audit, err := t.Store.AddFindingFollowUpIntentEx(finding.ID, *finding.NodeID, desc,
+		map[string]any{"escalate": true}, audit)
+	if err != nil {
+		if rbErr := s.m.pg.ClearFindingEscalation(finding.ID); rbErr != nil {
+			err = errors.Join(err, fmt.Errorf("回滚升级占位: %w", rbErr))
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	queued, err := s.admitTask(t, "resume")
+	if err != nil {
+		// 派单没跑起来:丢弃意图 + 回滚占位,让用户能重试。
+		if rbErr := t.Store.DiscardOpenIntent(intentID); rbErr != nil {
+			err = errors.Join(err, fmt.Errorf("discard escalation intent %d: %w", intentID, rbErr))
+		}
+		if rbErr := s.m.pg.ClearFindingEscalation(finding.ID); rbErr != nil {
+			err = errors.Join(err, fmt.Errorf("回滚升级占位: %w", rbErr))
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	s.engine.Broadcaster().Publish(t.ID, audit)
+	s.engine.touch(t.ID)
+	state := "open"
+	if cur, stateErr := t.Store.GetNode(intentID); stateErr == nil && cur != nil {
+		state = cur.State
+	}
+	writeJSON(w, 200, map[string]any{
+		"task_id":   t.ID,
+		"intent_id": i64s(intentID),
+		"state":     state,
+		"queued":    queued,
+		"severity":  sev,
+	})
 }

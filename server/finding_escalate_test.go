@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -451,5 +454,96 @@ func TestNeverEscalatedFindingRejectsWrite(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "不在升级流程中") {
 		t.Fatalf("未派升级的漏洞应拒绝改写, got %v", err)
+	}
+}
+
+// ---- 人工发起「扩大危害」(POST /findings/{id}/escalate) ----
+
+func escalateCall(t *testing.T, s *Server, id int64, body string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/exploration/findings/x/escalate", strings.NewReader(body))
+	req.SetPathValue("id", strconv.FormatInt(id, 10))
+	w := httptest.NewRecorder()
+	s.escalateFindingManual(w, req)
+	var out map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	return w, out
+}
+
+// 人工发起:不受 severity/审核状态限制,但同样派一条 escalate=true 的意图并占位。
+func TestManualEscalateDispatchesIntent(t *testing.T) {
+	s, f := escalateFixture(t)
+	// 刻意不审核、不设 low/medium —— 人工路径不看这些。
+	w, out := escalateCall(t, s, f.ID, `{"notes":"优先试把读接口换成写接口"}`)
+	if w.Code != 200 {
+		t.Fatalf("人工升级应成功, got %d %s", w.Code, w.Body.String())
+	}
+	if out["intent_id"] == nil || out["intent_id"] == "" {
+		t.Fatalf("应返回 intent_id, got %+v", out)
+	}
+	got, err := s.m.pg.GetFinding(f.ID)
+	if err != nil || got == nil {
+		t.Fatal(err)
+	}
+	if got.EscalatedAt == nil || got.EscalateStatus != db.EscalateDispatched {
+		t.Fatalf("应已占位, got status=%q escalated_at=%v", got.EscalateStatus, got.EscalatedAt)
+	}
+	if got.BaseSeverity != "low" {
+		t.Fatalf("base_severity 应为当前级别 low, got %q", got.BaseSeverity)
+	}
+	// 意图必须带 escalate=true + 手册 + 人工补充方向。
+	var payload string
+	if err := s.m.pg.QueryRow(`SELECT payload::text FROM exploration_nodes
+		WHERE exploration_id=(SELECT exploration_id FROM tasks WHERE id=$1)
+		  AND kind='intent' AND payload->>'escalate'='true' LIMIT 1`, *f.TaskID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"扩大危害", "report_escalation", "人工补充的升级方向", "读接口换成写接口"} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("人工升级意图缺少 %q", want)
+		}
+	}
+}
+
+// 人工发起也遵守「每个漏洞最多一轮」。
+func TestManualEscalateIsOnceOnly(t *testing.T) {
+	s, f := escalateFixture(t)
+	if w, _ := escalateCall(t, s, f.ID, `{}`); w.Code != 200 {
+		t.Fatalf("首次应成功, got %d %s", w.Code, w.Body.String())
+	}
+	w, _ := escalateCall(t, s, f.ID, `{}`)
+	if w.Code != 409 {
+		t.Fatalf("重复发起应 409, got %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "最多一轮") {
+		t.Fatalf("错误信息应说明最多一轮: %s", w.Body.String())
+	}
+}
+
+// 边界:漏洞不存在 / 无节点 / id 非法。
+func TestManualEscalateGuards(t *testing.T) {
+	s, f := escalateFixture(t)
+	if w, _ := escalateCall(t, s, 99999999, `{}`); w.Code != 404 {
+		t.Fatalf("不存在的漏洞应 404, got %d", w.Code)
+	}
+	if w, _ := escalateCall(t, s, 0, `{}`); w.Code != 400 {
+		t.Fatalf("非法 id 应 400, got %d", w.Code)
+	}
+	// 去掉 node_id -> 意图无处锚定,应 409。
+	if _, err := s.m.pg.Exec(`UPDATE findings SET node_id=NULL WHERE id=$1`, f.ID); err != nil {
+		t.Fatal(err)
+	}
+	if w, _ := escalateCall(t, s, f.ID, `{}`); w.Code != 409 {
+		t.Fatalf("无节点应 409, got %d %s", w.Code, w.Body.String())
+	}
+	// 超长补充说明应 400。
+	other, err := s.evidenceStore().Record(context.Background(), db.RecordFindingInput{
+		TaskID: *f.TaskID, ExplorationID: 0, Worker: "test", VulnClass: "x", Name: "y", Severity: "low",
+	}, nil)
+	if err == nil && other != nil {
+		long := strings.Repeat("a", 4001)
+		if w, _ := escalateCall(t, s, other.FindingID, `{"notes":"`+long+`"}`); w.Code != 400 {
+			t.Fatalf("超长 notes 应 400, got %d", w.Code)
+		}
 	}
 }

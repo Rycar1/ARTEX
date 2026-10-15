@@ -12,6 +12,7 @@ import {
   RotateCcwIcon,
   ShieldAlertIcon,
   Trash2Icon,
+  TrendingUpIcon,
 } from "lucide-react";
 
 import { CopyButton } from "@/components/copy-button";
@@ -105,6 +106,8 @@ interface FindingsTableProps {
   onRetest: (finding: Finding) => void;
   activeRetests: Record<string, ActiveFindingRetest>;
   onDeepen: (finding: Finding) => void;
+  // onEscalate 人工发起「扩大危害」:在已确认据点上纵向升级(每个漏洞最多一轮)。
+  onEscalate: (finding: Finding) => void;
   onDelete: (finding: Finding) => void;
   // onDismissDuplicate 人工判定「不是重复」,清掉疑似重复标记(第四层去重)。
   onDismissDuplicate?: (finding: Finding) => void;
@@ -130,6 +133,7 @@ export function FindingsTable({
   onRetest,
   activeRetests,
   onDeepen,
+  onEscalate,
   onDelete,
   onDismissDuplicate,
   selectAllLabel = "选择当前页全部",
@@ -331,6 +335,24 @@ export function FindingsTable({
                       <Button size="sm" variant="ghost" onClick={() => onDeepen(f)}>
                         <FlaskConicalIcon data-icon="inline-start" />
                         深入
+                      </Button>
+                    )}
+                    {/* 扩大危害:在已确认据点上纵向升级(每个漏洞最多一轮)。
+                        已升级过的禁用并提示,避免误点后吃 409。 */}
+                    {f.finding_id && f.task_id && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={Boolean(f.escalated_at)}
+                        title={
+                          f.escalated_at
+                            ? "该漏洞已发起过「扩大危害」(每个漏洞最多一轮)"
+                            : "在已确认据点上继续利用,把危害等级顶上去"
+                        }
+                        onClick={() => onEscalate(f)}
+                      >
+                        <TrendingUpIcon data-icon="inline-start" />
+                        {f.escalated_at ? "已升级" : "扩大危害"}
                       </Button>
                     )}
                     {f.finding_id && (

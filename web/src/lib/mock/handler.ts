@@ -2012,6 +2012,27 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       queued: false,
     };
   }
+  // 人工发起「扩大危害」(demo 内存态):与审核自动派单同一套回路,每漏洞最多一轮。
+  if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "escalate" && m === "POST") {
+    const finding = mockFindings.find((candidate) => candidate.id === seg[2]);
+    if (!finding) throw new Error("finding not found");
+    if (!finding.task_id || !mockTasks.some((candidate) => candidate.id === finding.task_id)) {
+      throw new Error("finding origin task or node is no longer available");
+    }
+    if (finding.escalated_at) throw new Error("该漏洞已发起过「扩大危害」(每个漏洞最多一轮)");
+    const notes = String(b.notes ?? "").trim();
+    if ([...notes].length > 4000) throw new Error("notes must be at most 4000 characters");
+    finding.escalated_at = new Date().toISOString();
+    finding.escalate_status = "dispatched";
+    finding.base_severity = finding.review_severity || finding.severity;
+    return {
+      task_id: finding.task_id,
+      intent_id: `mock-escalate-${Date.now()}`,
+      state: "open",
+      queued: false,
+      severity: finding.base_severity,
+    };
+  }
   // 关联流量证据:列表 / 绑定 / 编辑 / 解绑 / 排序 / 单条报文详情(demo 内存态)。
   // seg = ["exploration","findings",<id>,"traffic", ...]
   if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "traffic") {

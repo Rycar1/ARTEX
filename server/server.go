@@ -961,6 +961,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
+	// 人工发起「扩大危害」:在已确认据点上纵向升级(与审核自动派单同一套回路)。
+	mux.HandleFunc("POST /api/exploration/findings/{id}/escalate", s.escalateFindingManual)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/review", s.reviewFinding)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/dismiss-duplicate", s.dismissDuplicate)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
@@ -1699,7 +1701,7 @@ type createTaskReq struct {
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	ReviewEnabled        *bool    `json:"review_enabled,omitempty"`    // 二次审核开关;省略/null=默认关(false)。开启后本任务新登记的漏洞自动进入 AI 二次审核,不合格的自动置为 ignored 并注明原因(见 finding_review.go)。
-	OpMode               string   `json:"op_mode,omitempty"`          // 作战模式:standard(默认)/ aggressive(激进)。aggressive=放宽一切技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),保留资产范围边界与破坏性操作底线。
+	OpMode               string   `json:"op_mode,omitempty"`           // 作战模式:standard(默认)/ aggressive(激进)。aggressive=放宽一切技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),保留资产范围边界与破坏性操作底线。
 	ReviewSrcType        string   `json:"review_src_type,omitempty"`   // 审核标准:edusrc(默认,EduSRC 严格收录)/ enterprise(企业 SRC 高价值影响)。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
