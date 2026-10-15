@@ -259,6 +259,11 @@ func (d *DB) AddNotificationEvent(ctx context.Context, kind string, findingID in
 	return id, err
 }
 
+// reviewHoldTimeout 是「开了二次审核的漏洞」在推送队列里最多等多久。
+// 审核正常在几秒内出结论;这里给足余量,同时保证审核器挂了也不会让推送永久卡住
+// (超时后按未审处理照常推送 —— 宁可多推一条,不可静默丢一条高危)。
+const reviewHoldTimeout = "30 minutes"
+
 // FanOutPendingEvents 把尚未分派的漏洞事件按当前启用的渠道展开成投递任务，
 // 返回本轮处理的事件数与新建的投递数。
 //
@@ -286,18 +291,44 @@ func (d *DB) FanOutPendingEvents(ctx context.Context, limit int) (eventCount, de
 	if err != nil {
 		return 0, 0, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, kind, finding_id, snapshot FROM notification_events
-WHERE NOT fanned_out ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+	// 二次审核闸门:任务开了 review_enabled 时,「发现新漏洞」的推送必须等审核出结论
+	// —— 否则垃圾洞(信息泄露/版本号/CORS 误配等)会先刷屏、几秒后才被标 ignored。
+	// 线上实测:651 条 finding_created 里 586 条(90%)是 low/medium 信息泄露噪音,
+	// 全是先推后忽略。这里在分派口把它们拦下,不改写入路径的原子性。
+	//
+	// 三条放行条件,缺一不可地覆盖「不该等」的情形:
+	//   - 非 finding_created(状态变更等)不受影响;
+	//   - 任务没开二次审核 → 照旧立即推;
+	//   - 已有审核结论 → 按结论决定(ignored 在下面被丢弃);
+	//   - 超时兜底:审核挂了也不能让推送永久卡住(宁可多推一条,不可静默丢失)。
+	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.kind, e.finding_id, e.snapshot,
+       COALESCE(f.review_verdict,''), COALESCE(t.review_enabled,false)
+FROM notification_events e
+LEFT JOIN findings f ON f.id = e.finding_id
+LEFT JOIN tasks t ON t.id = f.task_id
+WHERE NOT e.fanned_out
+  AND (
+    e.kind <> 'finding_created'
+    OR NOT COALESCE(t.review_enabled, false)
+    OR COALESCE(f.review_verdict,'') <> ''
+    OR e.created_at < now() - $2::interval
+  )
+ORDER BY e.id
+FOR UPDATE OF e SKIP LOCKED
+LIMIT $1`, limit, reviewHoldTimeout)
 	if err != nil {
 		return 0, 0, err
 	}
 	var (
 		events      []NotificationEvent
 		parsedSnaps []notify.Snapshot
+		suppressed  []bool // 审核判为 ignored:事件照常标记已分派,但不产生任何投递
 	)
 	for rows.Next() {
 		var ev NotificationEvent
-		if err := rows.Scan(&ev.ID, &ev.Kind, &ev.FindingID, &ev.Snapshot); err != nil {
+		var verdict string
+		var reviewOn bool
+		if err := rows.Scan(&ev.ID, &ev.Kind, &ev.FindingID, &ev.Snapshot, &verdict, &reviewOn); err != nil {
 			rows.Close()
 			return 0, 0, err
 		}
@@ -310,6 +341,9 @@ WHERE NOT fanned_out ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
 		snap.Kind = ev.Kind
 		events = append(events, ev)
 		parsedSnaps = append(parsedSnaps, snap)
+		// 只有「开了二次审核 + 结论明确为 ignored」才丢弃。判空/未审不在此列:
+		// 未审的 finding_created 根本不会被上面的查询选中(等结论)。
+		suppressed = append(suppressed, reviewOn && verdict == ReviewVerdictIgnored)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -325,6 +359,9 @@ WHERE NOT fanned_out ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
 	}
 	var toInsert []pending
 	for i, snap := range parsedSnaps {
+		if suppressed[i] {
+			continue // 审核已判不收录 → 不推送
+		}
 		for _, ch := range channels {
 			if !notify.Match(notify.ParseFilter(ch.Filter), snap) {
 				continue

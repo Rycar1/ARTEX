@@ -265,6 +265,58 @@ var reviewJunkRules = []struct {
 	{[]string{"公开接口", "本就公开", "公开展示"}, "本就公开/公开展示的数据或接口,不属于漏洞"},
 }
 
+// infoLeakShapeMarkers 判断一条 finding 的「类型 + 名称」是否属于纯信息暴露形态。
+// 必须与下面的具体标记**同时**命中才判 ignored —— 单靠 "trpc" / "source map" 这类
+// 词会把「tRPC 反序列化 RCE」「source map 里翻出后台密钥」这种真漏洞一起误杀。
+var infoLeakShapeMarkers = []string{
+	"信息泄露", "信息泄漏", "info_leak", "info leak", "information disclosure",
+	"泄露", "泄漏", "暴露", "disclosure",
+	// 「响应体回显内部 X」这类没有「泄露」字样的写法也属于纯暴露形态(生产实测出现)。
+	"回显内部", "回显内网", "回显节点",
+}
+
+// infoLeakJunkRules 是「纯信息暴露」类的高置信忽略清单(生产实测补齐)。
+//
+// 来源:腾讯任务 651 条推送里 586 条(90%)是 low/medium 的这类噪音,而规则层原先
+// 只认「内网ip/私网ip/内网地址」三种写法,对实际出现过的类别覆盖率仅 2/18。
+// 共同点:只证明「某个内部信息被看见」,没有任何越权、控制或数据获取。
+//
+// 判定要求「形态词 + 具体标记」同时命中,理由见 infoLeakShapeMarkers 注释。
+var infoLeakJunkRules = []struct {
+	keys   []string
+	reason string
+}{
+	{[]string{"响应头泄露", "响应体回显", "响应头内网", "节点 ip", "节点ip", "回显内网", "回显内部", "内网/节点"},
+		"响应头/响应体泄露内网 IP 或节点信息:仅证明存在信息暴露,无越权或数据获取影响,不予收录"},
+	{[]string{"eol 组件", "组件精确版本", "精确版本泄露", "网关精确版本", "组件版本泄露", "版本指纹"},
+		"EOL/组件精确版本指纹泄露:无利用证明的版本信息,不予收录"},
+	{[]string{"trpc", "服务名泄露", "内部服务名", "内部应用上下文", "x-application-context"},
+		"内部服务名/应用上下文泄露:仅内部命名信息暴露,无实际影响,不予收录"},
+	{[]string{"内部域名泄露", "内部路径泄露", "泄露内部路径", "内部开发者标识", "开发者标识"},
+		"内部域名/路径/开发者标识泄露:无实际影响,不予收录"},
+	{[]string{"source map", "sourcemap", ".js.map", "source-map"},
+		"source map 公开可读:未证明可借此获取密钥或越权,按信息暴露不予收录"},
+}
+
+// infoLeakReviewFinding 对「纯信息暴露」类做规则层判定:形态词与具体标记同时命中
+// 才 ignored。只做 ignored、不做 accepted —— 通过必须过模型,免得规则误放。
+func infoLeakReviewFinding(f *db.DBFinding) *db.FindingReview {
+	head := strings.ToLower(f.VulnClass + " " + f.Name)
+	if !containsAny(head, infoLeakShapeMarkers) {
+		return nil
+	}
+	for _, rule := range infoLeakJunkRules {
+		if containsAny(head, rule.keys) {
+			return &db.FindingReview{
+				Verdict:  db.ReviewVerdictIgnored,
+				Severity: "low",
+				Reasons:  rule.reason + "(规则层自动判定)",
+			}
+		}
+	}
+	return nil
+}
+
 // ruleReviewFinding 是零成本规则层:命中高置信垃圾洞清单返回 ignored,否则 nil 交给
 // LLM。规则只做 ignored,不做 accepted —— 通过必须过模型,免得规则误放。
 func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
@@ -284,6 +336,11 @@ func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
 	// 明确写了已经跨域读到受保护的敏感数据(真实利用),否则规则层直接 ignored,不再交给
 	// 不稳定的 LLM 判(实测同一类 CORS 会被 LLM 一会儿 accepted、一会儿 ignored)。
 	if r := corsReviewFinding(f); r != nil {
+		return r
+	}
+	// 纯信息暴露类(响应头泄露内网 IP / EOL 版本 / 内部服务名 / source map 等):
+	// 生产实测占推送量的 90%,规则层直接判掉,既省 LLM 成本也避免它们刷屏。
+	if r := infoLeakReviewFinding(f); r != nil {
 		return r
 	}
 	return nil
