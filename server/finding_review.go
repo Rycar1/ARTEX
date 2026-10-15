@@ -315,13 +315,17 @@ var reviewJunkRules = []struct {
 		unless: []string{"密码", "凭据", "密钥", "secret", "db_password", "database_password", "access_key", "连库", "登录成功"}},
 	// 目录列表本身只是「开了 autoindex」;但索引里若真能取到备份/源码/配置/数据,
 	// 那就是敏感文件泄露(高价值),必须放给 LLM。
+	//
+	// unless 只列**具体制品名**:早期版本还放了「可读/读到/取得/下载/config/source」
+	// 这类泛词,而「目录可读」正是该类 finding 自己的陈述用词 —— 结果大量裸目录列表
+	// 穿透规则层,规则层对这一类退化成空转。判据要盯「有没有真的取到东西」,不是
+	// 「有没有出现动词」。
 	{keys: []string{"目录列表", "directory listing", "目录遍历", "autoindex"},
 		reason: "目录列表,不含敏感数据",
 		unless: []string{
 			"备份", "backup", ".bak", ".sql", ".zip", ".tar", ".gz", "dump", "数据库",
-			"源码", "source", ".git", "svn", "配置", "config", ".env", "web.config", "database.yml",
+			"源码", ".git", ".env", "web.config", "database.yml",
 			"密码", "password", "凭据", "credential", "密钥", "secret", "身份证", "id_card",
-			"下载", "可下载", "可读", "读到", "取得",
 		}},
 	{keys: []string{"内网ip", "私网ip", "内网地址"}, reason: "内网 IP 泄露,无实际影响",
 		unless: []string{"ssrf", "未授权访问", "redis", "mysql", "连上", "可达", "打通", "登录成功", "rce", "命令执行"}},
@@ -346,35 +350,19 @@ var reviewJunkRules = []struct {
 // infoLeakShapeMarkers 判断一条 finding 的「类型 + 名称」是否属于纯信息暴露形态。
 // 必须与下面的具体标记**同时**命中才判 ignored —— 单靠 "trpc" / "source map" 这类
 // 词会把「tRPC 反序列化 RCE」「source map 里翻出后台密钥」这种真漏洞一起误杀。
-var infoLeakShapeMarkers = []string{
-	"信息泄露", "信息泄漏", "info_leak", "info leak", "information disclosure",
-	"泄露", "泄漏", "暴露", "disclosure",
-	// 「响应体回显内部 X」这类没有「泄露」字样的写法也属于纯暴露形态(生产实测出现)。
-	"回显内部", "回显内网", "回显节点",
-}
+//
+// 与挖掘期闸门共用 agent.InfoLeakShapeMarkers(单一事实源):两边各写一份必然漂移,
+// 而漂移会让「闸门放行的洞被审核规则层枪毙」或反之 —— 这正是本次要消灭的问题。
+var infoLeakShapeMarkers = agent.InfoLeakShapeMarkers
 
-// infoLeakJunkRules 是「纯信息暴露」类的高置信忽略清单(生产实测补齐)。
+// infoLeakJunkRules 直接复用挖掘期闸门的那份清单(agent.InfoLeakJunkRules)。
 //
 // 来源:腾讯任务 651 条推送里 586 条(90%)是 low/medium 的这类噪音,而规则层原先
 // 只认「内网ip/私网ip/内网地址」三种写法,对实际出现过的类别覆盖率仅 2/18。
 // 共同点:只证明「某个内部信息被看见」,没有任何越权、控制或数据获取。
 //
 // 判定要求「形态词 + 具体标记」同时命中,理由见 infoLeakShapeMarkers 注释。
-var infoLeakJunkRules = []struct {
-	keys   []string
-	reason string
-}{
-	{[]string{"响应头泄露", "响应体回显", "响应头内网", "节点 ip", "节点ip", "回显内网", "回显内部", "内网/节点"},
-		"响应头/响应体泄露内网 IP 或节点信息:仅证明存在信息暴露,无越权或数据获取影响,不予收录"},
-	{[]string{"eol 组件", "组件精确版本", "精确版本泄露", "网关精确版本", "组件版本泄露", "版本指纹"},
-		"EOL/组件精确版本指纹泄露:无利用证明的版本信息,不予收录"},
-	{[]string{"trpc", "服务名泄露", "内部服务名", "内部应用上下文", "x-application-context"},
-		"内部服务名/应用上下文泄露:仅内部命名信息暴露,无实际影响,不予收录"},
-	{[]string{"内部域名泄露", "内部路径泄露", "泄露内部路径", "内部开发者标识", "开发者标识"},
-		"内部域名/路径/开发者标识泄露:无实际影响,不予收录"},
-	{[]string{"source map", "sourcemap", ".js.map", "source-map"},
-		"source map 公开可读:未证明可借此获取密钥或越权,按信息暴露不予收录"},
-}
+var infoLeakJunkRules = agent.InfoLeakJunkRules
 
 // infoLeakReviewFinding 对「纯信息暴露」类做规则层判定:形态词与具体标记同时命中
 // 才 ignored。只做 ignored、不做 accepted —— 通过必须过模型,免得规则误放。
@@ -393,11 +381,11 @@ func infoLeakReviewFinding(f *db.DBFinding) *db.FindingReview {
 		return nil
 	}
 	for _, rule := range infoLeakJunkRules {
-		if containsAny(head, rule.keys) {
+		if containsAny(head, rule.Keys) {
 			return &db.FindingReview{
 				Verdict:  db.ReviewVerdictIgnored,
 				Severity: "low",
-				Reasons:  rule.reason + "(规则层自动判定)",
+				Reasons:  rule.Reason + "(规则层自动判定)",
 			}
 		}
 	}

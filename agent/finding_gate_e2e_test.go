@@ -26,7 +26,6 @@ func TestReportFindingGateEndToEnd(t *testing.T) {
 	}
 	tools := NewToolSet(es, "work#1")
 	tools.SetTaskID(task.ID)
-	tools.SetFindingSrcType("edusrc")
 
 	findingTool := findToolByName(t, tools.WorkerTools(), "report_finding")
 	countFindings := func() int {

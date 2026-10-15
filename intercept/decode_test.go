@@ -216,18 +216,17 @@ func TestRuleMatchesThroughJSONEscapeView(t *testing.T) {
 				t.Fatal("precondition: 原始 JSON 视图本不该命中(这正是被修的 bug)")
 			}
 			subjects, kindOf := matchSubjects(tc.raw)
-			hit := false
+			hitKind := ""
 			for _, s := range subjects {
 				if ruleMatchesSubject(tc.rule, "Bash", s) {
-					hit = true
-					if s != tc.raw && kindOf[s] != "json_unescape" && kindOf[s] == "" {
-						t.Fatalf("命中视图缺少来源标注: %q", s)
-					}
+					hitKind = kindOf[s]
 					break
 				}
 			}
-			if !hit {
-				t.Fatalf("反转义视图必须让规则命中: %s", tc.raw)
+			// 必须命中**反转义视图**本身:只断言「命中了某个视图」的话,任何解码变体
+			// 也能让用例通过,就验不到本次修的东西了。
+			if hitKind != "json_unescape" {
+				t.Fatalf("命中来源必须是 json_unescape(反转义视图),实际=%q", hitKind)
 			}
 		})
 	}

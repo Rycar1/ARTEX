@@ -207,3 +207,43 @@ func TestParseReviewJSONDeepen(t *testing.T) {
 		t.Fatalf("deepen_directive 未解析出来: %q", rev.DeepenDirective)
 	}
 }
+
+// 回归:looksLikeRCEText 曾用裸 strings.Contains,短标记 "rce" 命中 "source"/"force",
+// 把一条 source map 纯信息暴露误判成「疑似盲打 RCE」并自动回炉。
+func TestLooksLikeRCETextNeedsWordBoundary(t *testing.T) {
+	// 不该命中的(含 "source"/"force"/"resource" 这类含 rce 子串的词)。
+	for _, head := range []string{
+		"信息泄露-源码泄露 source map 公开可读",
+		"source_map_leak",
+		"brute force 弱口令登录",
+		"resource exhaustion",
+	} {
+		if looksLikeRCEText(head) {
+			t.Errorf("%q 不应被判定为 RCE 一族(rce 子串误报)", head)
+		}
+	}
+	// 该命中的。
+	for _, head := range []string{
+		"rce", "RCE 命令执行", "command_injection", "ssti 模板注入",
+		"deserialization", "反序列化导致代码执行", "命令注入",
+	} {
+		if !looksLikeRCEText(head) {
+			t.Errorf("%q 应被判定为 RCE 一族", head)
+		}
+	}
+}
+
+// 端到端:source map 纯信息暴露不得被改判 deepen(旧实现会因 rce/source 误报回炉)。
+func TestSourceMapInfoLeakIsNotDeepened(t *testing.T) {
+	s := &Server{}
+	f := &db.DBFinding{
+		VulnClass: "信息泄露-源码泄露",
+		Name:      "信息泄露-源码泄露 https://x.example.com/static/js/main.75a4b3ad.js.map",
+		Evidence:  "source map 可直接下载;响应时间稳定",
+	}
+	rev := &db.FindingReview{Verdict: db.ReviewVerdictIgnored}
+	s.postReviewAdjust(f, rev, db.ReviewSrcEduSRC)
+	if rev.Verdict == db.ReviewVerdictDeepen {
+		t.Fatalf("source map 纯暴露不得因 rce 子串误报被回炉, directive=%q", rev.DeepenDirective)
+	}
+}

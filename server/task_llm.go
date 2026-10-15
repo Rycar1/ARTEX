@@ -589,11 +589,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetTaskProxyResolver(s.m.TaskProxyForTask) // 期 3b:按任务 MITM(经隧道时 任务实例→任务 socks)
 	wk.SetWebSearch(s.webSearchFor("worker"))
-	wk.SetConstraintInject(s.constraintInjectWorker)   // 操作约束注入 worker(可配置,默认开)
-	wk.SetIntranetResolver(s.taskIntranet)             // 期 4:内网期(立足点/隧道)切 worker.intranet 提示词变体
-	wk.SetUAResolver(s.uaForTask)                      // 批 5 B4:按任务稳定分配的客户端 UA → BashEnv ARTEX_UA
-	wk.SetFindingSrcTypeResolver(s.m.pg.ReviewSrcType) // 挖掘期闸门按任务收录标准启用检查
-	wk.SetEscalationWriter(s.writeEscalationResult)    // 「扩大危害」意图:写回原漏洞(report_escalation)
+	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	wk.SetIntranetResolver(s.taskIntranet)           // 期 4:内网期(立足点/隧道)切 worker.intranet 提示词变体
+	wk.SetUAResolver(s.uaForTask)                    // 批 5 B4:按任务稳定分配的客户端 UA → BashEnv ARTEX_UA
+	wk.SetEscalationWriter(s.writeEscalationResult)  // 「扩大危害」意图:写回原漏洞(report_escalation)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)

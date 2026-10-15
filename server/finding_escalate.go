@@ -111,10 +111,14 @@ func (s *Server) autoEscalateFinding(ctx context.Context, f *db.DBFinding, rev *
 		//     planner)就会领取它;此时若标 failed,worker 稍后交回的升级结果会被
 		//     状态守卫拒收,白干一轮(真机实测踩到过)。
 		if !escalationIntentCreated(err) {
-			if uerr := s.m.pg.ApplyEscalationFailure(f.ID, "升级派单失败,已回滚升级标记"); uerr != nil {
-				log.Printf("[escalate] 回滚标记也失败 finding=%d: %v", f.ID, uerr)
+			// 用 ClearFindingEscalation 而不是 ApplyEscalationFailure:后者只置
+			// escalate_status='failed',**不动 escalated_at**,而占位判定是
+			// `escalated_at IS NULL` —— 那会让这个漏洞被永久锁死、再也升不了。
+			// 这里是「意图根本没建成」,必须把占位完整清掉。
+			if uerr := s.m.pg.ClearFindingEscalation(f.ID); uerr != nil {
+				log.Printf("[escalate] 回滚占位也失败 finding=%d: %v", f.ID, uerr)
 			}
-			log.Printf("[escalate] 派单失败 finding=%d: %v", f.ID, err)
+			log.Printf("[escalate] 派单失败(意图未建成,占位已回滚) finding=%d: %v", f.ID, err)
 			return
 		}
 		log.Printf("[escalate] 升级意图已建但唤醒失败 finding=%d(保持 dispatched,由下次运行领取): %v", f.ID, err)
@@ -216,12 +220,14 @@ func (s *Server) writeEscalationResult(ctx context.Context, r agent.EscalationRe
 	if r.TaskID > 0 && (f.TaskID == nil || *f.TaskID != r.TaskID) {
 		return fmt.Errorf("漏洞 #%d 不属于本任务,拒绝改写", r.FindingID)
 	}
-	// 只在「升级流程中」才接受写回:防止普通 worker 误调 report_escalation 改级别。
-	// failed 也放行 —— 它可能是「派单时唤醒失败」留下的状态,而升级意图其实已经
-	// 在跑;此时拒收会把 worker 真打出来的结果丢掉。escalated_at 已经保证每个漏洞
-	// 只升级一轮,所以这里放宽不会造成重复升级。
-	if f.EscalateStatus == "" {
-		return fmt.Errorf("漏洞 #%d 不在升级流程中,不能通过 report_escalation 改写", r.FindingID)
+	// 只在「升级进行中」才接受写回:防止普通 worker 误调 report_escalation 改级别。
+	//
+	// dispatched = 已派待结果;done = 本轮的重复交回(允许覆盖,便于补证据)。
+	// failed **不接受**:修掉「派单失败回滚占位」那个 bug 之后,failed 只可能来自
+	// worker 自己上报的 success=false —— 同一轮先报失败再报成功是自相矛盾,不该被采纳
+	// (否则「每个漏洞一轮」只约束了派单、没约束写回)。
+	if f.EscalateStatus != db.EscalateDispatched && f.EscalateStatus != db.EscalateDone {
+		return fmt.Errorf("漏洞 #%d 不在升级流程中(当前状态 %q),不能通过 report_escalation 改写", r.FindingID, f.EscalateStatus)
 	}
 
 	if !r.Success {

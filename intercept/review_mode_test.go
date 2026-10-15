@@ -159,3 +159,49 @@ func TestSetRuleModeRequiresJudge(t *testing.T) {
 		t.Fatalf("未知模式应回落 rules, got %s", ic.RuleMode())
 	}
 }
+
+// 纯模型模式下关掉裁判 = 平台没有任何判定层。若不处理,Review() 会对**每一次**
+// 工具调用返回内置 ask,而 ask 超时默认 deny —— 等于把整个平台的工具调用冻死。
+// 因此 SetJudgeConfig 在关闭裁判时必须强制回落到「规则优先」。
+func TestDisablingJudgeFallsBackToRules(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skipf("no database config (%v) — skipping", err)
+	}
+	d, err := db.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	ic := New(d)
+	prevMode := ic.RuleMode()
+	prevJudge := ic.GetJudgeConfig()
+	t.Cleanup(func() {
+		_ = ic.SetJudgeConfig(prevJudge)
+		_ = d.SetSetting(settingRuleMode, prevMode)
+		ic.Invalidate()
+	})
+
+	// 先进入纯模型模式(需要裁判已启用)。
+	cfg := ic.GetJudgeConfig()
+	cfg.Enabled = true
+	if err := ic.SetJudgeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := ic.SetRuleMode(RuleModeJudgeOnly); err != nil {
+		t.Fatal(err)
+	}
+	if ic.RuleMode() != RuleModeJudgeOnly {
+		t.Fatalf("前置:模式应为 judge_only, got %s", ic.RuleMode())
+	}
+
+	// 关闭裁判 → 必须自动回落 rules,否则每一次工具调用都会转人工并被超时拒绝。
+	cfg.Enabled = false
+	if err := ic.SetJudgeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := ic.RuleMode(); got != RuleModeRules {
+		t.Fatalf("关闭裁判后必须回落 rules(否则全量转人工+超时拒绝), got %s", got)
+	}
+}

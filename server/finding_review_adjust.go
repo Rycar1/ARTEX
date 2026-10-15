@@ -326,13 +326,17 @@ func deepenDirectiveFor(f *db.DBFinding, srcType string) string {
 	return ""
 }
 
+// looksLikeRCEText 判断「类型/名称」是否属于 RCE 一族。
+//
+// 必须走 agent.ContainsAnyFold 而不是裸 strings.Contains:"rce" 是短 ASCII 标记,
+// 裸子串会命中 "sou**rce**"/"fo**rce**" —— 实测把一条 source map 纯信息暴露
+// 误判成「疑似盲打 RCE」并自动回炉。同类问题在挖掘期闸门已用词边界修过,这里是
+// 同一 bug 的漏网处。
 func looksLikeRCEText(head string) bool {
-	for _, k := range []string{"rce", "command_injection", "command_exec", "code_injection", "ssti", "deserialization", "命令执行", "命令注入", "代码执行", "反序列化"} {
-		if strings.Contains(head, k) {
-			return true
-		}
-	}
-	return false
+	return agent.ContainsAnyFold(head, []string{
+		"rce", "command_injection", "command_exec", "code_injection", "ssti",
+		"deserialization", "命令执行", "命令注入", "代码执行", "反序列化",
+	})
 }
 
 // ---------------------------------------------------------------------------

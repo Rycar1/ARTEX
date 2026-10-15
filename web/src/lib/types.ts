@@ -1421,7 +1421,8 @@ export interface InterceptModeState {
 }
 
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
-export interface JudgeConfig {  enabled: boolean;
+export interface JudgeConfig {
+  enabled: boolean;
   profile_id: number; // 0 = 跟随激活/默认配置
   prompt: string; // 判定提示词;GET 未设置时后端回填内置模板全文
   timeout_seconds: number; // 模型调用超时

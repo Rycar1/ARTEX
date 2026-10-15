@@ -193,10 +193,10 @@ const (
 )
 
 // reviewPolicy is the cached interception policy: which decision chain to run and
-// whether a judge is actually available. Read through reviewPolicy().
+// 当前只有 mode 一个字段(裁判可用性由 Judge() 自己判,不在这里重复缓存 —— 早期
+// 版本存了一个 judgeEnabled 但从没被读过,属于「注释声称它是可用性来源」的死字段)。
 type reviewPolicy struct {
-	mode         string
-	judgeEnabled bool
+	mode string
 }
 
 // reviewPolicy loads (and caches) the interception policy. It is invalidated by
@@ -216,7 +216,7 @@ func (i *Interceptor) reviewPolicy() reviewPolicy {
 	if p := i.policy; p != nil {
 		return *p
 	}
-	p := reviewPolicy{mode: RuleModeRules, judgeEnabled: i.db.GetBool(settingJudgeEnabled, false)}
+	p := reviewPolicy{mode: RuleModeRules}
 	if v, ok, err := i.db.GetSetting(settingRuleMode); err == nil && ok && strings.TrimSpace(v) == RuleModeJudgeOnly {
 		p.mode = RuleModeJudgeOnly
 	}
@@ -550,6 +550,14 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	}
 	if err := i.db.SetSetting(settingJudgeRetryAttempts, strconv.Itoa(clampJudgeRetryAttempts(c.RetryAttempts))); err != nil {
 		return err
+	}
+	// 关掉裁判时,纯模型审核模式会失去唯一判定层 —— 此时 Review() 对每一次工具调用
+	// 都返回内置 ask,而 ask 超时默认 deny,等于把整个平台的工具调用冻死。所以在
+	// 关闭裁判的同时强制回落到「规则优先」:要么有模型判,要么有规则判,不能两个都没有。
+	if !c.Enabled && i.RuleMode() == RuleModeJudgeOnly {
+		if err := i.db.SetSetting(settingRuleMode, RuleModeRules); err != nil {
+			return err
+		}
 	}
 	// 裁判开关是审核策略的一部分(纯模型审核模式要求裁判可用),缓存必须失效。
 	i.Invalidate()

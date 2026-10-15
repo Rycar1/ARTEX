@@ -59,9 +59,6 @@ type ToolSet struct {
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
-	// findingSrc 是任务的 SRC 收录标准(edusrc|enterprise),决定挖掘期提交闸门
-	// 启用哪些检查(见 SetFindingSrcType / finding_gate.go)。空 = edusrc。
-	findingSrc string
 	// escalateFinding 写回一次「扩大危害」的结果(见 server 侧实现)。nil = 未接入,
 	// report_escalation 报告不可用。只在「扩大危害」意图下注册该工具。
 	escalateFinding func(ctx context.Context, r EscalationResult) error
@@ -168,11 +165,6 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
 
-// SetFindingSrcType records the task's SRC 收录标准 (edusrc | enterprise) so the
-// digging-time finding gate (agent/finding_gate.go) can enable the right checks —
-// e.g. 短信/邮箱轰炸 只在 EduSRC 标准下拒收。空 = 按 edusrc(更严)。
-func (t *ToolSet) SetFindingSrcType(src string) { t.findingSrc = src }
-
 // SetEscalation wires the escalation result writer and marks this run as an
 // 「扩大危害」task, which adds report_escalation to the tool surface. nil fn = 不挂该工具。
 func (t *ToolSet) SetEscalation(fn func(ctx context.Context, r EscalationResult) error) {
@@ -182,14 +174,6 @@ func (t *ToolSet) SetEscalation(fn func(ctx context.Context, r EscalationResult)
 
 // Escalation reports whether this run is an 扩大危害 task.
 func (t *ToolSet) Escalation() bool { return t.escalation }
-
-// findingSrcType returns the configured 收录标准,默认 edusrc。
-func (t *ToolSet) findingSrcType() string {
-	if strings.TrimSpace(t.findingSrc) == "" {
-		return "edusrc"
-	}
-	return t.findingSrc
-}
 
 // SetIntelStore wires the global intel library (schema §O) so search_intel can
 // surface cross-task reusable intel. nil = the tool reports unavailable.
@@ -1617,7 +1601,16 @@ func (t *ToolSet) addEscalation() actool.CoreTool {
 }
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。提交前必须如实填 self_check；明显属于忽略清单的提交会被系统拒收并说明原因，线索请改用 record_fact 记为 inferred。", obj(map[string]any{
+	// self_check 是 required(harness 会硬校验),所以「怎么填」必须写在工具描述里 ——
+	// 这段描述对**所有**能调 report_finding 的 agent 可见(worker / planner / mainagent),
+	// 不能只依赖 worker 的系统提示词(那条只有 worker 看得到)。
+	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。"+
+		"**必填 self_check（7 个布尔位，如实回答；缺失会被工具校验直接拒绝）**："+
+		"is_reflected_xss(反射型/Self-XSS)、needs_admin_login(需先登管理员后台才能触发)、needs_mitm(需中间人)、"+
+		"is_pure_info_leak(无实际利用的信息泄露:phpinfo/内网IP/版本号/内部域名)、scanner_only_no_poc(只有扫描器结果、给不出利用方法)、"+
+		"is_public_interface(该接口本就面向公众公开)、info_leak_hits_strict_list(若属信息泄露:泄露数据是否命中本 SRC 敏感数据口径)。"+
+		"填 true 的位会被挖掘期闸门直接拒收；填得不实，审核会以证据为准反查。"+
+		"明显属于忽略清单的提交会被系统拒收并说明原因，线索请改用 record_fact 记为 inferred。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id;务必尽量带上(影响同入口合并);留空时系统会从上报文本的 URL 自动锚定"},
 		"evidence":         str("证据/PoC 文本"),
@@ -1656,7 +1649,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if rej := CheckFindingGate(FindingGateInput{
 			VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity,
 			Summary: a.Summary, Evidence: a.Evidence,
-			SelfCheck: a.SelfCheck, SrcType: t.findingSrcType(),
+			SelfCheck: a.SelfCheck,
 		}); rej != nil {
 			return actool.Errorf(GateToolError(rej)), nil
 		}

@@ -415,33 +415,95 @@ func TestEscalationWakeFailureIsDistinguishable(t *testing.T) {
 	}
 }
 
-// 派单时唤醒失败留下的 failed 状态,不能拒收 worker 之后真交回的升级结果。
-func TestLateEscalationResultAcceptedAfterWakeFailure(t *testing.T) {
+// failed 是 worker 自己上报的失败终态:同一轮先报失败再报成功属自相矛盾,
+// 不该被采纳(否则「每漏洞一轮」只约束派单、没约束写回)。
+// 注意:「派单时唤醒失败」不会再产生 failed —— 那条路径已改为完整回滚占位
+// (ClearFindingEscalation),见 TestEscalationWakeFailureIsDistinguishable。
+func TestFailedEscalationRejectsLaterSuccess(t *testing.T) {
 	s, f := escalateFixture(t)
 	ctx := context.Background()
 	if _, err := s.m.pg.MarkFindingEscalated(f.ID, "medium"); err != nil {
 		t.Fatal(err)
 	}
-	// 模拟「唤醒失败」把状态置成 failed(意图其实在跑)。
-	if err := s.m.pg.ApplyEscalationFailure(f.ID, "升级派单失败,已回滚升级标记"); err != nil {
+	// worker 上报「打不动」→ failed 终态。
+	if err := s.writeEscalationResult(ctx, agent.EscalationResult{
+		TaskID: *f.TaskID, FindingID: f.ID, Success: false, Summary: "试过写接口,返回 403",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	cur, _ := s.m.pg.GetFinding(f.ID)
 	if cur.EscalateStatus != db.EscalateFailed {
 		t.Fatalf("前置状态应为 failed, got %s", cur.EscalateStatus)
 	}
-	if err := s.writeEscalationResult(ctx, agent.EscalationResult{
+	// 同一轮再报成功 → 必须拒绝。
+	err := s.writeEscalationResult(ctx, agent.EscalationResult{
 		TaskID: *cur.TaskID, FindingID: cur.ID, Success: true, Severity: "high",
-		Evidence: "升级证据:用他人 addrId 批量改地址并旁路回读确认", Summary: "medium→high",
+		Evidence: "x", Summary: "又成功了",
+	})
+	if err == nil || !strings.Contains(err.Error(), "不在升级流程中") {
+		t.Fatalf("failed 后不得再采纳成功上报, got %v", err)
+	}
+	// 失败终态必须保留原级。
+	after, _ := s.m.pg.GetFinding(f.ID)
+	if after.Severity != "low" {
+		t.Fatalf("失败应保留原级 low, got %s", after.Severity)
+	}
+}
+
+// 升级失败不得篡改 severity 列(base_severity 是审核级别,severity 列可能是
+// worker 自评的更高值 —— 早期实现会把 critical 悄悄写成 low)。
+func TestEscalationFailureDoesNotTouchSeverityColumn(t *testing.T) {
+	s, f := escalateFixture(t)
+	if _, err := s.m.pg.Exec(`UPDATE findings SET severity='critical' WHERE id=$1`, f.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.MarkFindingEscalated(f.ID, "low"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeEscalationResult(context.Background(), agent.EscalationResult{
+		TaskID: *f.TaskID, FindingID: f.ID, Success: false, Summary: "打不动",
 	}); err != nil {
-		t.Fatalf("唤醒失败后的迟到结果不应被拒收: %v", err)
+		t.Fatal(err)
 	}
 	got, _ := s.m.pg.GetFinding(f.ID)
-	if got.Severity != "high" {
-		t.Fatalf("严重度应升到 high, got %s", got.Severity)
+	if got.Severity != "critical" {
+		t.Fatalf("失败不得改 severity 列(应保持 critical), got %s", got.Severity)
 	}
-	if got.EscalateStatus != db.EscalateDone {
-		t.Fatalf("应转为 done, got %s", got.EscalateStatus)
+}
+
+// 升级成功必须把 status 从 ignored 拉回来,否则待审队列过滤掉它,
+// 「已送回复核」永远不生效。
+func TestEscalationSuccessRevivesIgnoredFindingForReview(t *testing.T) {
+	s, f := escalateFixture(t)
+	ctx := context.Background()
+	if _, err := s.m.pg.MarkFindingEscalated(f.ID, "medium"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s.m.pg.SetFindingStatusWithNotify(ctx, f.ID, db.FindingIgnored); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeEscalationResult(ctx, agent.EscalationResult{
+		TaskID: *f.TaskID, FindingID: f.ID, Success: true, Severity: "high",
+		Evidence: "升级证据:越权写打通到批量篡改", Summary: "medium→high",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.m.pg.GetFinding(f.ID)
+	if got.Status == db.FindingIgnored {
+		t.Fatal("升级后 status 不应仍是 ignored(否则永远进不了待审队列)")
+	}
+	pend, err := s.m.pg.ListFindingsAwaitingReview(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range pend {
+		if p.ID == f.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("升级后的 ignored 漏洞必须重新进入待审队列")
 	}
 }
 

@@ -345,8 +345,12 @@ LIMIT $1`, limit, reviewHoldTimeout)
 		//   ignored —— 审核判定不收录,纯噪音;
 		//   deepen  —— 审核判定「线索真实但没打穿」,已自动转成回炉意图让 worker 再挖
 		//              一轮,属于流程中间态而非成果,推给用户同样是噪音。
-		// 未审不在此列:未审的 finding_created 根本不会被上面的查询选中(等结论)。
-		suppressed = append(suppressed, reviewOn &&
+		//
+		// **只对 finding_created 生效**:闸门要拦的是「新发现漏洞」这一条噪音;
+		// finding_status_changed 是状态流转通知(含人工把漏洞标成已修复),审核结论为
+		// ignored 并不代表人不该收到状态变更 —— 早期实现对全部 kind 生效,会把这类
+		// 通知一并静默丢掉。
+		suppressed = append(suppressed, reviewOn && ev.Kind == "finding_created" &&
 			(verdict == ReviewVerdictIgnored || verdict == ReviewVerdictDeepen))
 	}
 	rows.Close()

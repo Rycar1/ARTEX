@@ -34,8 +34,6 @@ type FindingGateInput struct {
 	Evidence  string
 	// SelfCheck 是 worker 提交前的结构化自检。nil = 没填(旧调用/模型没给)。
 	SelfCheck *FindingSelfCheck
-	// SrcType 是任务的收录标准(edusrc | enterprise),决定启用哪些闸门。
-	SrcType string
 }
 
 // GateRejection 是一次拒收:为什么拒、以及让 worker 怎么改。
@@ -113,7 +111,15 @@ var writeSemanticMarkers = []string{
 }
 
 // writeTypeMarkers 判断漏洞类型是否属于「未授权/越权」这一族。
-var writeTypeMarkers = []string{"unauthorized", "idor", "auth", "access", "越权", "未授权"}
+//
+// 注意 "auth" 是短 ASCII 标记,containsAnyFold 对它要求词边界 —— 所以
+// "authentication"/"authorization" 不会命中 "auth",必须显式列全,否则
+// authentication_bypass 这类标题会漏掉写语义识别(weakWriteGate 与
+// classifyHarmlessWriteProof 都依赖它)。
+var writeTypeMarkers = []string{
+	"unauthorized", "idor", "auth", "authentication", "authorization",
+	"access", "越权", "未授权", "无授权", "权限绕过",
+}
 
 // scannerOnlyMarkers 是「只有扫描器输出、没有真实请求响应」的特征。
 var scannerOnlyMarkers = []string{
@@ -182,7 +188,7 @@ func CheckFindingGate(in FindingGateInput) *GateRejection {
 	}
 
 	// ② 无利用影响的信息暴露 —— 线上 90% 的噪音都在这一类。
-	if r := infoExposureGate(head, body, in.SrcType); r != nil {
+	if r := infoExposureGate(head, body); r != nil {
 		return r
 	}
 
@@ -207,7 +213,7 @@ func CheckFindingGate(in FindingGateInput) *GateRejection {
 	}
 
 	// ⑤ 写/删/改接口:只有成功文案 + 零影响,且没有任何无害证法 → 半成品。
-	if r := weakWriteGate(head, body, in.SrcType); r != nil {
+	if r := weakWriteGate(head, body); r != nil {
 		return r
 	}
 
@@ -224,7 +230,7 @@ func CheckFindingGate(in FindingGateInput) *GateRejection {
 // 判定要求「信息暴露形态词」与「具体噪音标记」**同时**命中 —— 单靠 trpc /
 // source map 这类词会把「tRPC 反序列化 RCE」「source map 里翻出后台密钥」一起误杀。
 // 同一套标记与 server 侧审核规则层共用口径(server/finding_review.go)。
-func infoExposureGate(head, body, srcType string) *GateRejection {
+func infoExposureGate(head, body string) *GateRejection {
 	if !containsAnyFold(head, InfoLeakShapeMarkers) {
 		return nil
 	}
@@ -282,7 +288,7 @@ var infoExposureExploitMarkers = InfoExposureExploitMarkers
 // 只拦最明确的一种:命中零影响特征(或"不存在/未实证/未证明")、且**没有**任何
 // 无害证法痕迹。有任何一条无害证法就放行 —— 那是实锤,只是形式与"破坏了真数据"
 // 不同,不能因此驳回(AutoHunter 的 _maybe_accept_write_proof 就是为纠这个)。
-func weakWriteGate(head, body, srcType string) *GateRejection {
+func weakWriteGate(head, body string) *GateRejection {
 	if !isWriteSemantic(head, body) {
 		return nil
 	}
@@ -348,10 +354,6 @@ func isWeakBackdoor(head, body string) bool {
 	}
 	weak := []string{"图床", "oss", "cdn", "七牛", "又拍云", "imgur", "jsdelivr", "外部图片", "外链", "第三方 js", "第三方统计"}
 	return containsAnyFold(body, weak)
-}
-
-func isEduSrc(srcType string) bool {
-	return !strings.EqualFold(strings.TrimSpace(srcType), "enterprise")
 }
 
 // ---------------------------------------------------------------------------

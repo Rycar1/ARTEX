@@ -79,10 +79,6 @@ type Worker struct {
 	// injected into the worker system prompt. Read per run so the settings toggle
 	// takes effect without rebuilding the agent. nil = inject (default).
 	injectConstraints func() bool
-	// findingSrcFn resolves this task's SRC 收录标准 (edusrc | enterprise) per run,
-	// so the digging-time submission gate enables the right checks(例如短信/邮箱轰炸
-	// 只在 EduSRC 标准下拒收)。nil = edusrc(更严)。
-	findingSrcFn func(taskID int64) string
 	// escalateFinding 写回一次「扩大危害」的结果(server 侧接线)。nil = 该能力不可用,
 	// 扩大危害意图下不会挂载 report_escalation 工具。见 agent/finding_escalate.go。
 	escalateFinding EscalationWriter
@@ -177,11 +173,6 @@ func (w *Worker) uaForTask(taskID int64) string {
 // SetConstraintInject wires a resolver deciding whether this task's operation
 // constraints get injected into the worker system prompt. nil = inject (default).
 func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn }
-
-// SetFindingSrcTypeResolver installs a per-task resolver for the SRC 收录标准
-// (edusrc | enterprise), used by the digging-time finding gate. Read per run so a
-// task's standard takes effect without rebuilding the worker. nil = edusrc.
-func (w *Worker) SetFindingSrcTypeResolver(fn func(taskID int64) string) { w.findingSrcFn = fn }
 
 // SetEscalationWriter wires the 「扩大危害」result writer. When set, an intent whose
 // payload carries escalate=true gets the report_escalation tool (see IntentIsEscalation).
@@ -503,9 +494,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
-	if w.findingSrcFn != nil {
-		tsx.SetFindingSrcType(w.findingSrcFn(taskID))
-	}
 	// 「扩大危害」意图额外挂 report_escalation(写回原漏洞 + 抬升严重度 + 送回复核)。
 	if w.escalateFinding != nil && IntentIsEscalation(intent) {
 		tsx.SetEscalation(w.escalateFinding)

@@ -47,6 +47,10 @@ func (d *DB) MarkFindingEscalated(id int64, baseSeverity string) (bool, error) {
 // severity 只在高于 base_severity 时才采纳(升级只做加法,不降级)。比较用**数值
 // 等级**而不是字符串:Postgres 的 GREATEST 对 text 是字典序,'low' > 'critical',
 // 直接 GREATEST 会把升级结果吞掉(实测踩到过)。
+//
+// status 也要一并从 ignored 拉回来:待审队列过滤 `status IN (pending,in_progress,
+// confirmed)`,只清 review_verdict 而不改 status 的话,被 ignored 过的漏洞(人工对
+// ignored 漏洞发起升级是合法路径)永远进不了队列 —— 「已送回复核」就成了空话。
 func (d *DB) ApplyEscalationSuccess(id int64, severity, evidence, note string) error {
 	const sevRank = `CASE %s WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END`
 	_, err := d.Exec(`UPDATE findings
@@ -56,6 +60,7 @@ func (d *DB) ApplyEscalationSuccess(id int64, severity, evidence, note string) e
 		        WHEN base_severity = '' THEN $3
 		        WHEN `+fmt.Sprintf(sevRank, "$3")+` >= `+fmt.Sprintf(sevRank, "base_severity")+` THEN $3
 		        ELSE base_severity END,
+		    status = CASE WHEN COALESCE(status,'pending') = 'ignored' THEN 'pending' ELSE COALESCE(status,'pending') END,
 		    escalate_status = $4,
 		    review_verdict = '',
 		    review_notes = CASE WHEN $5 = '' THEN review_notes
@@ -67,10 +72,15 @@ func (d *DB) ApplyEscalationSuccess(id int64, severity, evidence, note string) e
 
 // ApplyEscalationFailure 记录「升级未成立」:**保留原级**,只记一条说明。
 // 升级失败不等于原漏洞不成立 —— 绝不因此降级或忽略。
+//
+// 刻意**不动 severity 列**:升级流程从没改过它,失败时也就没有可回退的东西。
+// 早期实现在这里写 `severity = base_severity`,而 base_severity 存的是**审核后**
+// 级别、severity 列可能是 worker 自评的更高值 —— 结果「升级失败」会把列从 critical
+// 悄悄改成 low,与「保留原级」的承诺相反。真正需要回退列的只有「升级成功抬过级、
+// 复核又判不成立」那条路,由 RevertFindingSeverity 负责。
 func (d *DB) ApplyEscalationFailure(id int64, note string) error {
 	_, err := d.Exec(`UPDATE findings
 		SET escalate_status = $2,
-		    severity = CASE WHEN base_severity <> '' THEN base_severity ELSE severity END,
 		    review_notes = CASE WHEN $3 = '' THEN review_notes
 		                        ELSE COALESCE(review_notes,'') || E'\n' || $3 END
 		WHERE id = $1`, id, EscalateFailed, note)
