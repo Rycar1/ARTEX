@@ -79,6 +79,10 @@ type Worker struct {
 	// injected into the worker system prompt. Read per run so the settings toggle
 	// takes effect without rebuilding the agent. nil = inject (default).
 	injectConstraints func() bool
+	// findingSrcFn resolves this task's SRC 收录标准 (edusrc | enterprise) per run,
+	// so the digging-time submission gate enables the right checks(例如短信/邮箱轰炸
+	// 只在 EduSRC 标准下拒收)。nil = edusrc(更严)。
+	findingSrcFn func(taskID int64) string
 	// nonStreamingFn resolves whether this run uses the non-streaming (Complete)
 	// path. Read per run so a profile/task toggle takes effect without rebuilding
 	// the agent. nil = streaming (default).
@@ -170,6 +174,11 @@ func (w *Worker) uaForTask(taskID int64) string {
 // SetConstraintInject wires a resolver deciding whether this task's operation
 // constraints get injected into the worker system prompt. nil = inject (default).
 func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn }
+
+// SetFindingSrcTypeResolver installs a per-task resolver for the SRC 收录标准
+// (edusrc | enterprise), used by the digging-time finding gate. Read per run so a
+// task's standard takes effect without rebuilding the worker. nil = edusrc.
+func (w *Worker) SetFindingSrcTypeResolver(fn func(taskID int64) string) { w.findingSrcFn = fn }
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
@@ -306,8 +315,19 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
+**少报垃圾洞 —— 提交前的三道自问（答不上就别提交）**：
+1. **我用它实际干成了什么？** 「发现了某个密钥/版本号/内部地址」不算干成事 —— 要能说清借它读到了什么受限数据、拿到了什么可用凭证、或执行了什么敏感操作。
+2. **有原始请求+响应（或命令回显）证据吗？** 只有扫描器输出、只有状态码 200、只有"看起来危险"都不算。
+3. **这个证据证明的是危害，还是只证明了某处存在缺陷？** 半成品（接口没鉴权但只泄露普通数据、能上传但只传了 txt、弱口令登进去只看到菜单、配置项泄露但没提取出可用凭证）都不是漏洞。
+系统会在提交时做结构化校验：明显属于忽略清单的提交会被**直接拒收**并告诉你缺哪一步该怎么补。被拒收后别换个说法再撞一次 —— 按提示补证据，或改用 record_fact 把线索记为 inferred 交棒，把轮次留给能交付的目标。
+
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+
+// workerFindingGateBlock 是代码固定的「挖掘期提交闸门」说明段,追加到 worker 与
+// pentest 提示词尾部(不可被 DB 正文编辑掉)。与 agent/finding_gate.go 的实际校验
+// 一一对应:提示词说的是"自查什么",闸门做的是"实际拦什么",两边必须同步。
+const workerFindingGateBlock = "\n\n**提交闸门(系统会实际校验,不是建议)**:" + SelfCheckHint
 
 // workerIntranetDiscipline 是内网期追加进 worker 正文的纪律段落(可编辑,随
 // "worker.intranet" 种子入库,见 promptcatalog.go)。
@@ -387,7 +407,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) stri
 	// Optional finding guidance is added for every role after tool resolution.
 	// workerAntiTrapRules(批 5 B1 反 AI 蜜罐红线)对内外网 worker 一律追加,
 	// 内网红线尾仍只在 intranet 时生效。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + untrustedDataRule + evidenceFirstRule + toolchainRule + chainskel.WorkerMetaRules + workerAntiTrapRules + tail
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + untrustedDataRule + evidenceFirstRule + toolchainRule + chainskel.WorkerMetaRules + workerAntiTrapRules + workerFindingGateBlock + tail
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -459,6 +479,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
+	if w.findingSrcFn != nil {
+		tsx.SetFindingSrcType(w.findingSrcFn(taskID))
+	}
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {

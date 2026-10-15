@@ -341,9 +341,13 @@ LIMIT $1`, limit, reviewHoldTimeout)
 		snap.Kind = ev.Kind
 		events = append(events, ev)
 		parsedSnaps = append(parsedSnaps, snap)
-		// 只有「开了二次审核 + 结论明确为 ignored」才丢弃。判空/未审不在此列:
-		// 未审的 finding_created 根本不会被上面的查询选中(等结论)。
-		suppressed = append(suppressed, reviewOn && verdict == ReviewVerdictIgnored)
+		// 丢弃两种「不该交付给用户」的裁决:
+		//   ignored —— 审核判定不收录,纯噪音;
+		//   deepen  —— 审核判定「线索真实但没打穿」,已自动转成回炉意图让 worker 再挖
+		//              一轮,属于流程中间态而非成果,推给用户同样是噪音。
+		// 未审不在此列:未审的 finding_created 根本不会被上面的查询选中(等结论)。
+		suppressed = append(suppressed, reviewOn &&
+			(verdict == ReviewVerdictIgnored || verdict == ReviewVerdictDeepen))
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

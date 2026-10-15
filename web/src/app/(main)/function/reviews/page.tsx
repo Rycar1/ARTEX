@@ -27,11 +27,13 @@ const REVIEW_TABS: { value: ReviewFilter; label: string }[] = [
   { value: "all", label: "全部" },
   { value: "pending", label: "待审核" },
   { value: "accepted", label: "已收录" },
+  { value: "deepen", label: "已回炉" },
   { value: "ignored", label: "已忽略" },
 ];
 
 const VERDICT_META: Record<ReviewVerdict, { label: string; tone: Tone }> = {
   accepted: { label: "收录", tone: "green" },
+  deepen: { label: "回炉深挖", tone: "blue" },
   ignored: { label: "忽略", tone: "neutral" },
 };
 
@@ -104,13 +106,15 @@ export default function FindingReviewsPage() {
       <div className="mb-4">
         <h1 className="font-semibold text-xl">二次审核</h1>
         <p className="text-muted-foreground text-sm">
-          AI 按企业 SRC / EduSRC 收录标准复核每条漏洞；不符合标准的自动标记为「忽略」并注明原因。
+          AI 按企业 SRC / EduSRC 收录标准复核每条漏洞；不符合标准的自动标记为「忽略」并注明原因；
+          线索真实但没打穿的会「回炉深挖」，自动派回原任务补链，不推送也不占人工复审。
         </p>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label="已审核" value={stats?.total ?? 0} />
         <StatCard label="收录" value={stats?.accepted ?? 0} />
+        <StatCard label="回炉深挖" value={stats?.deepen ?? 0} />
         <StatCard label="忽略" value={stats?.ignored ?? 0} />
         <StatCard label="待审核" value={stats?.pending ?? 0} highlight />
       </div>

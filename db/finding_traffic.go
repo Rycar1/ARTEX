@@ -330,6 +330,9 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	// SelfCheck 是 worker 提交前的结构化自检(agent/finding_selfcheck.go 的 7 个
+	// 布尔位)。原样落库供审核层核对;nil = 未填(独立 agent/旧调用)。
+	SelfCheck json.RawMessage
 }
 
 type RecordedFinding struct {
@@ -409,8 +412,12 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedup_key,fingerprint)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), dedupKey, fingerprint).Scan(&out.FindingID); err != nil {
+	selfCheck := in.SelfCheck
+	if len(selfCheck) == 0 {
+		selfCheck = json.RawMessage("{}")
+	}
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedup_key,fingerprint,self_check)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), dedupKey, fingerprint, string(selfCheck)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 四层去重第二层:终态行(已修复/误报/忽略/风险接受/重复)不自动合并,但在新行

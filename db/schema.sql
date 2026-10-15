@@ -1139,6 +1139,11 @@ CREATE TABLE IF NOT EXISTS findings (
     review_reasons  TEXT NOT NULL DEFAULT '',
     review_notes    TEXT NOT NULL DEFAULT '',
     reviewed_at     TIMESTAMPTZ,
+    -- worker 提交前的结构化自检(参考 AutoHunter 的 SelfCheck):7 个布尔位,
+    -- 如 {is_reflected_xss,needs_admin_login,needs_mitm,is_pure_info_leak,
+    -- scanner_only_no_poc,is_public_interface,info_leak_hits_strict_list}。
+    -- 挖掘期闸门据此直接拒收;审核层据此一票否决/核对。空 = 旧数据或未填。
+    self_check  JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
@@ -1152,6 +1157,8 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_score    DOUBLE PRECISION;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_reasons  TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_notes    TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS reviewed_at     TIMESTAMPTZ;
+-- worker 提交前结构化自检(见上方 CREATE 注释);旧库靠这一行补列。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS self_check     JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_findings_review ON findings(review_verdict, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);

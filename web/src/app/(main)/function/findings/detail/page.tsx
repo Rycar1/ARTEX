@@ -43,6 +43,7 @@ const FINDING_STATUSES: FindingStatus[] = [
 // AI 二次审核结论的展示元数据(与 /function/reviews 页保持同一套配色)。
 const REVIEW_VERDICT_META: Record<string, { label: string; tone: Tone }> = {
   accepted: { label: "已收录", tone: "green" },
+  deepen: { label: "回炉深挖", tone: "blue" },
   ignored: { label: "已忽略", tone: "neutral" },
 };
 

@@ -59,6 +59,9 @@ type ToolSet struct {
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// findingSrc 是任务的 SRC 收录标准(edusrc|enterprise),决定挖掘期提交闸门
+	// 启用哪些检查(见 SetFindingSrcType / finding_gate.go)。空 = edusrc。
+	findingSrc string
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -158,6 +161,19 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+
+// SetFindingSrcType records the task's SRC 收录标准 (edusrc | enterprise) so the
+// digging-time finding gate (agent/finding_gate.go) can enable the right checks —
+// e.g. 短信/邮箱轰炸 只在 EduSRC 标准下拒收。空 = 按 edusrc(更严)。
+func (t *ToolSet) SetFindingSrcType(src string) { t.findingSrc = src }
+
+// findingSrcType returns the configured 收录标准,默认 edusrc。
+func (t *ToolSet) findingSrcType() string {
+	if strings.TrimSpace(t.findingSrc) == "" {
+		return "edusrc"
+	}
+	return t.findingSrc
+}
 
 // SetIntelStore wires the global intel library (schema §O) so search_intel can
 // surface cross-task reusable intel. nil = the tool reports unavailable.
@@ -270,6 +286,9 @@ func intp(desc string) map[string]any {
 }
 func idp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
+}
+func boolean(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
 }
 
 func readTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
@@ -1525,13 +1544,24 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。提交前必须如实填 self_check；明显属于忽略清单的提交会被系统拒收并说明原因，线索请改用 record_fact 记为 inferred。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id;务必尽量带上(影响同入口合并);留空时系统会从上报文本的 URL 自动锚定"},
 		"evidence":         str("证据/PoC 文本"),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
+		// 结构化自检(参考 AutoHunter 的 SelfCheck):7 个布尔位。填 true 会被挖掘期
+		// 闸门直接拒收 —— 让 worker 在提交前自己先过一遍忽略清单,而不是等审核。
+		"self_check": obj(map[string]any{
+			"is_reflected_xss":           boolean("是否反射型 XSS / Self-XSS(主流 SRC 均不收)"),
+			"needs_admin_login":          boolean("是否必须先登录管理员后台才能触发(不收)"),
+			"needs_mitm":                 boolean("是否需要中间人攻击才能触发(不收)"),
+			"is_pure_info_leak":          boolean("是否是无实际利用的信息泄露(phpinfo/内网IP/版本号/内部域名,不收)"),
+			"scanner_only_no_poc":        boolean("是否只有扫描器结果、给不出利用方法(不收)"),
+			"is_public_interface":        boolean("该接口是否本就面向公众公开(是则访问它不构成漏洞)"),
+			"info_leak_hits_strict_list": boolean("若属信息泄露类:泄露数据是否命中本 SRC 的敏感数据口径"),
+		}, "is_reflected_xss", "needs_admin_login", "needs_mitm", "is_pure_info_leak", "scanner_only_no_poc", "is_public_interface", "info_leak_hits_strict_list"),
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
@@ -1539,12 +1569,23 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
 			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
+			SelfCheck                                    *FindingSelfCheck `json:"self_check"`
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
+		}
+		// 挖掘期提交闸门(参考 AutoHunter 的 submit_finding 前置校验):明显属于忽略
+		// 清单的提交在这里就拒收,**不落库**,并把「为什么拒 + 下一步怎么补」返回给
+		// 模型当场修正。理由见 agent/finding_gate.go 的设计说明。
+		if rej := CheckFindingGate(FindingGateInput{
+			VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity,
+			Summary: a.Summary, Evidence: a.Evidence,
+			SelfCheck: a.SelfCheck, SrcType: t.findingSrcType(),
+		}); rej != nil {
+			return actool.Errorf(GateToolError(rej)), nil
 		}
 		// Auto-binding off: ignore the evidence params instead of rejecting the call.
 		// stripTrafficParameters already removes them from the advertised schema, but
@@ -1562,6 +1603,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf(err.Error()), nil
 		}
 		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		// 落库 worker 的结构化自检(参考 AutoHunter 的 SelfCheck):审核层会拿它
+		// 做一票否决与证据核对。
+		if a.SelfCheck != nil {
+			if raw, err := json.Marshal(a.SelfCheck); err == nil {
+				input.SelfCheck = raw
+			}
+		}
 		anchorText := strings.Join([]string{input.Name, input.Summary, input.Evidence}, "\n")
 		if strings.TrimSpace(input.Name) == "" {
 			input.Name = fallbackFindingName(input.VulnClass, anchorText)

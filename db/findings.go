@@ -33,20 +33,23 @@ type DBFinding struct {
 	Status    string
 	Report    string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
 	// AI 二次审核结论(见 server/finding_review.go)。ReviewVerdict 取值 ''/accepted/ignored。
-	ReviewVerdict   string
-	ReviewSeverity  string
-	ReviewScore     *float64
-	ReviewReasons   string
-	ReviewNotes     string
-	ReviewedAt      *time.Time
+	ReviewVerdict  string
+	ReviewSeverity string
+	ReviewScore    *float64
+	ReviewReasons  string
+	ReviewNotes    string
+	ReviewedAt     *time.Time
+	// SelfCheck 是 worker 提交前的结构化自检(原样保存的 JSON;空 = 未填)。
+	// 挖掘期闸门据此拒收,二次审核据此一票否决/核对。见 agent/finding_selfcheck.go。
+	SelfCheck json.RawMessage
 	// 去重(四层方案,见 db/finding_dedup.go / db/finding_merge.go):
 	DedupKey          string   // 结构化合并键(归一化类别 + 主资产/弱锚)
 	Fingerprint       string   // 归一化正文 SHA-1
 	MergedInto        *int64   // 本行已被合并到哪条 finding(被合并时非空)
 	SuspectedDupOf    *int64   // 疑似与哪条 finding 重复(未自动合并时)
 	SuspectedDupScore *float64 // 疑似重复的相似度(0~1)
-	CreatedAt       time.Time
-	TaskDescription string // populated via LEFT JOIN on tasks
+	CreatedAt         time.Time
+	TaskDescription   string // populated via LEFT JOIN on tasks
 }
 
 // Finding triage states (findings.status).
@@ -127,7 +130,7 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       COALESCE(f.review_verdict,''), COALESCE(f.review_severity,''), f.review_score,
 	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at,
 	       COALESCE(f.dedup_key,''), COALESCE(f.fingerprint,''), f.merged_into,
-	       f.suspected_dup_of, f.suspected_dup_score`
+	       f.suspected_dup_of, f.suspected_dup_score, COALESCE(f.self_check, '{}'::jsonb)`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -142,7 +145,7 @@ func scanFindings(rows interface {
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
-			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore); err != nil {
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore, &f.SelfCheck); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -245,7 +248,7 @@ func (f FindingFilter) where() (string, []any) {
 	case "pending":
 		// 与 ReviewStats.Pending 口径一致:只算「开了二次审核但尚未出结论」的漏洞。
 		conds = append(conds, "COALESCE(f.review_verdict,'') = '' AND COALESCE(t.review_enabled,false)")
-	case "accepted", "ignored":
+	case "accepted", "ignored", "deepen":
 		args = append(args, f.Review)
 		conds = append(conds, fmt.Sprintf("f.review_verdict = $%d", len(args)))
 	}
@@ -550,7 +553,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
 			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
-			&f.Report); err != nil {
+			&f.SelfCheck, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -681,7 +684,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 		&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
 		&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
-		&f.Report)
+		&f.SelfCheck, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
