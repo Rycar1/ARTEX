@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -99,14 +100,32 @@ func (s *Server) autoEscalateFinding(ctx context.Context, f *db.DBFinding, rev *
 	if !claimed {
 		return // 已被别处派过
 	}
-	if err := s.dispatchEscalation(t, f, sev); err != nil {
-		// 派单失败要把占位放开,否则这个漏洞永远不会再被升级。
-		if uerr := s.m.pg.ApplyEscalationFailure(f.ID, "升级派单失败,已回滚升级标记"); uerr != nil {
-			log.Printf("[escalate] 回滚标记也失败 finding=%d: %v", f.ID, uerr)
+	if err := s.dispatchEscalationChecked(t, f, sev); err != nil {
+		// 区分「意图是否真的建起来了」:
+		//   - 意图没建成 → 回滚占位,让这个漏洞以后还有机会升级;
+		//   - 意图已建成、只是唤醒任务失败(如任务生命周期 CAS 冲突)→ **保持
+		//     dispatched**。意图已经 durable 落在探索图里,任务下次运行(或本轮
+		//     planner)就会领取它;此时若标 failed,worker 稍后交回的升级结果会被
+		//     状态守卫拒收,白干一轮(真机实测踩到过)。
+		if !escalationIntentCreated(err) {
+			if uerr := s.m.pg.ApplyEscalationFailure(f.ID, "升级派单失败,已回滚升级标记"); uerr != nil {
+				log.Printf("[escalate] 回滚标记也失败 finding=%d: %v", f.ID, uerr)
+			}
+			log.Printf("[escalate] 派单失败 finding=%d: %v", f.ID, err)
+			return
 		}
-		log.Printf("[escalate] 派单失败 finding=%d: %v", f.ID, err)
+		log.Printf("[escalate] 升级意图已建但唤醒失败 finding=%d(保持 dispatched,由下次运行领取): %v", f.ID, err)
 	}
 }
+
+// escalationIntentCreated 判断派单错误是「意图没建成」还是「建成后唤醒失败」。
+// 用哨兵错误区分,避免靠字符串匹配。
+func escalationIntentCreated(err error) bool {
+	return err != nil && errors.Is(err, errEscalationIntentCreated)
+}
+
+// errEscalationIntentCreated 表示升级意图已经落库,只是后续唤醒任务失败。
+var errEscalationIntentCreated = errors.New("escalation intent created but task wake failed")
 
 // escalationBudgetOK 判断任务是否还有足够预算跑一轮升级。
 // DeadlineAt=0 表示不限时(或尚未开跑)→ 放行。
@@ -123,8 +142,9 @@ func (s *Server) escalationBudgetOK(t *Task) bool {
 	return remaining.Seconds()*escalateBudgetShare >= escalateMinRemaining.Seconds()
 }
 
-// dispatchEscalation 建意图并唤醒任务。
-func (s *Server) dispatchEscalation(t *Task, f *db.DBFinding, sev string) error {
+// dispatchEscalationChecked 建意图并唤醒任务。唤醒失败时用 errEscalationIntentCreated
+// 包装,让调用方能区分「意图没建成」与「建成后唤醒失败」。
+func (s *Server) dispatchEscalationChecked(t *Task, f *db.DBFinding, sev string) error {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return fmt.Errorf("任务正在删除")
 	}
@@ -142,9 +162,10 @@ func (s *Server) dispatchEscalation(t *Task, f *db.DBFinding, sev string) error 
 	if err != nil {
 		return fmt.Errorf("建升级意图: %w", err)
 	}
+	// 意图已落库 —— 从这里开始,失败都只是「没唤醒成功」,不能回滚升级占位。
 	queued, err := s.admitTask(t, "resume")
 	if err != nil {
-		return fmt.Errorf("唤醒任务: %w", err)
+		return fmt.Errorf("%w: intent=%d: %v", errEscalationIntentCreated, intentID, err)
 	}
 	log.Printf("[escalate] 已派升级意图 intent=%d finding=%d sev=%s queued=%v", intentID, f.ID, sev, queued)
 	return nil
@@ -193,7 +214,10 @@ func (s *Server) writeEscalationResult(ctx context.Context, r agent.EscalationRe
 		return fmt.Errorf("漏洞 #%d 不属于本任务,拒绝改写", r.FindingID)
 	}
 	// 只在「升级流程中」才接受写回:防止普通 worker 误调 report_escalation 改级别。
-	if f.EscalateStatus != db.EscalateDispatched && f.EscalateStatus != db.EscalateDone {
+	// failed 也放行 —— 它可能是「派单时唤醒失败」留下的状态,而升级意图其实已经
+	// 在跑;此时拒收会把 worker 真打出来的结果丢掉。escalated_at 已经保证每个漏洞
+	// 只升级一轮,所以这里放宽不会造成重复升级。
+	if f.EscalateStatus == "" {
 		return fmt.Errorf("漏洞 #%d 不在升级流程中,不能通过 report_escalation 改写", r.FindingID)
 	}
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -396,5 +397,59 @@ func TestHighSeverityNotEscalated(t *testing.T) {
 	got, _ := s.m.pg.GetFinding(f.ID)
 	if got.EscalatedAt != nil {
 		t.Fatal("high 级别不应派升级")
+	}
+}
+
+// 唤醒失败必须与「意图没建成」区分开:意图已落库时保持 dispatched,
+// 否则 worker 真跑出来的升级结果会被状态守卫拒收(真机实测踩到过)。
+func TestEscalationWakeFailureIsDistinguishable(t *testing.T) {
+	if escalationIntentCreated(fmt.Errorf("建升级意图: 数据库不可用")) {
+		t.Fatal("普通错误不应被当成「意图已建」")
+	}
+	wrapped := fmt.Errorf("%w: intent=99: task lifecycle changed before admission", errEscalationIntentCreated)
+	if !escalationIntentCreated(wrapped) {
+		t.Fatal("唤醒失败(哨兵)应被识别为「意图已建」")
+	}
+}
+
+// 派单时唤醒失败留下的 failed 状态,不能拒收 worker 之后真交回的升级结果。
+func TestLateEscalationResultAcceptedAfterWakeFailure(t *testing.T) {
+	s, f := escalateFixture(t)
+	ctx := context.Background()
+	if _, err := s.m.pg.MarkFindingEscalated(f.ID, "medium"); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟「唤醒失败」把状态置成 failed(意图其实在跑)。
+	if err := s.m.pg.ApplyEscalationFailure(f.ID, "升级派单失败,已回滚升级标记"); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := s.m.pg.GetFinding(f.ID)
+	if cur.EscalateStatus != db.EscalateFailed {
+		t.Fatalf("前置状态应为 failed, got %s", cur.EscalateStatus)
+	}
+	if err := s.writeEscalationResult(ctx, agent.EscalationResult{
+		TaskID: *cur.TaskID, FindingID: cur.ID, Success: true, Severity: "high",
+		Evidence: "升级证据:用他人 addrId 批量改地址并旁路回读确认", Summary: "medium→high",
+	}); err != nil {
+		t.Fatalf("唤醒失败后的迟到结果不应被拒收: %v", err)
+	}
+	got, _ := s.m.pg.GetFinding(f.ID)
+	if got.Severity != "high" {
+		t.Fatalf("严重度应升到 high, got %s", got.Severity)
+	}
+	if got.EscalateStatus != db.EscalateDone {
+		t.Fatalf("应转为 done, got %s", got.EscalateStatus)
+	}
+}
+
+// 从未派过升级的漏洞,不得被 report_escalation 改写(普通 worker 无此能力)。
+func TestNeverEscalatedFindingRejectsWrite(t *testing.T) {
+	s, f := escalateFixture(t)
+	err := s.writeEscalationResult(context.Background(), agent.EscalationResult{
+		TaskID: *f.TaskID, FindingID: f.ID, Success: true, Severity: "critical",
+		Evidence: "x", Summary: "y",
+	})
+	if err == nil || !strings.Contains(err.Error(), "不在升级流程中") {
+		t.Fatalf("未派升级的漏洞应拒绝改写, got %v", err)
 	}
 }
