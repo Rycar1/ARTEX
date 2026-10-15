@@ -30,7 +30,7 @@ func TestReviewJunkRulesCoverProductionNoise(t *testing.T) {
 		{VulnClass: "", Name: "信息泄露（响应头泄露内网/节点 IP） sma.cache.qcloudcdn.qq.com"},
 	}
 	for _, f := range junk {
-		got := ruleReviewFinding(&f)
+		got := ruleReviewFinding(&f, db.ReviewSrcEduSRC)
 		if got == nil {
 			t.Errorf("生产噪音未被规则层拦下(会继续走 LLM 并可能推送): %q / %q", f.VulnClass, f.Name)
 			continue
@@ -53,7 +53,7 @@ func TestReviewJunkRulesCoverProductionNoise(t *testing.T) {
 		{VulnClass: "弱口令", Name: "后台弱口令 admin/123456 登录成功并可执行管理操作"},
 	}
 	for _, f := range real {
-		if got := ruleReviewFinding(&f); got != nil {
+		if got := ruleReviewFinding(&f, db.ReviewSrcEduSRC); got != nil {
 			t.Errorf("真漏洞被规则层误杀(应交给 LLM 复核): %q / %q -> %s (%s)",
 				f.VulnClass, f.Name, got.Verdict, got.Reasons)
 		}
@@ -69,12 +69,74 @@ func TestCORSExploitedPassesRuleLayer(t *testing.T) {
 		Summary:   "构造恶意页面成功跨域读取到受害者的手机号与身份证号",
 		Evidence:  "已跨域读取到用户数据: {\"phone\":\"138****\"}",
 	}
-	if got := ruleReviewFinding(&f); got != nil {
+	if got := ruleReviewFinding(&f, db.ReviewSrcEduSRC); got != nil {
 		t.Fatalf("有真实跨域窃取证据的 CORS 应放行给 LLM, got %s (%s)", got.Verdict, got.Reasons)
 	}
 	// 无利用证据的 CORS 误配仍应被规则层判掉。
 	bare := db.DBFinding{VulnClass: "CORS", Name: "任意 Origin 反射 + Allow-Credentials"}
-	if got := ruleReviewFinding(&bare); got == nil || got.Verdict != db.ReviewVerdictIgnored {
+	if got := ruleReviewFinding(&bare, db.ReviewSrcEduSRC); got == nil || got.Verdict != db.ReviewVerdictIgnored {
 		t.Fatalf("无 PoC 的 CORS 误配应判 ignored, got %+v", got)
+	}
+}
+
+// 规则里的 unless 例外:理由文本写了条件的规则(「目录列表,不含敏感数据」
+// 「反射型 XSS…除非能造成账号接管」),必须在证据里出现打穿迹象时**让路**给 LLM。
+//
+// 这是修一个真实缺陷:早期实现只做单关键词匹配,于是「目录列表泄露数据库备份」
+// 「反射型 XSS 可接管账号」这类真洞会被规则层直接枪毙,连 evidence 都不看。
+func TestReviewJunkRulesRespectUnlessExceptions(t *testing.T) {
+	// A. 名字像垃圾 + 证据里出现打穿迹象 → 规则必须让路(返回 nil,交 LLM)。
+	pass := []db.DBFinding{
+		{
+			VulnClass: "目录列表", Name: "目录列表暴露数据库备份文件",
+			Evidence: "GET /files/ 索引列出 backup_students_20240311.sql,下载后含 8 名学生身份证号与密码哈希",
+		},
+		{
+			VulnClass: "directory listing", Name: "Directory listing enabled",
+			Summary: "索引可直接下载 config.inc.php.bak,内含数据库明文密码",
+		},
+		{
+			VulnClass: "目录遍历", Name: "目录遍历可读取源码与 .git",
+			Evidence: "读到 /files/.git/config 与 web.config,含数据库连接串与凭据",
+		},
+		{
+			VulnClass: "反射型XSS", Name: "反射型 XSS 可窃取管理员会话",
+			Evidence: "构造链接诱使管理员点击后成功窃取 session cookie 并接管后台",
+		},
+		{
+			VulnClass: "内网IP泄露", Name: "响应头泄露内网 IP",
+			Evidence: "据该内网地址 SSRF 打通内网 Redis 未授权访问,写入公钥拿到登录",
+		},
+		{
+			VulnClass: "用户名枚举", Name: "登录接口用户名枚举",
+			Evidence: "枚举出管理员账号后配合弱口令登录成功并接管后台",
+		},
+		{
+			VulnClass: "公开接口", Name: "公告接口本就公开",
+			Evidence: "同前缀 /api/user/list 未授权返回他人身份证号与密码哈希(批量)",
+		},
+	}
+	for _, f := range pass {
+		f := f
+		if got := ruleReviewFinding(&f, db.ReviewSrcEduSRC); got != nil {
+			t.Errorf("证据已打穿,规则层应让路给 LLM: %q / %q -> %s (%s)",
+				f.VulnClass, f.Name, got.Verdict, got.Reasons)
+		}
+	}
+
+	// B. 名字像垃圾且**没有任何**打穿迹象 → 规则层照旧零成本拦下。
+	block := []db.DBFinding{
+		{VulnClass: "目录列表", Name: "目录列表 /files/ 开启", Evidence: "GET /files/ 返回索引页,列出 notice.pdf 等公开文档"},
+		{VulnClass: "反射型XSS", Name: "反射型 XSS(参数回显)", Evidence: "q 参数原样回显到页面"},
+		{VulnClass: "phpinfo", Name: "phpinfo 信息泄露", Evidence: "phpinfo 页面可访问,暴露 PHP 版本与路径"},
+		{VulnClass: "用户名枚举", Name: "用户名枚举", Evidence: "登录返回 1001 用户不存在 / 1002 密码错误"},
+		{VulnClass: "内网IP泄露", Name: "响应头泄露内网 IP", Evidence: "X-Backend-Server: 10.213.0.5:8080"},
+	}
+	for _, f := range block {
+		f := f
+		got := ruleReviewFinding(&f, db.ReviewSrcEduSRC)
+		if got == nil || got.Verdict != db.ReviewVerdictIgnored {
+			t.Errorf("无打穿迹象的垃圾应被规则层判 ignored: %q / %q -> %+v", f.VulnClass, f.Name, got)
+		}
 	}
 }

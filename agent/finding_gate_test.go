@@ -69,11 +69,7 @@ func TestFindingGateRejectsJunk(t *testing.T) {
 			Evidence: "报错页泄露 /data/app/... 内部路径",
 		}, GateInfoExposure},
 
-		// ---- 轰炸 / 假被黑 ----
-		{"短信轰炸", FindingGateInput{
-			VulnClass: "短信轰炸", Name: "发送验证码接口无频率限制", Severity: "medium",
-			Evidence: "可对任意手机号连发短信",
-		}, GateBombing},
+		// ---- 假被黑 ----
 		{"图床冒充被黑", FindingGateInput{
 			VulnClass: "backdoor", Name: "疑似被黑页面", Severity: "high",
 			Evidence: "首页引用了外部图床与第三方 JS，存在外链",
@@ -169,6 +165,19 @@ func TestFindingGatePassesRealVulns(t *testing.T) {
 		{"正常漏洞（无 self_check）", FindingGateInput{
 			VulnClass: "ssrf", Name: "SSRF 打通内网并读取云元数据", Severity: "high",
 			Evidence: "url 参数请求 169.254.169.254 返回临时凭证",
+		}},
+		// 操作者口径:短信/邮箱轰炸与 DoS **算漏洞**,闸门不得拒收。
+		{"短信轰炸(可收录)", FindingGateInput{
+			VulnClass: "短信轰炸", Name: "发送验证码接口无频率限制可对任意手机号连发", Severity: "medium",
+			Evidence: "连续 5 次 POST /api/sms/send 均返回 200 且目标号码收到短信，无验证码无频率限制",
+		}},
+		{"邮箱轰炸(可收录)", FindingGateInput{
+			VulnClass: "邮箱轰炸", Name: "注册接口邮件发送无频率限制", Severity: "low",
+			Evidence: "对任意邮箱连续发送均成功",
+		}},
+		{"DoS/资源耗尽(可收录)", FindingGateInput{
+			VulnClass: "拒绝服务", Name: "单个请求触发资源耗尽导致服务不可用", Severity: "high",
+			Evidence: "构造深层嵌套 JSON 单请求后服务 5xx 持续 30s，连接数被打满",
 		}},
 	}
 	for _, tc := range cases {

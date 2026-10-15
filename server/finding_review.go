@@ -205,7 +205,7 @@ func (r *Reviewer) reviewClaimed(ctx context.Context, id int64) error {
 // 调用方负责决定要不要看任务的 review_enabled 开关(自动路径看,手动路径不看)。
 func (s *Server) reviewFindingOnce(ctx context.Context, f *db.DBFinding) (*db.FindingReview, error) {
 	src := s.m.pg.ReviewSrcType(*f.TaskID)
-	rev := ruleReviewFinding(f)
+	rev := ruleReviewFinding(f, src)
 	if rev == nil {
 		r := s.reviewer
 		if r == nil {
@@ -259,24 +259,62 @@ func (s *Server) applyFindingReview(ctx context.Context, f *db.DBFinding, rev db
 	return nil
 }
 
-// reviewJunkRules 是规则层的高置信忽略清单。只在「漏洞类型 + 名称」上匹配(不看
-// evidence/summary),避免把「SQL 注入 + 顺带目录列表」这类真漏洞误杀。
+// reviewJunkRules 是规则层的高置信忽略清单。
+//
+// 匹配分两段,缺一不可:
+//   - keys   在「漏洞类型 + 名称」上匹配(不看 evidence/summary),避免把
+//     「SQL 注入 + 顺带目录列表」这类真漏洞误杀;
+//   - unless 在**全文**(含 summary/evidence/report)上匹配 —— 命中任一即认为
+//     「这条可能已经打穿」,规则**不生效**,交给 LLM 按证据判。
+//
+// 为什么要 unless:下面几条规则的 reason 文本本身就写了例外(如「目录列表,不含敏感
+// 数据」「反射型 XSS…除非能造成账号接管」),但早期的单关键词匹配无法执行这个例外 ——
+// 结果「目录列表泄露数据库备份」「反射型 XSS 可接管账号」这种真洞会被规则层直接枪毙,
+// 连证据都不看。规则层只该拦「名字像垃圾且没有任何打穿迹象」的。
 var reviewJunkRules = []struct {
 	keys   []string
 	reason string
+	unless []string
+	// eduOnly 标记「只有 EduSRC 标准才不收」的规则。企业 SRC 下这类要交给 LLM
+	// 按实际影响判,不能因为名字命中就一律丢弃。
+	eduOnly bool
 }{
-	{[]string{"轰炸"}, "短信/邮箱轰炸类,不属于可收录漏洞"},
-	{[]string{"self-xss", "self xss", "自xss", "自身xss"}, "Self-XSS:需要受害者在自己浏览器里粘贴代码,无实际危害"},
-	{[]string{"用户名枚举", "用户枚举", "账号枚举", "账户枚举", "user enumeration", "username enumeration"}, "用户名/账号枚举,不构成可收录漏洞"},
-	{[]string{"phpinfo"}, "phpinfo 信息泄露,不含敏感数据"},
-	{[]string{"目录列表", "directory listing"}, "目录列表,不含敏感数据"},
-	{[]string{"内网ip", "私网ip", "内网地址"}, "内网 IP 泄露,无实际影响"},
-	{[]string{"拒绝服务", "ddos", "dos攻击", "资源耗尽"}, "DoS/资源耗尽类,不予收录"},
-	{[]string{"反射型xss", "反射型 xss", "反射xss", "反射 xss", "reflected xss"}, "反射型 XSS:需受害者点击特制链接,单独一条不足以收录(除非能造成账号接管或后台操作)"},
-	{[]string{"钓鱼", "phishing"}, "钓鱼页面/仿冒登录:需用户主动输入账号,不构成可收录漏洞"},
-	{[]string{"中间人", "mitm", "man-in-the-middle"}, "中间人攻击:需控制链路且无直接业务影响,不予收录"},
-	{[]string{"图形验证码", "算术验证码"}, "仅验证码机制问题,无敏感影响,不予收录"},
-	{[]string{"公开接口", "本就公开", "公开展示"}, "本就公开/公开展示的数据或接口,不属于漏洞"},
+	// 短信/邮箱轰炸与 DoS 已按操作者口径改为「算漏洞」——发送接口无频率限制可连发、
+	// 可造成骚扰/资源耗尽本身就是可交付缺陷。不再做规则层无条件忽略,交 LLM 按影响判
+	// (取证纪律:不得真去连发/不得真打瘫,由提示词承担)。
+	{keys: []string{"self-xss", "self xss", "自xss", "自身xss"}, reason: "Self-XSS:需要受害者在自己浏览器里粘贴代码,无实际危害"},
+	{keys: []string{"用户名枚举", "用户枚举", "账号枚举", "账户枚举", "user enumeration", "username enumeration"}, reason: "用户名/账号枚举,不构成可收录漏洞",
+		unless: []string{"接管", "登录成功", "越权", "批量导出", "身份证", "密码哈希"}},
+	{keys: []string{"phpinfo"}, reason: "phpinfo 信息泄露,不含敏感数据",
+		unless: []string{"密码", "凭据", "密钥", "secret", "db_password", "database_password", "access_key", "连库", "登录成功"}},
+	// 目录列表本身只是「开了 autoindex」;但索引里若真能取到备份/源码/配置/数据,
+	// 那就是敏感文件泄露(高价值),必须放给 LLM。
+	{keys: []string{"目录列表", "directory listing", "目录遍历", "autoindex"},
+		reason: "目录列表,不含敏感数据",
+		unless: []string{
+			"备份", "backup", ".bak", ".sql", ".zip", ".tar", ".gz", "dump", "数据库",
+			"源码", "source", ".git", "svn", "配置", "config", ".env", "web.config", "database.yml",
+			"密码", "password", "凭据", "credential", "密钥", "secret", "身份证", "id_card",
+			"下载", "可下载", "可读", "读到", "取得",
+		}},
+	{keys: []string{"内网ip", "私网ip", "内网地址"}, reason: "内网 IP 泄露,无实际影响",
+		unless: []string{"ssrf", "未授权访问", "redis", "mysql", "连上", "可达", "打通", "登录成功", "rce", "命令执行"}},
+	// 反射型 XSS 是真漏洞类,不是垃圾 —— 只是 EduSRC 明确不收。因此这条规则
+	// 只在 EduSRC 标准下生效(eduOnly),且证据里出现「已造成实际影响」时一律让路;
+	// 企业 SRC 下完全交给 LLM 按影响判(能接管账号/后台操作的反射 XSS 是有价值的)。
+	{keys: []string{"反射型xss", "反射型 xss", "反射xss", "反射 xss", "reflected xss", "reflected-xss"},
+		reason:  "反射型 XSS:EduSRC 不收录(需受害者点击特制链接,单独一条不足以收录)",
+		eduOnly: true,
+		unless: []string{
+			"账号接管", "接管", "后台操作", "管理员", "窃取", "盗取", "token", "session", "cookie",
+			"改密", "重置密码", "csrf", "存储型", "stored", "持久化", "任意用户", "越权",
+		}},
+	{keys: []string{"钓鱼", "phishing"}, reason: "钓鱼页面/仿冒登录:需用户主动输入账号,不构成可收录漏洞"},
+	{keys: []string{"中间人", "mitm", "man-in-the-middle"}, reason: "中间人攻击:需控制链路且无直接业务影响,不予收录"},
+	{keys: []string{"图形验证码", "算术验证码"}, reason: "仅验证码机制问题,无敏感影响,不予收录",
+		unless: []string{"接管", "登录成功", "改密", "重置密码", "越权"}},
+	{keys: []string{"公开接口", "本就公开", "公开展示"}, reason: "本就公开/公开展示的数据或接口,不属于漏洞",
+		unless: []string{"越权", "未授权", "他人", "身份证", "密码哈希", "敏感", "批量"}},
 }
 
 // infoLeakShapeMarkers 判断一条 finding 的「类型 + 名称」是否属于纯信息暴露形态。
@@ -319,6 +357,15 @@ func infoLeakReviewFinding(f *db.DBFinding) *db.FindingReview {
 	if !containsAny(head, infoLeakShapeMarkers) {
 		return nil
 	}
+	// 与挖掘期闸门同一套逃逸标记:证据里出现「已把暴露打成实际危害」的迹象
+	// (SSRF 打通内网、下载到备份、拿到凭据、登录成功…) → 不再是纯暴露,交 LLM。
+	//
+	// 只在**证据文本**上判,刻意不含 vulnclass/name —— 标题里的「源码泄露」
+	// 「source map 可下载」本身就是纯暴露类的命名用词,拿标题判会把垃圾放跑。
+	evidence := strings.ToLower(strings.Join([]string{f.Summary, f.Evidence, f.Report}, "\n"))
+	if containsAny(evidence, agent.InfoExposureExploitMarkers) {
+		return nil
+	}
 	for _, rule := range infoLeakJunkRules {
 		if containsAny(head, rule.keys) {
 			return &db.FindingReview{
@@ -333,17 +380,35 @@ func infoLeakReviewFinding(f *db.DBFinding) *db.FindingReview {
 
 // ruleReviewFinding 是零成本规则层:命中高置信垃圾洞清单返回 ignored,否则 nil 交给
 // LLM。规则只做 ignored,不做 accepted —— 通过必须过模型,免得规则误放。
-func ruleReviewFinding(f *db.DBFinding) *db.FindingReview {
+func ruleReviewFinding(f *db.DBFinding, srcType string) *db.FindingReview {
 	head := strings.ToLower(f.VulnClass + " " + f.Name)
+	// unless 在全文上判:打穿证据通常写在 evidence/summary 里,只看名字会漏。
+	body := strings.ToLower(strings.Join([]string{f.VulnClass, f.Name, f.Summary, f.Evidence, f.Report}, "\n"))
+	edu := db.NormalizeReviewSrcType(srcType) == db.ReviewSrcEduSRC
 	for _, rule := range reviewJunkRules {
+		// 只在 EduSRC 下不收的规则,企业标准直接交给 LLM 判。
+		if rule.eduOnly && !edu {
+			continue
+		}
+		matched := false
 		for _, k := range rule.keys {
 			if strings.Contains(head, k) {
-				return &db.FindingReview{
-					Verdict:  db.ReviewVerdictIgnored,
-					Severity: "low",
-					Reasons:  rule.reason + "(规则层自动判定)",
-				}
+				matched = true
+				break
 			}
+		}
+		if !matched {
+			continue
+		}
+		// 名字像垃圾,但全文里出现了「可能已打穿」的迹象 → 规则不生效,交 LLM 按证据判。
+		// 规则层只做零成本的高置信忽略,不该替模型做需要读证据的判断。
+		if len(rule.unless) > 0 && containsAny(body, rule.unless) {
+			continue
+		}
+		return &db.FindingReview{
+			Verdict:  db.ReviewVerdictIgnored,
+			Severity: "low",
+			Reasons:  rule.reason + "(规则层自动判定)",
 		}
 	}
 	// CORS/跨域误配:SRC 普遍不收录「任意 Origin 反射 + 允许携带凭据」本身。除非证据里
@@ -388,13 +453,11 @@ func corsReviewFinding(f *db.DBFinding) *db.FindingReview {
 	}
 }
 
+// containsAny 委托给 agent 的同一套匹配语义(含短 ASCII 标记的词边界规则),
+// 保证规则层与挖掘期闸门、改判层三处口径完全一致 —— 各写一份必然会漂移。
+// 调用方传入的 hay/keys 已是小写,大小写折叠不影响结果。
 func containsAny(hay string, keys []string) bool {
-	for _, k := range keys {
-		if strings.Contains(hay, k) {
-			return true
-		}
-	}
-	return false
+	return agent.ContainsAnyFold(hay, keys)
 }
 
 // reviewLLMOutput 是审核模型返回的 JSON 结构(契约见 review_prompts.go)。

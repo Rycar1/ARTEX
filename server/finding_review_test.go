@@ -7,17 +7,20 @@ import (
 )
 
 func TestRuleReviewFindingIgnoresJunk(t *testing.T) {
+	// 只列**规则层无条件/带逃逸但本用例无逃逸证据**的垃圾类型。
+	// 注意:短信/邮箱轰炸与 DoS 已按操作者口径改为「算漏洞」,不在此列 ——
+	// 它们的可收录性由 TestBombingAndDoSAreCollectible 覆盖。
 	cases := []struct{ class, name string }{
 		{"XSS", "登录处反射型XSS"},
 		{"信息泄露", "phpinfo 页面"},
 		{"信息泄露", "用户名枚举"},
-		{"DoS", "拒绝服务"},
-		{"其他", "短信轰炸"},
 		{"其他", "钓鱼页面"},
+		{"其他", "self-XSS 需要用户自己粘贴"},
+		{"其他", "图形验证码答案回显"},
 	}
 	for _, c := range cases {
 		f := &db.DBFinding{VulnClass: c.class, Name: c.name}
-		rev := ruleReviewFinding(f)
+		rev := ruleReviewFinding(f, db.ReviewSrcEduSRC)
 		if rev == nil || rev.Verdict != db.ReviewVerdictIgnored {
 			t.Fatalf("%s/%s: 期望规则层 ignored,得到 %+v", c.class, c.name, rev)
 		}
@@ -26,7 +29,7 @@ func TestRuleReviewFindingIgnoresJunk(t *testing.T) {
 
 func TestRuleReviewFindingPassesRealVuln(t *testing.T) {
 	f := &db.DBFinding{VulnClass: "SQL注入", Name: "订单查询接口注入"}
-	if rev := ruleReviewFinding(f); rev != nil {
+	if rev := ruleReviewFinding(f, db.ReviewSrcEduSRC); rev != nil {
 		t.Fatalf("真实漏洞不该被规则层拦截: %+v", rev)
 	}
 }
@@ -123,7 +126,7 @@ func TestCorsReviewFindingIgnoresReflectionWithoutProof(t *testing.T) {
 	}
 	for _, c := range cases {
 		f := &db.DBFinding{VulnClass: c.class, Name: c.name, Evidence: c.evidence}
-		rev := ruleReviewFinding(f)
+		rev := ruleReviewFinding(f, db.ReviewSrcEduSRC)
 		if rev == nil || rev.Verdict != db.ReviewVerdictIgnored {
 			t.Fatalf("%s: 期望规则层 ignored,得到 %+v", c.name, rev)
 		}
@@ -137,7 +140,7 @@ func TestCorsReviewFindingPassesWhenDataTheftProven(t *testing.T) {
 		Name:      "CORS 任意 Origin 反射",
 		Evidence:  "用恶意页面跨域读取到用户手机号与身份证,已窃取到真实敏感数据",
 	}
-	if rev := ruleReviewFinding(f); rev != nil {
+	if rev := ruleReviewFinding(f, db.ReviewSrcEduSRC); rev != nil {
 		t.Fatalf("有真实利用证据的 CORS 不该被规则层拦截: %+v", rev)
 	}
 }

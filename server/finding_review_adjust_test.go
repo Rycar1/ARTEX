@@ -14,29 +14,23 @@ func fptr(v float64) *float64 { return &v }
 func TestPostReviewAdjust(t *testing.T) {
 	s := &Server{}
 
-	// ---- ① 轰炸:LLM 误收、或误判 deepen → 强制 ignored ----
+	// ---- ① 轰炸/DoS:按操作者口径**算漏洞**,改判层不得把它们压成 ignored ----
 	{
-		f := &db.DBFinding{VulnClass: "短信轰炸", Name: "验证码接口无频率限制", Severity: "medium"}
-		rev := &db.FindingReview{Verdict: db.ReviewVerdictAccepted, Severity: "medium", Score: fptr(5)}
-		if !s.postReviewAdjust(f, rev, db.ReviewSrcEduSRC) {
-			t.Fatal("轰炸类应被改判")
-		}
-		if rev.Verdict != db.ReviewVerdictIgnored {
-			t.Fatalf("轰炸类应改判 ignored, got %s", rev.Verdict)
-		}
-		if rev.Score == nil || *rev.Score > 1.5 {
-			t.Fatalf("轰炸类分值应压到 ≤1.5, got %v", rev.Score)
+		for _, f := range []*db.DBFinding{
+			{VulnClass: "短信轰炸", Name: "验证码接口无频率限制可对任意手机号连发", Severity: "medium"},
+			{VulnClass: "邮箱轰炸", Name: "注册邮件发送无频率限制", Severity: "low"},
+			{VulnClass: "拒绝服务", Name: "单请求资源耗尽致服务不可用", Severity: "high"},
+		} {
+			rev := &db.FindingReview{Verdict: db.ReviewVerdictAccepted, Severity: f.Severity, Score: fptr(5)}
+			if s.postReviewAdjust(f, rev, db.ReviewSrcEduSRC) {
+				t.Errorf("%q 已按操作者口径算漏洞,不应被改判", f.Name)
+			}
+			if rev.Verdict != db.ReviewVerdictAccepted {
+				t.Errorf("%q 不应被改判 ignored, got %s", f.Name, rev.Verdict)
+			}
 		}
 	}
-	{
-		// 企业标准下不启用轰炸拦截(企业 SRC 口径不同)。
-		f := &db.DBFinding{VulnClass: "短信轰炸", Name: "验证码接口无频率限制"}
-		rev := &db.FindingReview{Verdict: db.ReviewVerdictAccepted, Score: fptr(5)}
-		if s.postReviewAdjust(f, rev, db.ReviewSrcEnterprise) {
-			t.Fatal("企业标准不应套用 EduSRC 的轰炸拦截")
-		}
-	}
-	// 反向:短信 OTP 明文回显是有效漏洞,不能被轰炸规则误杀。
+	// 反向:短信 OTP 明文回显是有效漏洞,同样不能被误杀。
 	{
 		f := &db.DBFinding{
 			VulnClass: "unauthorized_access", Name: "短信验证码明文回显致任意用户登录",
@@ -44,7 +38,7 @@ func TestPostReviewAdjust(t *testing.T) {
 		}
 		rev := &db.FindingReview{Verdict: db.ReviewVerdictAccepted, Severity: "high", Score: fptr(7)}
 		if s.postReviewAdjust(f, rev, db.ReviewSrcEduSRC) {
-			t.Fatalf("OTP 回显不应被轰炸规则误杀, got %s", rev.Verdict)
+			t.Fatalf("OTP 回显不应被改判, got %s", rev.Verdict)
 		}
 	}
 

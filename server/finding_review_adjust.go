@@ -32,11 +32,13 @@ func parseSelfCheck(raw json.RawMessage) *agent.FindingSelfCheck {
 // 真洞又可能因为「没破坏真实数据」被驳回。模型判完再套一层确定性规则,把这几类
 // 反复出错的边界钉死,比反复调提示词可靠。
 //
-// AutoHunter 有四个这样的函数,这里对应实现:
-//   - maybeRejectEduBombing   —— 轰炸类 LLM 误收 → 强制 ignored
+// AutoHunter 有四个这样的函数,这里对应实现(按操作者口径做过取舍):
 //   - maybeRejectWeakBackdoor —— 图床/CDN 冒充被黑 → 强制 ignored
 //   - maybeAcceptWriteProof   —— 无害写证据齐全却被驳回 → 强制 accepted(反向纠偏)
 //   - maybeDeepenIgnored      —— 有价值的半成品被 ignored → 改判 deepen 并给定向指令
+//
+// 刻意**没有**轰炸/DoS 的强制忽略:操作者口径认为这两类算漏洞(发送接口无频率限制、
+// 资源耗尽本身就是可交付缺陷),该由 LLM 按实际影响定级,而不是代码替它拍死。
 //
 // 纪律:只做「确定性、可解释」的改判,每条都在 notes 里留 [系统改判] 痕迹,绝不
 // 静默改动模型结论。
@@ -48,8 +50,6 @@ func (s *Server) postReviewAdjust(f *db.DBFinding, rev *db.FindingReview, srcTyp
 		return false
 	}
 	switch {
-	case maybeRejectEduBombing(f, rev, srcType):
-		return true
 	case maybeRejectWeakBackdoor(f, rev):
 		return true
 	case maybeAcceptWriteProof(f, rev):
@@ -58,18 +58,6 @@ func (s *Server) postReviewAdjust(f *db.DBFinding, rev *db.FindingReview, srcTyp
 		return true
 	}
 	return false
-}
-
-// maybeRejectEduBombing:EduSRC 不收短信/邮箱轰炸。LLM 误收或误打回深挖时改判 ignored。
-func maybeRejectEduBombing(f *db.DBFinding, rev *db.FindingReview, srcType string) bool {
-	if !isEduSrcType(srcType) || rev.Verdict == db.ReviewVerdictIgnored {
-		return false
-	}
-	if !looksLikeBombing(f) {
-		return false
-	}
-	toIgnored(rev, "EduSRC 不收短信/邮箱轰炸", "轰炸类不属于可收录漏洞,且不得为取证去连发。")
-	return true
 }
 
 // maybeRejectWeakBackdoor:只有图床/CDN/第三方外链的「疑似被黑」改判 ignored。
@@ -194,16 +182,6 @@ func findingFullText(f *db.DBFinding) string {
 	return strings.ToLower(strings.Join([]string{f.VulnClass, f.Name, f.Summary, f.Evidence, f.Report}, "\n"))
 }
 
-func looksLikeBombing(f *db.DBFinding) bool {
-	blob := findingHeadText(f) + "\n" + findingFullText(f)
-	for _, k := range []string{"短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸", "短信炸弹", "sms bomb", "email bomb"} {
-		if strings.Contains(blob, k) {
-			return true
-		}
-	}
-	return false
-}
-
 // looksLikeWeakBackdoor:「疑似被黑」但证据只有外部资源引用,没有页面被攻陷的实锤。
 func looksLikeWeakBackdoor(f *db.DBFinding) bool {
 	head := findingHeadText(f)
@@ -254,10 +232,10 @@ func classifyHarmlessWriteProof(f *db.DBFinding) string {
 // ---------------------------------------------------------------------------
 
 // deepenNeverMarkers 命中即不回炉:这些是明确不收的类型,打了也是白发一轮。
+// 注意:轰炸/DoS 已按操作者口径移出本清单(它们算漏洞,值得回炉补证据)。
 var deepenNeverMarkers = []string{
 	"反射型xss", "反射型 xss", "反射xss", "reflected xss", "self-xss", "self xss",
-	"用户名枚举", "用户枚举", "phpinfo", "拒绝服务", "dos攻击",
-	"短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸",
+	"用户名枚举", "用户枚举", "phpinfo",
 	"非教育", "不在范围", "钓鱼", "中间人", "mitm",
 	"本就公开", "公开展示", "公开接口", "图形验证码", "算术验证码",
 }

@@ -186,15 +186,14 @@ func CheckFindingGate(in FindingGateInput) *GateRejection {
 		return r
 	}
 
-	// ③ 短信/邮箱轰炸(EduSRC 明确不收;不许 worker 为了取证去连发)。
-	if isEduSrc(in.SrcType) && isBombing(head, body) {
-		return &GateRejection{
-			Kind:      GateBombing,
-			Reason:    "这是短信/邮箱轰炸类(发送验证码或通知的接口无频率限制,只能对手机号/邮箱连发)。EduSRC 明确不予收录。",
-			Guidance:  "不要提交,也不要为了取证真去连发。注意区分:若同一接口把**发往手机的短信验证码**明文回显在响应里、并能打通任意用户登录或改密,那才是有效漏洞(按 OTP 回显提交,不要写成轰炸)。",
-			Retriable: false,
-		}
-	}
+	// ③ 短信/邮箱轰炸 —— **可收录**,不再拒收。
+	//
+	// 早期版本按 EduSRC 口径把它当无条件垃圾拦下,后来按操作者口径改为「算漏洞」:
+	// 发送接口无频率限制、可对任意手机号/邮箱连发,本身就是可交付的缺陷(轰炸/骚扰
+	// 风险),该由审核按实际影响定级,而不是在提交口枪毙。
+	//
+	// 唯一保留的是**取证纪律**(不是拒收理由):不得为了取证真去连发。这条由提示词
+	// 承担(见 workerFindingGateBlock),闸门不拦 —— 闸门只判「能不能作为 finding 提交」。
 
 	// ④ 只是图床/CDN 外链就声称「服务器被黑」。
 	if isWeakBackdoor(head, body) {
@@ -259,13 +258,24 @@ func infoExposureGate(head, body, srcType string) *GateRejection {
 	return nil
 }
 
-// infoExposureExploitMarkers 是「已把信息暴露打成实际危害」的正向特征。
+// InfoExposureExploitMarkers 是「已把信息暴露打成实际危害」的正向特征。
 // 命中即放行:此时它不再是纯暴露,而是有利用链的真洞。
-var infoExposureExploitMarkers = []string{
+//
+// 导出给 server 侧审核规则层复用 —— 两边必须同一套口径,否则会出现
+// 「挖掘期闸门放行的洞,被审核规则层又枪毙」这种自相矛盾。
+var InfoExposureExploitMarkers = []string{
 	"窃取到", "窃取成功", "成功读取", "读取到用户", "读取到受害者", "读取到个人信息",
 	"登录成功", "getshell", "命令执行", "拿到凭据", "可用凭证", "接管", "越权",
 	"set-cookie", "伪造签名调通", "实际盗刷", "脱库", "dump",
+	// SSRF / 横向:内网地址被真的用起来了。
+	"ssrf", "未授权访问", "redis", "mysql", "连上", "可达", "打通", "rce",
+	// 敏感文件/数据被真的取到了。刻意不放「源码」「下载」这类词 —— 它们是纯暴露
+	// 类的**标题用词**(如「源码泄露」「source map 可下载」),放在这里会把垃圾放跑。
+	"备份文件", "数据库备份", "backup_", ".sql", ".bak", ".git/config", "身份证号", "密码哈希", "明文密码",
 }
+
+// infoExposureExploitMarkers 是包内别名(与导出名同一份数据)。
+var infoExposureExploitMarkers = InfoExposureExploitMarkers
 
 // weakWriteGate 拦「写/删/改接口只有成功文案 + 零影响」的半成品。
 //
@@ -324,15 +334,6 @@ func hasZeroEffect(body string) bool {
 		}
 	}
 	return false
-}
-
-// isBombing 判断是否短信/邮箱轰炸。
-func isBombing(head, body string) bool {
-	blob := head + "\n" + body
-	return containsAnyFold(blob, []string{
-		"短信轰炸", "邮箱轰炸", "邮件轰炸", "验证码轰炸", "短信炸弹", "sms bomb", "email bomb",
-		"轰炸",
-	})
 }
 
 // isWeakBackdoor 判断"疑似被黑"证据是否只是外链/图床。
@@ -407,11 +408,54 @@ func containsAnyFold(s string, keywords []string) bool {
 	lower := strings.ToLower(s)
 	for _, kw := range keywords {
 		kw = strings.ToLower(strings.TrimSpace(kw))
-		if kw != "" && strings.Contains(lower, kw) {
+		if kw == "" {
+			continue
+		}
+		if containsFoldMarker(lower, kw) {
 			return true
 		}
 	}
 	return false
+}
+
+// containsFoldMarker 判断 lower(已小写) 里是否含标记 kw。
+//
+// 短纯 ASCII 标记要求**词边界**:否则 "rce" 会命中 "sou*rce*"、"del" 会命中
+// "delivery" —— 这类子串误报会让「逃逸条件」凭空触发,把本该拦下的垃圾放跑
+// (真机实测:source map 的 "source" 触发了 rce 逃逸)。中文标记没有词边界概念,
+// 照旧子串匹配。边界只在标记自身以字母数字开头/结尾的那一侧要求。
+func containsFoldMarker(lower, kw string) bool {
+	if len(kw) > 4 || !isASCIIOnly(kw) {
+		return strings.Contains(lower, kw)
+	}
+	startWithAlnum := isASCIIAlnum(kw[0])
+	endWithAlnum := isASCIIAlnum(kw[len(kw)-1])
+	for idx := 0; ; {
+		i := strings.Index(lower[idx:], kw)
+		if i < 0 {
+			return false
+		}
+		i += idx
+		beforeOK := !startWithAlnum || i == 0 || !isASCIIAlnum(lower[i-1])
+		afterOK := !endWithAlnum || i+len(kw) >= len(lower) || !isASCIIAlnum(lower[i+len(kw)])
+		if beforeOK && afterOK {
+			return true
+		}
+		idx = i + 1
+	}
+}
+
+func isASCIIOnly(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlnum(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 // GateToolError 把一次拒收渲染成工具错误的文本(模型直接看到这段)。
