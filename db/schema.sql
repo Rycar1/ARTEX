@@ -1144,6 +1144,13 @@ CREATE TABLE IF NOT EXISTS findings (
     -- scanner_only_no_poc,is_public_interface,info_leak_hits_strict_list}。
     -- 挖掘期闸门据此直接拒收;审核层据此一票否决/核对。空 = 旧数据或未填。
     self_check  JSONB NOT NULL DEFAULT '{}',
+    -- 危害升级(参考 AutoHunter 的「扩大危害 Hunter」):已采纳的低危/中危漏洞会自动
+    -- 派一条「扩大危害」意图再挖一轮。escalated_at 非空 = 已派过(每个漏洞最多一轮);
+    -- escalate_status:''(未派)/dispatched(已派待结果)/done(升级已交回,待复核)/
+    -- failed(打不动,保留原级);base_severity 保存升级前的严重度,升级不成立时回退用。
+    escalated_at    TIMESTAMPTZ,
+    escalate_status TEXT NOT NULL DEFAULT '',
+    base_severity   TEXT NOT NULL DEFAULT '',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
@@ -1159,6 +1166,10 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_notes    TEXT NOT NULL DEFA
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS reviewed_at     TIMESTAMPTZ;
 -- worker 提交前结构化自检(见上方 CREATE 注释);旧库靠这一行补列。
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS self_check     JSONB NOT NULL DEFAULT '{}';
+-- 危害升级(见上方 CREATE 注释);旧库靠这三行补列。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS escalated_at    TIMESTAMPTZ;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS escalate_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS base_severity   TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_findings_review ON findings(review_verdict, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);

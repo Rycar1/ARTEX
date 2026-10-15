@@ -350,6 +350,13 @@ type FindingDTO struct {
 	MergedInto        string   `json:"merged_into,omitempty"`
 	SuspectedDupOf    string   `json:"suspected_dup_of,omitempty"`
 	SuspectedDupScore *float64 `json:"suspected_dup_score,omitempty"`
+
+	// 危害升级(见 server/finding_escalate.go)。已采纳的低危/中危漏洞会自动派一条
+	// 「扩大危害」意图;escalate_status 取值 dispatched/done/failed,base_severity 是
+	// 升级前的级别(升级不成立时回退用)。
+	EscalatedAt    string `json:"escalated_at,omitempty"`
+	EscalateStatus string `json:"escalate_status,omitempty"`
+	BaseSeverity   string `json:"base_severity,omitempty"`
 }
 
 // FindingAssetDTO is one asset a finding is anchored to, pre-labelled for display.
@@ -495,6 +502,11 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		d.SuspectedDupOf = i64s(*f.SuspectedDupOf)
 	}
 	d.SuspectedDupScore = f.SuspectedDupScore
+	d.EscalateStatus = f.EscalateStatus
+	d.BaseSeverity = f.BaseSeverity
+	if f.EscalatedAt != nil {
+		d.EscalatedAt = f.EscalatedAt.UTC().Format(time.RFC3339)
+	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
 		d.TaskID = i64s(*f.TaskID)

@@ -732,7 +732,7 @@ func splitLines(s string) []string {
 
 // WorkerTools returns the tool set for a work agent.
 func (t *ToolSet) WorkerTools() []actool.CoreTool {
-	return []actool.CoreTool{
+	tools := []actool.CoreTool{
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
 		t.addFinding(), t.recordFact(),
@@ -747,6 +747,12 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// worker 只做单条意图的执行与写回）：list_facts / node_detail / list_companies /
 		// 跨 work 检索 search_all_worker_traces / list_worker_traces / get_worker_trace。
 	}
+	// report_escalation 只在「扩大危害」意图下挂载：普通探索/回炉任务不该有"写回原漏洞
+	// 并抬升严重度"的能力(那会绕过正常上报与审核)。见 agent/finding_escalate.go。
+	if t.escalation && t.escalateFinding != nil {
+		tools = append(tools, t.addEscalation())
+	}
+	return tools
 }
 
 // MainAgentTools returns the human-interface tool set.

@@ -535,6 +535,12 @@ export interface Finding {
   merged_into?: string;
   suspected_dup_of?: string;
   suspected_dup_score?: number;
+  // 危害升级(见 server/finding_escalate.go):已采纳的低危/中危漏洞会自动派一条
+  // 「扩大危害」意图再挖一轮。dispatched=已派/待结果;done=升级已交回待复核;
+  // failed=打不动,已保留原级。base_severity 是升级前的级别。
+  escalated_at?: string;
+  escalate_status?: "dispatched" | "done" | "failed" | "";
+  base_severity?: Severity | "";
   ts: string;
 }
 

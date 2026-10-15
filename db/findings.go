@@ -42,6 +42,12 @@ type DBFinding struct {
 	// SelfCheck 是 worker 提交前的结构化自检(原样保存的 JSON;空 = 未填)。
 	// 挖掘期闸门据此拒收,二次审核据此一票否决/核对。见 agent/finding_selfcheck.go。
 	SelfCheck json.RawMessage
+	// 危害升级(见 server/finding_escalate.go)。EscalatedAt 非空 = 已派过升级意图
+	// (每个漏洞最多一轮);EscalateStatus 取值见 Escalate* 常量;BaseSeverity 是升级
+	// 前的严重度,升级不成立时回退用。
+	EscalatedAt    *time.Time
+	EscalateStatus string
+	BaseSeverity   string
 	// 去重(四层方案,见 db/finding_dedup.go / db/finding_merge.go):
 	DedupKey          string   // 结构化合并键(归一化类别 + 主资产/弱锚)
 	Fingerprint       string   // 归一化正文 SHA-1
@@ -130,7 +136,8 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       COALESCE(f.review_verdict,''), COALESCE(f.review_severity,''), f.review_score,
 	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at,
 	       COALESCE(f.dedup_key,''), COALESCE(f.fingerprint,''), f.merged_into,
-	       f.suspected_dup_of, f.suspected_dup_score, COALESCE(f.self_check, '{}'::jsonb)`
+	       f.suspected_dup_of, f.suspected_dup_score, COALESCE(f.self_check, '{}'::jsonb),
+	       f.escalated_at, COALESCE(f.escalate_status,''), COALESCE(f.base_severity,'')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -145,7 +152,7 @@ func scanFindings(rows interface {
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
-			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore, &f.SelfCheck); err != nil {
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore, &f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -411,6 +418,12 @@ var ErrFindingOriginUnavailable = errors.New("finding origin is no longer availa
 // The returned activity is the committed row and can be broadcast as-is without
 // calling AppendActivity again.
 func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int64, description string, audit Activity) (int64, Activity, error) {
+	return s.AddFindingFollowUpIntentEx(findingID, findingNodeID, description, nil, audit)
+}
+
+// AddFindingFollowUpIntentEx 同 AddFindingFollowUpIntent,但允许往意图 payload 里追加
+// 字段 —— 用于标记这条意图的性质(如 {"escalate":true} 表示「扩大危害」任务)。
+func (s *ExplorationStore) AddFindingFollowUpIntentEx(findingID, findingNodeID int64, description string, extra map[string]any, audit Activity) (int64, Activity, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, Activity{}, err
@@ -459,6 +472,11 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
+	}
+	// extra 让调用方标记这条意图的性质(如 {"escalate":true} 表示「扩大危害」),
+	// worker 侧据此挂载升级手册与 report_escalation 工具。
+	for k, v := range extra {
+		payload[k] = v
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -553,7 +571,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
 			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
-			&f.SelfCheck, &f.Report); err != nil {
+			&f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -684,7 +702,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
 		&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
 		&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
-		&f.SelfCheck, &f.Report)
+		&f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -220,6 +220,16 @@ function FindingDetailInner() {
                         <span>价值分：{finding.review_score.toFixed(1)}</span>
                       ) : null}
                       {finding.reviewed_at ? <span>审核时间：{fmtTime(finding.reviewed_at)}</span> : null}
+                      {finding.escalate_status ? (
+                        <span>
+                          危害升级：
+                          {finding.escalate_status === "dispatched"
+                            ? "已派「扩大危害」任务"
+                            : finding.escalate_status === "done"
+                              ? `升级已交回待复核${finding.base_severity ? `（原 ${statusMeta("severity", finding.base_severity).label}）` : ""}`
+                              : "升级未成立，保留原级"}
+                        </span>
+                      ) : null}
                     </div>
                     {finding.review_reasons ? (
                       <div>

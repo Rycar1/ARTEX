@@ -83,6 +83,9 @@ type Worker struct {
 	// so the digging-time submission gate enables the right checks(例如短信/邮箱轰炸
 	// 只在 EduSRC 标准下拒收)。nil = edusrc(更严)。
 	findingSrcFn func(taskID int64) string
+	// escalateFinding 写回一次「扩大危害」的结果(server 侧接线)。nil = 该能力不可用,
+	// 扩大危害意图下不会挂载 report_escalation 工具。见 agent/finding_escalate.go。
+	escalateFinding EscalationWriter
 	// nonStreamingFn resolves whether this run uses the non-streaming (Complete)
 	// path. Read per run so a profile/task toggle takes effect without rebuilding
 	// the agent. nil = streaming (default).
@@ -179,6 +182,27 @@ func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn 
 // (edusrc | enterprise), used by the digging-time finding gate. Read per run so a
 // task's standard takes effect without rebuilding the worker. nil = edusrc.
 func (w *Worker) SetFindingSrcTypeResolver(fn func(taskID int64) string) { w.findingSrcFn = fn }
+
+// SetEscalationWriter wires the 「扩大危害」result writer. When set, an intent whose
+// payload carries escalate=true gets the report_escalation tool (see IntentIsEscalation).
+func (w *Worker) SetEscalationWriter(fn EscalationWriter) {
+	w.escalateFinding = fn
+}
+
+// IntentIsEscalation reports whether an intent is an 「扩大危害」task — payload 里
+// escalate=true 是 server 侧派单时打的标记(见 server/finding_escalate.go)。
+func IntentIsEscalation(intent *db.Node) bool {
+	if intent == nil || len(intent.Payload) == 0 {
+		return false
+	}
+	var p struct {
+		Escalate bool `json:"escalate"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil {
+		return false
+	}
+	return p.Escalate
+}
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
@@ -481,6 +505,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetTaskID(taskID)
 	if w.findingSrcFn != nil {
 		tsx.SetFindingSrcType(w.findingSrcFn(taskID))
+	}
+	// 「扩大危害」意图额外挂 report_escalation(写回原漏洞 + 抬升严重度 + 送回复核)。
+	if w.escalateFinding != nil && IntentIsEscalation(intent) {
+		tsx.SetEscalation(w.escalateFinding)
 	}
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)

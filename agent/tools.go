@@ -62,6 +62,12 @@ type ToolSet struct {
 	// findingSrc 是任务的 SRC 收录标准(edusrc|enterprise),决定挖掘期提交闸门
 	// 启用哪些检查(见 SetFindingSrcType / finding_gate.go)。空 = edusrc。
 	findingSrc string
+	// escalateFinding 写回一次「扩大危害」的结果(见 server 侧实现)。nil = 未接入,
+	// report_escalation 报告不可用。只在「扩大危害」意图下注册该工具。
+	escalateFinding func(ctx context.Context, r EscalationResult) error
+	// escalation 标记本次 worker 领到的是「扩大危害」意图(而非普通探索/回炉),
+	// 决定是否把 report_escalation 挂进工具面。
+	escalation bool
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -166,6 +172,16 @@ func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
 // digging-time finding gate (agent/finding_gate.go) can enable the right checks —
 // e.g. 短信/邮箱轰炸 只在 EduSRC 标准下拒收。空 = 按 edusrc(更严)。
 func (t *ToolSet) SetFindingSrcType(src string) { t.findingSrc = src }
+
+// SetEscalation wires the escalation result writer and marks this run as an
+// 「扩大危害」task, which adds report_escalation to the tool surface. nil fn = 不挂该工具。
+func (t *ToolSet) SetEscalation(fn func(ctx context.Context, r EscalationResult) error) {
+	t.escalateFinding = fn
+	t.escalation = fn != nil
+}
+
+// Escalation reports whether this run is an 扩大危害 task.
+func (t *ToolSet) Escalation() bool { return t.escalation }
 
 // findingSrcType returns the configured 收录标准,默认 edusrc。
 func (t *ToolSet) findingSrcType() string {
@@ -1542,6 +1558,63 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 }
 
 // --- worker write tools ---
+
+// addEscalation 是「扩大危害」任务的交付工具(见 agent/finding_escalate.go 的手册)。
+// 与 report_finding 的区别:升级是**写回原漏洞**(追加证据链 + 抬升严重度 + 送回复核),
+// 而不是新建一条 —— 新建会造成同一漏洞重复计数。
+func (t *ToolSet) addEscalation() actool.CoreTool {
+	return writeTool("report_escalation",
+		"交付一次「扩大危害」的结果:把新增证据链写回原漏洞并抬升严重度(success=true),或报告打不动(success=false,系统保留原级)。只在执行扩大危害任务时使用,不要用它新建漏洞。",
+		obj(map[string]any{
+			"finding_id": idp("被升级的原漏洞 id(意图里给出)"),
+			"success":    boolean("是否打出了原漏洞未证明的新实锤危害;false = 原地打转,保留原级"),
+			"severity":   str("升级后的严重度 critical|high|medium|low(success=true 时必填,且应高于原级)"),
+			"evidence":   str("新增的完整证据链:原始请求+响应 / 命令回显 / 旁路回读;必须能独立支撑新等级"),
+			"summary":    str("一句话说清「从什么升级到什么」;success=false 时写清试过哪些手段、为何打不动"),
+		}, "finding_id", "success", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				FindingID json.RawMessage `json:"finding_id"`
+				Success   *bool           `json:"success"`
+				Severity  string          `json:"severity"`
+				Evidence  string          `json:"evidence"`
+				Summary   string          `json:"summary"`
+			}
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if t.ts == nil {
+				return actool.Errorf("report_escalation 需要任务上下文"), nil
+			}
+			fid := pid(a.FindingID)
+			if fid <= 0 {
+				return actool.Errorf("finding_id 必填且必须是被升级的原漏洞 id"), nil
+			}
+			if a.Success == nil {
+				return actool.Errorf("success 必填:true=打出新危害,false=打不动(保留原级)"), nil
+			}
+			if t.escalateFinding == nil {
+				return actool.Errorf("危害升级未接入:当前会话不支持写回原漏洞"), nil
+			}
+			ok := *a.Success
+			if ok && strings.TrimSpace(a.Severity) == "" {
+				return actool.Errorf("success=true 时 severity 必填(critical|high|medium|low)"), nil
+			}
+			if ok && strings.TrimSpace(a.Evidence) == "" {
+				return actool.Errorf("success=true 时 evidence 必填:升级必须带新增的完整证据链,不能只给结论"), nil
+			}
+			note := strings.TrimSpace(a.Summary)
+			if err := t.escalateFinding(ctx, EscalationResult{
+				TaskID: t.taskID, FindingID: fid, Success: ok,
+				Severity: strings.TrimSpace(a.Severity), Evidence: a.Evidence, Summary: note,
+			}); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !ok {
+				return actool.Text("已记录「升级未成立」:原漏洞级别与采纳结论保持不变(不会被降级或忽略)。可以继续打其它方向,或结束本次升级。"), nil
+			}
+			return actool.Text(fmt.Sprintf("升级结果已写回原漏洞 #%d:严重度 → %s,证据链已追加,并已重新送交审核复核。请勿再用 report_finding 新建同一漏洞。", fid, strings.TrimSpace(a.Severity))), nil
+		})
+}
 
 func (t *ToolSet) addFinding() actool.CoreTool {
 	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。提交前必须如实填 self_check；明显属于忽略清单的提交会被系统拒收并说明原因，线索请改用 record_fact 记为 inferred。", obj(map[string]any{

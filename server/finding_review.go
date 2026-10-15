@@ -224,7 +224,7 @@ func (s *Server) reviewFindingOnce(ctx context.Context, f *db.DBFinding) (*db.Fi
 }
 
 // applyFindingReview 落库一条审核结论:先过确定性改判层,再写 review_* 列;
-// ignored 改状态(带推送),deepen 自动建回炉意图。
+// ignored 改状态(带推送),deepen 自动建回炉意图,accepted 的低危/中危自动派升级。
 func (s *Server) applyFindingReview(ctx context.Context, f *db.DBFinding, rev db.FindingReview) error {
 	if f == nil {
 		return fmt.Errorf("finding 不存在")
@@ -234,6 +234,28 @@ func (s *Server) applyFindingReview(ctx context.Context, f *db.DBFinding, rev db
 	// 半成品从 ignored 改判 deepen。改判痕迹写在 notes 的 [系统改判] 里。
 	if s.postReviewAdjust(f, &rev, s.m.pg.ReviewSrcType(*f.TaskID)) {
 		log.Printf("[review] finding=%d 审核结论被系统改判为 %s", f.ID, rev.Verdict)
+	}
+	// 升级后的复核保护:**不能因为复核判 ignored 就把已采纳的漏洞降级/忽略**。
+	// 升级失败只说明「没打得更大」,不说明「原漏洞不成立」—— 保留原级与原采纳结论。
+	if f.EscalateStatus == db.EscalateDone && rev.Verdict == db.ReviewVerdictIgnored {
+		keep := f.BaseSeverity
+		if keep == "" {
+			keep = f.ReviewSeverity
+		}
+		if keep == "" {
+			keep = f.Severity
+		}
+		rev.Verdict = db.ReviewVerdictAccepted
+		rev.Severity = keep
+		rev.Reasons = ""
+		rev.Notes = strings.TrimSpace(rev.Notes) +
+			"\n[系统] 升级复核未通过,保留升级前的严重度与采纳结论(升级不成立≠原漏洞不成立)。"
+		// review_severity 只是审核列,漏洞自身的 severity 才是展示/统计口径 ——
+		// 升级时抬过的那一档要一起回退,否则列表里仍显示 critical。
+		if err := s.m.pg.RevertFindingSeverity(f.ID); err != nil {
+			log.Printf("[review] finding=%d 回退严重度失败: %v", f.ID, err)
+		}
+		log.Printf("[review] finding=%d 升级复核未通过,保留原级 %s", f.ID, keep)
 	}
 	if err := s.m.pg.SetFindingReview(f.ID, rev); err != nil {
 		return err
@@ -255,6 +277,10 @@ func (s *Server) applyFindingReview(ctx context.Context, f *db.DBFinding, rev db
 	case db.ReviewVerdictDeepen:
 		// 不是终态:不改 status,改为自动建一条高优先级回炉意图,唤醒任务继续补链。
 		s.autoDeepenFinding(ctx, f, &rev)
+	case db.ReviewVerdictAccepted:
+		// 低危/中危已采纳 → 自动派「扩大危害」意图再挖一轮(每个漏洞最多一轮,
+		// 剩余预算不足或已派过则跳过)。见 server/finding_escalate.go。
+		s.autoEscalateFinding(ctx, f, &rev)
 	}
 	return nil
 }
