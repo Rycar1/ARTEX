@@ -111,10 +111,26 @@ func main() {
 	}
 	defer pg.Close()
 
-	prov, err := (agent.Config{Format: llm.FormatOpenAI, BaseURL: base, APIKey: key, Model: model, Proxy: proxy}).NewProvider()
+	// 与生产裁判路径保持一致:profile 上的自定义会话头 / 会话体字段必须一起带上。
+	// 否则会复现「生产已修、探针仍失败」的假象 —— 实测某中转按请求长度把缺
+	// conversation id 的请求路由到严格通道,直接返回 upstream 400 code 11-128。
+	sessionHeader, sessionBody := "", ""
+	if p, err := pg.ActiveProfile(); err == nil && p != nil {
+		sessionHeader, sessionBody = p.SessionHeaderKey, p.SessionBodyField
+	}
+	if v := getenv("ARTEX_JUDGE_SESSION_HEADER_KEY", ""); v != "" {
+		sessionHeader = v
+	}
+	if v := getenv("ARTEX_JUDGE_SESSION_BODY_FIELD", ""); v != "" {
+		sessionBody = v
+	}
+
+	prov, err := (agent.Config{Format: llm.FormatOpenAI, BaseURL: base, APIKey: key, Model: model, Proxy: proxy,
+		SessionHeaderKey: sessionHeader, SessionBodyField: sessionBody}).NewProvider()
 	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("session_header_key=%q session_body_field=%q\n", sessionHeader, sessionBody)
 
 	ic := intercept.New(pg)
 	// Force the judge ON for this probe regardless of stored settings.

@@ -136,6 +136,9 @@ type Interceptor struct {
 	// policy 是拦截策略缓存(规则模式 + 裁判是否启用);nil 表示未加载。
 	// 见 reviewPolicy()。
 	policy *reviewPolicy
+	// 裁判熔断状态(见 judgeBreakerTripped):连续失败次数 + 熔断截止时间。
+	judgeFailStreak int
+	judgeOpenUntil  time.Time
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -633,6 +636,10 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	// Every verdict out of Judge() is a model decision (including the model-failure
 	// fallback), so the history row is attributed to the judge, not "unknown".
 	out.Source = "model"
+	// 熔断记账:ModelFallback 覆盖「上游报错」与「输出无法解析」两种失败。连续失败到
+	// 阈值即熔断,让 Review 改走规则兜底 —— 否则 judge_only 模式下每一次工具调用都会
+	// 按 fail_action(deny)被拦掉,把整条任务链冻死在平台侧的上游故障上。
+	i.noteJudgeOutcome(out.ModelFallback)
 	return out, true
 }
 
@@ -739,11 +746,18 @@ func matchSubjects(raw string) ([]string, map[string]string) {
 //     the rule table is skipped entirely (rules stay in the DB, so switching
 //     back restores them).
 //
+// 裁判熔断(见 judgeBreakerTripped)打开时,模型失败不再按 fail_action 落地:
+//   - rules 模式:当作「没有判定层」返回 decided=false,交回调用方既有的 fail-open 兜底;
+//   - judge_only 模式:降级为规则兜底 —— 命中规则照拦,未命中放行(不再冻住任务)。
+//
 // decided=false means no decision layer produced a verdict (rules matched
 // nothing and no judge is wired). Callers keep their own fail-closed fallback.
 func (i *Interceptor) Review(ctx context.Context, toolName string, input []byte) (Decision, bool) {
 	if i.reviewPolicy().mode == RuleModeJudgeOnly {
 		if dec, judged := i.Judge(ctx, toolName, input); judged {
+			if dec.ModelFallback && i.judgeBreakerTripped() {
+				return i.rulesFallbackDecision(toolName, input), true
+			}
 			return dec, true
 		}
 		// 纯模型审核模式下裁判不可用 = 平台没有任何判定层。fail-closed 转人工:
@@ -758,12 +772,85 @@ func (i *Interceptor) Review(ctx context.Context, toolName string, input []byte)
 	if dec, matched := i.Match(toolName, input); matched {
 		return dec, true
 	}
-	return i.Judge(ctx, toolName, input)
+	dec, judged := i.Judge(ctx, toolName, input)
+	if judged && dec.ModelFallback && i.judgeBreakerTripped() {
+		// 规则模式下未命中任何规则、裁判又熔断 —— 按「无判定层」处理(与裁判未接线
+		// 时的历史行为一致:guard 侧只对强编码特征做 fail-closed 转人工)。
+		log.Printf("[intercept] 裁判熔断中,%s 未命中规则且裁判不可用,按无判定层放行", toolName)
+		return Decision{}, false
+	}
+	return dec, judged
+}
+
+// rulesFallbackDecision 是 judge_only 模式下裁判熔断后的降级判定:规则表照常评估,
+// 命中即用规则结论;未命中则显式放行(带 JudgeBreakerHint 文案,历史页可筛选追溯)。
+// 出口审查 / RoE 范围检查是 guard 里独立的前置层,不经过这里,因此硬边界不受影响。
+func (i *Interceptor) rulesFallbackDecision(toolName string, input []byte) Decision {
+	if dec, matched := i.Match(toolName, input); matched {
+		dec.Message = strings.TrimSpace(dec.Message + "（裁判熔断降级中:本次由规则判定）")
+		return dec
+	}
+	return Decision{
+		RuleName: "[内置] 裁判熔断降级",
+		Action:   "allow",
+		Message:  JudgeBreakerHint,
+		Source:   "builtin",
+	}
 }
 
 // JudgeUnavailableHint 是「纯模型审核模式已开启但裁判模型不可用」时给人工的提示。
 const JudgeUnavailableHint = "平台已切换为纯模型审核(拦截规则不参与判定),但裁判模型当前不可用(未启用 / 未配置 / 调用失败)。" +
 	"此时没有任何判定层能给出结论,按 fail-closed 转人工。请到 系统 → 拦截审批 → 模型配置 启用裁判模型,或把审核模式切回「规则 + 模型」。"
+
+// JudgeBreakerHint 是「裁判连续失败触发熔断降级」时写入历史的原因文案。
+const JudgeBreakerHint = "[内置] 裁判熔断降级:裁判模型连续调用失败,平台在冷却期内改按「规则兜底」判定 —— " +
+	"命中拦截规则照常拦截,未命中的调用直接放行(出口审查 / RoE 范围检查等硬边界不受影响)。" +
+	"冷却结束后平台会自动重试裁判;若持续出现请检查裁判模型配置与上游可用性。"
+
+// 裁判熔断参数:连续 judgeBreakerFailures 次模型失败(上游错误 / 无法解析)即熔断,
+// 冷却 judgeBreakerCooldown;冷却结束自动半开(下一次调用重新交给裁判,成功即恢复)。
+// 取 5 次是为了不把偶发抖动当成故障,5 分钟是为了让上游恢复后能自动回来。
+const (
+	judgeBreakerFailures = 5
+	judgeBreakerCooldown = 5 * time.Minute
+)
+
+// noteJudgeOutcome 记录一次裁判调用的结果,维护熔断状态。失败计数按「连续」语义:
+// 任何一次成功都清零,避免长期低频失败把熔断器慢慢推到阈值。
+func (i *Interceptor) noteJudgeOutcome(failed bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !failed {
+		i.judgeFailStreak = 0
+		i.judgeOpenUntil = time.Time{}
+		return
+	}
+	i.judgeFailStreak++
+	if i.judgeFailStreak >= judgeBreakerFailures && time.Now().After(i.judgeOpenUntil) {
+		i.judgeOpenUntil = time.Now().Add(judgeBreakerCooldown)
+		log.Printf("[intercept] 裁判熔断:连续 %d 次模型失败,冷却 %s 内改按规则兜底(命中规则照拦,未命中放行)",
+			i.judgeFailStreak, judgeBreakerCooldown)
+	}
+}
+
+// judgeBreakerTripped 报告裁判熔断是否处于打开状态。冷却结束后自动关闭(半开):
+// 下一次调用仍会交给裁判,由 noteJudgeOutcome 决定恢复还是重新熔断。
+func (i *Interceptor) judgeBreakerTripped() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return !i.judgeOpenUntil.IsZero() && time.Now().Before(i.judgeOpenUntil)
+}
+
+// JudgeBreakerState 供运维页/日志查询熔断状态:是否打开、连续失败次数、剩余冷却秒数。
+func (i *Interceptor) JudgeBreakerState() (open bool, failStreak int, cooldownLeft time.Duration) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	open = !i.judgeOpenUntil.IsZero() && time.Now().Before(i.judgeOpenUntil)
+	if open {
+		cooldownLeft = time.Until(i.judgeOpenUntil)
+	}
+	return open, i.judgeFailStreak, cooldownLeft
+}
 
 // decisionForRule builds the Decision for a matched rule. kind is the encoding
 // that had to be decoded before the rule matched ("" when the raw input matched),

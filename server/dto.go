@@ -64,6 +64,10 @@ type TaskDTO struct {
 	ReviewEnabled      bool               `json:"review_enabled"`   // 二次审核开关(创建时定,默认关)
 	OpMode             string             `json:"op_mode"`          // 作战模式:standard(默认) | aggressive(激进)
 	ReviewSrcType      string             `json:"review_src_type"`  // 审核标准:edusrc | enterprise
+	// LaunchRefused=true 表示任务建好了但平台拒绝启动(无靶机拒跑),原因见
+	// LaunchRefusedReason。仅建任务响应会带上,列表/详情恒为 false。
+	LaunchRefused       bool   `json:"launch_refused,omitempty"`
+	LaunchRefusedReason string `json:"launch_refused_reason,omitempty"`
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -663,6 +667,9 @@ type LLMProfileDTO struct {
 	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
 	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
 	SessionHeaderKey string `json:"session_header_key"`
+	// 自定义会话体字段名：非空时在每次请求的 JSON 体里注入该字段，值=当前会话/意图的
+	// session id。''=不注入。用于「请求体缺 conversation id 就 400」的网关。
+	SessionBodyField string `json:"session_body_field"`
 	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
@@ -690,6 +697,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		SessionBodyField: p.SessionBodyField,
 		Retry:            p.Retry,
 	}
 }

@@ -36,6 +36,7 @@ type Guard struct {
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
 	roe         RoEConfig              // optional; Scope==nil disables the RoE check
+	isolation   IsolationConfig        // optional; DataRoot==nil disables the per-task data isolation check
 	egress      *EgressGuard           // optional; 批 5 B2 出口审查(敏感指纹拦截),nil 关闭
 	tarpit      *tarpitState           // optional; 批 5 B3 tarpit 熔断,nil 关闭
 }
@@ -86,6 +87,12 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		return res
 	}
 	g.record(ev.ToolName, "allow", "", cmd)
+	// 跨任务数据隔离:worker 与平台同容器同权限,共享数据根下的兄弟任务目录
+	// (/app/data/tasks/<其它 id>、transcripts、drafts)必须拦掉 —— 实测正是这条通路
+	// 让一个没拿到靶机的任务从兄弟任务里翻出平台宿主 IP。先于 RoE/拦截规则。
+	if res, stop := g.checkIsolation(ctx, ev, cmd); stop {
+		return res
+	}
 	// RoE 授权范围检查(F5):Bash/HTTP 类工具的交互目标与 task_scope 比对,
 	// 先于用户拦截规则;Out+strict 走 ask,Out+warn 只记审计。
 	if res, stop := g.checkRoE(ctx, ev, cmd); stop {

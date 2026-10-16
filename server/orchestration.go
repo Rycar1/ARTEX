@@ -331,7 +331,10 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			// 共享的建后流程,与 HTTP 建任务(server.go createTask)复用同一段 launchTask:
 			// seed + 后台可见地做目标分解(第0轮/LLM步骤/逐条goal) + engine.Run。
 			// seed_first_intent 默认 false(标准先规划再执行);简单任务可开启直接下发一 work 测试。
-			s.launchTask(t, a.Description+" "+a.Goal, a.SeedFirstIntent)
+			// 被「无靶机拒跑」拦下时把原因回给 planner —— 否则它以为子任务已经在跑。
+			if started, why := s.launchTask(t, a.Description+" "+a.Goal, a.SeedFirstIntent); !started {
+				return actool.Text(fmt.Sprintf("task created: %s（未启动:%s）", t.ID, why)), nil
+			}
 			return actool.Text(fmt.Sprintf("task created: %s", t.ID)), nil
 		})
 }

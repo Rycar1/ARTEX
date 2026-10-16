@@ -6,6 +6,7 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -135,7 +136,9 @@ func (s *Server) sessionHandoff(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.launchTask(t, desc+" "+goal, false)
+	if started, why := s.launchTask(t, desc+" "+goal, false); !started {
+		log.Printf("[handoff] 子任务 %s 未启动: %s", t.ID, why)
+	}
 	s.auditIntranet(r, "handoff session=%d host=%s → task=%s(来源任务 %s)", rec.ID, hostIP, t.ID, srcTask.ID)
 	writeJSON(w, 200, map[string]any{"task_id": t.ID})
 }

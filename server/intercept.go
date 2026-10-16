@@ -21,6 +21,7 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 // judgeWorkerLane is the usage-ledger "worker" label for intercept fallback-judge
@@ -44,8 +45,21 @@ const settingRoEEnforcement = "roe_enforcement"
 func (s *Server) agentGuard() *guard.Guard {
 	g := guard.NewWithInterceptor(s.m.interceptor)
 	g.SetRoE(newRoEConfig(s.m.pg))
-	g.SetEgress(s.m.egress) // 批 5 B2 出口审查:chat/planner/mainagent 同样过敏感指纹拦截
+	g.SetIsolation(newIsolationConfig(s.m.dir)) // 跨任务数据隔离:禁止读兄弟任务的 tasks/transcripts/drafts
+	g.SetEgress(s.m.egress)                     // 批 5 B2 出口审查:chat/planner/mainagent 同样过敏感指纹拦截
 	return g
+}
+
+// newIsolationConfig wires the guard's per-task data isolation check against the
+// server's data root. taskID comes from the same run attribution as RoE, so a
+// non-task run (chat) is skipped by the check itself.
+func newIsolationConfig(dataDir string) guard.IsolationConfig {
+	return guard.IsolationConfig{
+		DataRoot: func() string { return dataDir },
+		TaskIDOf: func(ctx context.Context) int64 {
+			return agent.RunInfoFrom(ctx).TaskID
+		},
+	}
 }
 
 // newRoEConfig builds the guard RoE wiring backed by pg: mode from the
@@ -116,6 +130,13 @@ func (s *Server) wireInterceptReviewer() {
 		// Tag this call's usage as the "judge" lane so the config page can report
 		// how much the fallback approval has spent, separate from model profiles.
 		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
+		// 裁判走的是 provider 的裸 Stream 路径:tool hook 的 ctx 通常已带 worker/planner
+		// 的 session id(transcript.WithSessionID),但目标拆解 / 压缩等一次性调用没有。
+		// 某些网关(profile 的 session_header_key / session_body_field 机制)缺少会话
+		// 标识会直接 400,所以这里兜底补一个一次性 id。
+		if transcript.SessionIDFrom(ctx) == "" {
+			ctx = transcript.WithSessionID(ctx, "judge-"+transcript.NewSessionID())
+		}
 		dec, err := judgeWithRetry(ctx, prov, profileID, prompt, input, s.m.interceptor.GetJudgeConfig().RetryAttempts)
 		if err == nil {
 			return dec, nil
