@@ -3578,6 +3578,8 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
+		// 「停滞顾问」开关(默认开)。engine 每 run 读,改完即时生效。
+		"stuck_adviser_enabled": s.m.pg.GetBool(settingStuckAdviser, true),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
 		// 这里只放「作用于全部渠道」的三项。
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
@@ -3650,6 +3652,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
 		// 实验功能:noa 上下文压缩开关(默认关);每 run 读,对之后启动的 run 生效,无需重建 agent。
 		NoaCompaction *bool `json:"noa_compaction"`
+		// 「停滞顾问」开关(默认开):worker 被判信息梯度为零时,除固定转向纪律外再唤起
+		// 一次带全局上下文的顾问调用,把「停止同轴重试」升级成「具体换到哪去」。
+		// 每 run 读,即时生效;关掉只省 token,判据与注入路径不变。
+		StuckAdviser *bool `json:"stuck_adviser_enabled"`
 		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
 		// 不需要重建 agent 或重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
@@ -3675,6 +3681,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.NoaCompaction != nil {
 		// 每 run 读的解析器,切换即时对之后启动的 run 生效,无需 applyLLM 重建。
 		if err := s.m.SetNoaCompaction(*req.NoaCompaction); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.StuckAdviser != nil {
+		// 停滞顾问:engine 每 run 读一次,切换即时生效。
+		if err := s.m.pg.SetBool(settingStuckAdviser, *req.StuckAdviser); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

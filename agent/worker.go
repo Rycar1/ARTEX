@@ -176,6 +176,10 @@ func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn 
 
 // SetEscalationWriter wires the 「扩大危害」result writer. When set, an intent whose
 // payload carries escalate=true gets the report_escalation tool (see IntentIsEscalation).
+// Provider returns the LLM provider this worker runs on. Side calls (the stuck
+// adviser) use it so they inherit the same task chain and failover as the run.
+func (w *Worker) Provider() llm.Provider { return w.prov }
+
 func (w *Worker) SetEscalationWriter(fn EscalationWriter) {
 	w.escalateFinding = fn
 }

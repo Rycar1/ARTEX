@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -562,8 +563,9 @@ type steerHooks struct {
 	// 意图的触发额度(冷却/上限)跨重跑共享,重跑一轮不清零。nil = 关闭。
 	det *agent.StuckDetector
 	// onStuck 在检测器触发时回调(engine 接线:写 system activity + hint 挂探索图,
-	// 让 planner 感知)。nil = 只注入、不留痕。
-	onStuck func(ev *agent.StuckEvent)
+	// 让 planner 感知;并唤起「停滞顾问」把固定纪律升级成具体转向建议)。
+	// ctx 来自 PostToolUse,顾问调用受它约束(可被 kill_work / 暂停取消)。
+	onStuck func(ctx context.Context, ev *agent.StuckEvent)
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -636,7 +638,7 @@ func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result 
 		if ev := h.det.Observe(name, string(result), isErr); ev != nil {
 			log.Printf("[work %s] 停滞检测触发(%s,连续 %d 次,签名 %s,第 %d 次)", h.label, ev.Kind, ev.Count, ev.Signature, ev.N)
 			if h.onStuck != nil {
-				h.onStuck(ev)
+				h.onStuck(ctx, ev)
 			}
 		}
 	}
@@ -1069,6 +1071,33 @@ func (e *Engine) budgetRetryLimit() int {
 	return n
 }
 
+// settingStuckAdviser 是「停滞顾问」的开关(默认开)。关掉后退回原来的固定转向纪律,
+// 不再产生额外的顾问调用(省 token);触发判据与注入路径完全不变。
+const settingStuckAdviser = "stuck_adviser_enabled"
+
+// stuckAdviserEnabled 报告是否启用停滞顾问。读全局策略、不跟 profile 走 —— 它是
+// 「卡住时要不要请顾问」的平台级取舍,与当前用哪个模型无关。
+func (e *Engine) stuckAdviserEnabled() bool {
+	if e == nil || e.m == nil || e.m.pg == nil {
+		return true
+	}
+	return e.m.pg.GetBool(settingStuckAdviser, true)
+}
+
+// intentText 取意图正文(payload 的 summary),供停滞顾问理解「这一棒在干什么」。
+func intentText(intent *db.Node) string {
+	if intent == nil || len(intent.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Summary)
+}
+
 // runIntent executes and fully settles one already-claimed (state=running) intent.
 // Both the pool worker loop (via runWorkerStep) and the human-message handler (via
 // runDetachedIntent, a dedicated goroutine outside the worker pool) call it, so the
@@ -1137,7 +1166,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// chains L3 → L1:停滞触发时附上类别化转向建议(按意图 chain_tags 从对应类
 	// 骨架抽"转向"条目,无匹配则为空、维持通用措辞)。一次性算好,整条意图不变。
 	hooks.det.PivotHint = chainskel.PivotHintsForIntent(intent.Payload, 3)
-	hooks.onStuck = func(ev *agent.StuckEvent) {
+	// P0-1「停滞顾问」:触发时除了固定纪律,再唤起一次带全局上下文的顾问调用,
+	// 把「立即停止同轴重试」升级成「具体该换到哪去」。顾问不可用/失败/超时一律
+	// 保留固定纪律(干预绝不丢),判据仍由确定性检测器决定。
+	adviser := agent.NewStuckAdviser(worker.Provider())
+	adviserOn := adviser.Available() && e.stuckAdviserEnabled()
+	hooks.onStuck = func(ctx context.Context, ev *agent.StuckEvent) {
 		taskEmit(db.Activity{Kind: "system", Tool: ev.Tool,
 			Summary: fmt.Sprintf("停滞检测:连续 %d 次同质响应(%s,签名 %s)", ev.Count, ev.Kind, ev.Signature),
 			Detail:  agent.StuckIntervention(*ev)})
@@ -1148,6 +1182,25 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 				log.Printf("[work %s] 停滞检测 hint 写图失败: %v", label, err)
 			}
 		}
+		if !adviserOn {
+			return
+		}
+		advice, err := adviser.Advise(ctx, agent.StuckAdviceRequest{
+			Goal:        t.Goal,
+			Intent:      intentText(intent),
+			Stuck:       *ev,
+			PivotHint:   hooks.det.PivotHint,
+			RecentTools: hooks.det.RecentTools(12),
+			PriorFires:  ev.N,
+		})
+		if err != nil || advice == "" {
+			log.Printf("[work %s] 停滞顾问未给出建议(保留固定干预): %v", label, err)
+			return
+		}
+		hooks.det.UpgradeLastPending(advice)
+		taskEmit(db.Activity{Kind: "system", Tool: ev.Tool,
+			Summary: "停滞顾问已给出转向建议",
+			Detail:  agent.AdviserIntervention(advice)})
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)

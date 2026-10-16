@@ -208,6 +208,44 @@ func (d *StuckDetector) Drain() (string, bool) {
 	return msg, true
 }
 
+// RecentTools 返回最近 n 次 tool_result 的工具名(新到旧),供「停滞顾问」判断
+// worker 已经试过什么。保留重复项 —— 重复本身就是"同轴空转"的证据。
+func (d *StuckDetector) RecentTools(n int) []string {
+	if n <= 0 || len(d.recent) == 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	for i := len(d.recent) - 1; i >= 0 && len(out) < n; i-- {
+		out = append(out, d.recent[i].tool)
+	}
+	return out
+}
+
+// UpgradeLastPending 用「停滞顾问」的建议替换最近一条待注入的干预消息。
+//
+// 触发路径:Observe 触发时先把固定转向纪律排入 pending(保证顾问不可用时也有干预),
+// 随后由 engine 唤起顾问;顾问给出建议就调本方法把那条替换成建议。没有 pending 时
+// 退化为追加 —— 无论哪条路径,干预都不会丢。
+func (d *StuckDetector) UpgradeLastPending(advice string) {
+	advice = strings.TrimSpace(advice)
+	if advice == "" {
+		return
+	}
+	body := AdviserIntervention(advice)
+	if n := len(d.pending); n > 0 {
+		d.pending[n-1] = body
+		return
+	}
+	d.pending = append(d.pending, body)
+}
+
+// AdviserIntervention 把顾问建议包装成注入文本(与固定干预同构:先说"本次工具调用
+// 未执行",再给指令)。
+func AdviserIntervention(advice string) string {
+	return "【停滞顾问】你在这个方向上已连续多次得到同质响应,平台已请顾问基于全局上下文给出转向指令。" +
+		"(本次工具调用未执行,先读完这条再决定下一步。)\n\n" + strings.TrimSpace(advice)
+}
+
 // Fires 返回已触发次数(观测/日志用)。
 func (d *StuckDetector) Fires() int { return d.fires }
 
