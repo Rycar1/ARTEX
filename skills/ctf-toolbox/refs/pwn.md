@@ -71,7 +71,19 @@ qemu-aarch64 -g 1234 ./chall      # 起调试端口，配 gdb-multiarch 连
 ```
 pwntools 里：`context.arch='aarch64'` + `process(['qemu-aarch64','-L','/usr/aarch64-linux-gnu','./chall'])`
 
-## 6. 纪律
+## 6. 卡点与换维
+
+| 卡点 | 换维方向 |
+|---|---|
+| 找不到溢出点 | 换函数：`read/gets/scanf` 的参数长度、`printf(user_input)`；`r2 -A` 看交叉引用 |
+| 算不出偏移 | 用 `cyclic` + corefile（见第 2 节），别手数；gdb 里 `x/gx $rsp` 后 `cyclic_find` |
+| 本地通、远程崩 | libc 版本不一致：`patchelf --set-interpreter/--set-rpath` 换成题目给的 libc 再打 |
+| 泄漏不出来 | 换泄漏原语（puts/write/printf 格式化串）；或改泄露目标（GOT、栈、environ） |
+| 拿到 shell 但读不到 flag | 看沙箱（`seccomp-tools dump`）与权限：改用 open/read/write，或 `system('cat /flag')` 前先 `ls` |
+| 栈对齐崩 | 在 ROP 链里插一个 `ret` gadget 调整 16 字节对齐（movaps 报错时必查） |
+| 堆题没思路 | 先确认 glibc 版本与菜单功能，找 UAF/double free/off-by-one；用 pwndbg 看 bin 链（未预装则手算） |
+
+## 7. 纪律
 
 - 本地打通再打远程；远程只发必要交互。
 - payload 每个字段写清来历（偏移怎么算的、gadget 从哪来）。

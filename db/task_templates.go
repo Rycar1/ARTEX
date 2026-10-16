@@ -305,18 +305,55 @@ var builtinTaskTemplates = []struct {
 }{
 	{
 		Name:        "CTF",
-		Description: "CTF 竞赛 / 靶场场景：目标处于隔离比赛环境，允许为解题放开手脚做高强度利用与破坏性操作（打点、提权、横向、拿 flag），不承担业务影响。",
-		Goal: `在隔离的 CTF / 靶场环境中解题并拿到 flag。这是比赛/靶场场景，可以放开手脚：
+		Description: "CTF 竞赛 / 靶场场景：目标处于隔离比赛环境，允许为解题放开手脚做高强度利用与破坏性操作（打点、提权、横向、拿 flag），不承担业务影响。开局强制先做题型判定（web / pwn / reverse / crypto / misc / forensics）并按题型挂对应方法论与工具清单，同时把 flag 格式提取成显式验收目标——每条利用链以「产出符合该格式的字符串」为收敛判据。",
+		Goal: `在隔离的 CTF / 靶场环境中解题并拿到 flag。这是比赛/靶场场景，可以放开手脚：允许高强度利用、破坏性操作、提权、横向与痕迹清理，不承担业务影响。
 
-工具箱：镜像内已预装 CTF 常用件，先读 'skills/ctf-toolbox/' 下的说明与参考（SKILL 文档 + refs 目录里的 misc / rev / pwn 笔记）确认该用哪个工具、惯用套路与命令，再动手，别手搓轮子。
+【第 0 步 · 强制题型判定（判完型才允许动手）】
+开局第一件事是判型，不是直接扫端口。逐条取证再下结论，判定结果与依据必须写进交付：
+1. 题面文字：题干关键词指向题型——上传/绕过/参数/注入/鉴权/源码 → web；nc 交互/溢出/ROP/堆/沙箱 → pwn；注册机/校验/去混淆/自解密/算法还原 → reverse；密文/公钥/模数 n e c/密钥交换 → crypto；流量/磁盘/内存镜像/日志/图片/音频 → forensics；编码杂项/脑洞/冷门协议 → misc。
+2. 附件类型：先 file 看类型与魔数（ELF/PE/.so → pwn 或 reverse；pcap/pcapng → forensics；img/raw/dd/E01 → forensics；apk/dex → mobile；png/jpg/gif/wav/zip/rar → misc 或 forensics；纯文本/源码/前端 JS → web 或 crypto）。
+3. 目标端口与服务特征：nc 目标端口看 banner——HTTP/80/443 或直接给了 URL → web；裸二进制交互、菜单式读写、无提示直接吃输入 → pwn；只给主机端口不给程序 → web 或 misc。
+4. 给出的入口：URL/源码/前端 JS/接口文档 → web；二进制 + libc/ld + 远程地址 → pwn；只有密文与参数 → crypto；日志/流量/内存转储/磁盘镜像 → forensics。
+5. flag 提交格式提示：平台规则、题目描述、样例 flag 的前缀/长度/字符集（直接决定第 1 步怎么做）。
 
+题型集合以 web / pwn / reverse / crypto / misc / forensics 六类为准（mobile、osint 可作补充，但别铺开）。判定结论要落盘成第一条记录：题型 + 判定依据（具体是哪条证据）+ 选定的方法论文档路径；后续所有动作都挂在这条结论下，中途改判也要写明改判依据。
+
+判定后按题型挂方法论与工具清单，先 Read 对应文档再动手，禁止手搓轮子：
+- web → skills/ctf-toolbox/refs/web.md
+- pwn → skills/ctf-toolbox/refs/pwn.md
+- reverse → skills/ctf-toolbox/refs/rev.md
+- crypto → skills/ctf-toolbox/refs/crypto.md
+- forensics → skills/ctf-toolbox/refs/forensics.md
+- misc → skills/ctf-toolbox/refs/misc.md
+- 附件不知从哪下手 → skills/ctf-toolbox/refs/attachments.md（附件指纹 → 工具链映射表）
+- 总索引与环境自检 → skills/ctf-toolbox/SKILL.md（不确定工具在不在，先 command -v 探一下）
+
+判定不确定时的处理（硬性，不许瞎猜一个方向往下扎）：取最可能的两个题型，各写一个最小验证动作，用一次探测把两者区分开。例：web 与 misc 之间，先 curl -i 目标一次，有 HTTP 响应就走 web；pwn 与 reverse 之间，先 file + checksec 再本地跑一次，是交互服务走 pwn、是本地校验程序走 reverse；crypto 与 reverse 之间，看输入是「参数与密文」还是「一个可执行程序」；forensics 与 misc 之间，先 file + binwalk 看有无嵌套结构与文件系统，是磁盘/内存/流量镜像就走 forensics，是单文件隐写就走 misc。探测命令与结论一并写进交付。
+
+【第 1 步 · 把 flag 格式提取成显式目标】
+- 开局先从题面、平台规则、题目样例、已知其它题 flag 中提取格式：前缀（flag{}、DASCTF{}、ctfshow{}、纯 hex、UUID、base64）、长度、字符集，把格式原文写下来，作为本次解题的验收标准。
+- 每条利用链的收敛判据是「产出符合该格式的字符串」，不是「看起来像 flag」。拿到疑似字符串先做格式校验（正则/长度/字符集），不匹配就继续推进，别提前收工。
+- 格式未知时：先按最常见的 xxx{...} 试（前缀用 flag/ctf/题目名），同时把「找到 flag 格式定义」本身列成一条待办；之后任何新信息（平台规则、响应头、附件里的 readme、源码注释、配置项）都要回头补这个定义。
+- 题目已明确给出格式时，把匹配规则写死在交付里（例如 flag\{[0-9a-f]{32}\} 这种前缀 + 长度 + 字符集的组合），每拿到一个候选就现场跑一次校验，不靠肉眼判断。
+- flag 常见落点，按题型优先找：/flag 与环境变量、数据库表与配置文件、进程内存与流量响应体、图片元数据与文件尾部追加数据、源码里的比较逻辑与常量。
+- 候选 flag 必须回显原文，并说明它出现在哪一步的哪个响应或文件里：完整命令 + 原始回显片段 + 文件路径/偏移/时间点。禁止把推测、脑补、格式化拼出来的字符串当 flag 上报；不确定的标「候选 · 未验证」并写清验证缺口。
+
+【第 2 步 · 附件指纹 → 工具链】
+- 每个附件先做指纹：file 看类型与魔数，xxd 看文件头，strings -n 6 看特征串，binwalk 看嵌套结构。
+- 按指纹直接查 skills/ctf-toolbox/refs/attachments.md 的映射表上工具链，不要每道题从零摸索。
+- 映射速览（全表见 attachments.md）：ELF → checksec + objdump/radare2；PE → strings + 反编译；APK → jadx/apktool（未预装，先 command -v）；PCAP → tshark；内存镜像 → volatility3（未预装，先 command -v）；图片 → zsteg/binwalk/exiftool；压缩包 → zip2john + john；音频 → sox 频谱；二维码 → zbarimg；.py/.js/.php → 直接读源码；未知 → binwalk + strings。
+- 工具先确认存在（command -v <工具名>）；缺工具就在交付里标注未执行，并给出可复现的获取或替代命令，禁止假装跑过。
+
+【第 3 步 · 解题主线（判型后按题型走）】
 1. 侦察定面：枚举端口与服务、Web 路径与参数、指纹与已知漏洞版本，先把攻击面铺开。
 2. 漏洞利用：对确认的漏洞直接利用（RCE、反序列化、文件包含、SQL 注入、越权、模板注入等），必要时上传工具、写 webshell、提权。
 3. 后利用与横向：允许内网横向、抓取凭据、读取任意文件，以拿到最终目标（flag / 域控 / 隐藏关卡）为准。
 4. 破坏性操作允许：可以改配置、重启服务、清理痕迹，比赛环境不追求业务连续性。
-5. 交付：写清完整利用链、每步用的命令与 payload、拿到的 flag 原文及其位置；未打通的部分标注卡点与已排除的路径。
+5. 交付：写清完整利用链、每步用的命令与 payload、拿到的 flag 原文及其位置（响应/文件/偏移）、flag 格式的提取依据；未打通的部分标注卡点与已排除的路径。
 
-纪律：以最快拿到 flag 为第一目标，不要停在信息收集；每条结论都要附实际命令与回显，禁止虚构结果。`,
+【纪律】
+- 以最快拿到 flag 为第一目标，不要停在信息收集；但第 0 步判型与第 1 步 flag 格式提取不许跳过。
+- 每条结论都要附实际命令与回显，禁止虚构结果；没跑通的标「未执行」。`,
 	},
 	{
 		Name:        "SRC",
@@ -399,12 +436,14 @@ var builtinTaskTemplates = []struct {
 }
 
 // builtinTaskTemplatesVersion 是内置任务模板正文的版本旗标：DB 中记录的版本低于当前值时，
-// 本次启动强制把内置模板(CTF/SRC/渗透-基础/渗透-激进)的 description/goal 刷成新版（用于给老库补上 SRC 的
-// 「必须测完所有资产才能结束 + 单资产穷尽多漏洞」硬约束），刷新后写入当前版本；此后只重申 builtin 标记，
-// 不再覆盖用户对正文的修改。
+// 本次启动强制把内置模板(CTF/SRC/渗透-基础/渗透-激进)的 description/goal 刷成新版，刷新后写入当前版本；
+// 此后只重申 builtin 标记，不再覆盖用户对正文的修改。
+// 历史版本：v5 给老库补上 SRC 的「必须测完所有资产才能结束 + 单资产穷尽多漏洞」硬约束；
+// v6 给老库补上 CTF 的「开局强制题型判定 + flag 格式驱动 + 附件指纹→工具链」三项正文
+// （不改此旗标，新 CTF 正文永远不会到达已有部署）。
 const (
 	builtinTaskTemplatesVersionKey = "builtin_task_templates_version"
-	builtinTaskTemplatesVersion    = "5"
+	builtinTaskTemplatesVersion    = "6"
 )
 
 // seedBuiltinTaskTemplates 幂等播种内置模板(CTF/SRC)。默认只重申 builtin 标记、不覆盖
