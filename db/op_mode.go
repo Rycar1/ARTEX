@@ -36,3 +36,22 @@ func (d *DB) TaskOpMode(taskID int64) string {
 	}
 	return NormalizeOpMode(m)
 }
+
+// TaskUnattended 读取任务的无人值守开关(tasks.unattended)。缺行/读失败/taskID<=0
+// → false(保守):无人值守必须显式开启,读不到就按有人值守处理。
+func (d *DB) TaskUnattended(taskID int64) bool {
+	if taskID <= 0 {
+		return false
+	}
+	var u bool
+	if err := d.QueryRow(`SELECT COALESCE(unattended,false) FROM tasks WHERE id=$1`, taskID).Scan(&u); err != nil {
+		return false
+	}
+	return u
+}
+
+// SetTaskUnattended 切换任务的无人值守开关(任务创建后可单独开/关)。
+func (d *DB) SetTaskUnattended(taskID int64, enabled bool) error {
+	_, err := d.Exec(`UPDATE tasks SET unattended=$2 WHERE id=$1 AND deleted_at IS NULL`, taskID, enabled)
+	return err
+}

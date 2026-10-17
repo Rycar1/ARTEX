@@ -565,6 +565,11 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_src_type TEXT NOT NULL DEFAULT
 -- 技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),但保留资产范围边界与
 -- 破坏性操作底线。见 db/op_mode.go、server/op_mode.go。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS op_mode TEXT NOT NULL DEFAULT 'standard';
+-- 无人值守(任务级);补旧库。true=本任务 judge 给出 ask 时不再进入人工审批队列,
+-- 而是发起一次「禁止 ask」的强制二次裁决(allow/deny 二选一,无法判断安全则 deny)。
+-- 全局开关(settings 表 intercept_unattended)开启时,所有任务均按无人值守处理,本列被
+-- 短路;全局关闭时以本列为准。见 intercept.SetTaskUnattended / intercept.UnattendedContract。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unattended BOOLEAN NOT NULL DEFAULT false;
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"time"
 )
 
@@ -38,6 +39,11 @@ type CredentialRecord struct {
 	Source      string    `json:"source"`
 	Verified    bool      `json:"verified"`
 	CreatedAt   time.Time `json:"created_at"`
+	// SecretUnreadable 表示这条凭据的密文用当前 master key 解不开(密钥轮换/丢失、
+	// 数据被篡改)。列表路径把它当作"可展示但不可用"的行返回,而不是整表报错 ——
+	// 否则一条坏行就会让整个凭据页 500、且无法自救。
+	// Get(单条,供工具复用 secret)仍按严格语义报错,不会把空 secret 当明文交出去。
+	SecretUnreadable bool `json:"secret_unreadable,omitempty"`
 }
 
 // ValidCredType 校验凭据类型。
@@ -168,6 +174,26 @@ func (s *CredentialStore) scan(row interface{ Scan(...any) error }) (*Credential
 	return &r, nil
 }
 
+// scanLenient 与 scan 相同,但**解密失败不返回错误**:记录 SecretUnreadable 并留空
+// secret,让调用方(列表页)仍能展示这条凭据的元数据。单条读取(Get)不走这条路径,
+// 避免把"解不开"悄悄当成"空口令"交给复用逻辑。
+func (s *CredentialStore) scanLenient(row interface{ Scan(...any) error }) (*CredentialRecord, error) {
+	var r CredentialRecord
+	var enc string
+	if err := row.Scan(&r.ID, &r.TaskID, &r.HostAssetID, &r.Username, &r.CredType, &enc,
+		&r.Domain, &r.Source, &r.Verified, &r.CreatedAt); err != nil {
+		return nil, err
+	}
+	plain, err := s.decrypt(enc)
+	if err != nil {
+		log.Printf("[credentials] 凭据 %d 解密失败,列表按不可读展示: %v", r.ID, err)
+		r.SecretUnreadable = true
+		return &r, nil
+	}
+	r.Secret = plain
+	return &r, nil
+}
+
 // Get 取一条(含解密 secret);不存在返回 (nil, nil)。
 func (s *CredentialStore) Get(ctx context.Context, id int64) (*CredentialRecord, error) {
 	r, err := s.scan(s.d.QueryRowContext(ctx,
@@ -188,7 +214,8 @@ func (s *CredentialStore) ListByTask(ctx context.Context, taskID int64) ([]*Cred
 	defer rows.Close()
 	out := []*CredentialRecord{}
 	for rows.Next() {
-		r, err := s.scan(rows)
+		// 列表路径用宽松扫描:单条密文解不开不应让整张列表 500(见 SecretUnreadable)。
+		r, err := s.scanLenient(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -208,7 +235,8 @@ func (s *CredentialStore) ListAll(ctx context.Context) ([]*CredentialRecord, err
 	defer rows.Close()
 	out := []*CredentialRecord{}
 	for rows.Next() {
-		r, err := s.scan(rows)
+		// 列表路径用宽松扫描:单条密文解不开不应让整张列表 500(见 SecretUnreadable)。
+		r, err := s.scanLenient(rows)
 		if err != nil {
 			return nil, err
 		}

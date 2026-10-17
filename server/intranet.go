@@ -23,6 +23,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/session"
+	"github.com/Autumn-27/artex/tunnel"
 )
 
 // auditIntranet 打人工操作审计日志:操作者(JWT subject)/来源地址/动作明细。
@@ -510,6 +511,11 @@ func (s *Server) intranetTeardownTunnel(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := s.tunnels.Teardown(r.Context(), id); err != nil {
 		s.auditIntranet(r, "tunnel_teardown id=%d 失败: %v", id, err)
+		// 隧道不存在 → 404(而不是 502"回收失败"):客户端要能区分"id 错"与"真失败"。
+		if errors.Is(err, tunnel.ErrTunnelNotFound) {
+			writeErr(w, 404, err.Error())
+			return
+		}
 		writeErr(w, 502, "回收失败: "+err.Error())
 		return
 	}
@@ -545,12 +551,22 @@ func (s *Server) intranetListCredentials(w http.ResponseWriter, r *http.Request)
 	for _, c := range creds {
 		items = append(items, map[string]any{
 			"id": c.ID, "task_id": c.TaskID, "username": c.Username,
-			"cred_type": c.CredType, "secret_masked": db.MaskSecret(c.Secret),
-			"domain": c.Domain, "source": c.Source, "verified": c.Verified,
+			"cred_type": c.CredType, "secret_masked": maskCredentialSecret(c),
+			"secret_unreadable": c.SecretUnreadable,
+			"domain":            c.Domain, "source": c.Source, "verified": c.Verified,
 			"host_asset_id": c.HostAssetID, "created_at": c.CreatedAt,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+// maskCredentialSecret 脱敏展示。密文用当前 master key 解不开时明确标注 —— 显示成
+// "空口令"会让使用者误以为凭据没密码,标注后才知道是密钥不匹配(见 db.SecretUnreadable)。
+func maskCredentialSecret(c *db.CredentialRecord) string {
+	if c.SecretUnreadable {
+		return "<无法解密>"
+	}
+	return db.MaskSecret(c.Secret)
 }
 
 // ---------------- 拓扑组装(纯函数,可测) ----------------

@@ -8,6 +8,7 @@ package tunnel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -175,6 +176,11 @@ func (m *Manager) rollbackKeepRow(ctx context.Context, id int64, sess session.Se
 	m.killServer(id, p)
 }
 
+// ErrTunnelNotFound 表示目标隧道不存在(已被删除/从未创建)。HTTP 层据此回 404 ——
+// 否则"id 写错"会被当成"回收失败"回 502,客户端无法区分,且与 DELETE /api/sessions/{id}
+// 的幂等语义不一致。
+var ErrTunnelNotFound = errors.New("隧道不存在")
+
 // Teardown 回收一条隧道：远端进程经会话按 pid 杀（查远端、核对 cmdline)→
 // 杀平台 server → 删 stage 条目 → 删 authfile → state=stopped。幂等：已 stopped
 // 直接返回。
@@ -184,7 +190,7 @@ func (m *Manager) Teardown(ctx context.Context, id int64) error {
 		return err
 	}
 	if rec == nil {
-		return fmt.Errorf("隧道 %d 不存在", id)
+		return fmt.Errorf("隧道 %d: %w", id, ErrTunnelNotFound)
 	}
 	if rec.State == db.TunnelStopped {
 		return nil

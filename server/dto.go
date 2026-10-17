@@ -63,6 +63,7 @@ type TaskDTO struct {
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	ReviewEnabled      bool               `json:"review_enabled"`   // 二次审核开关(创建时定,默认关)
 	OpMode             string             `json:"op_mode"`          // 作战模式:standard(默认) | aggressive(激进)
+	Unattended         bool               `json:"unattended"`       // 无人值守:judge ask 强制二次裁决,不进人工审批队列
 	ReviewSrcType      string             `json:"review_src_type"`  // 审核标准:edusrc | enterprise
 	// LaunchRefused=true 表示任务建好了但平台拒绝启动(无靶机拒跑),原因见
 	// LaunchRefusedReason。仅建任务响应会带上,列表/详情恒为 false。
@@ -144,6 +145,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		ReviewEnabled:      t.ReviewEnabled,
 		ReviewSrcType:      t.ReviewSrcType,
 		OpMode:             t.OpMode,
+		Unattended:         lifecycle.Unattended,
 	}
 }
 

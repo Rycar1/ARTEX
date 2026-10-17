@@ -5,7 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
+import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
@@ -301,6 +301,28 @@ function TaskDetailInner() {
     }
   }
 
+  // 无人值守开关(任务级):judge 给出 ask 时强制二次裁决(allow/deny 二选一),
+  // 不再进入人工审批队列。全局开关(系统设置)开启时本开关被短路。
+  const [togglingUnattended, setTogglingUnattended] = React.useState(false);
+  async function toggleUnattended() {
+    if (!task || togglingUnattended) return;
+    const next = !task.unattended;
+    setTogglingUnattended(true);
+    try {
+      const updated = await api.setTaskUnattended(task.id, next);
+      setTask((prev) => (prev ? { ...prev, unattended: updated.unattended ?? next } : prev));
+      toast.success(
+        next
+          ? "已开启无人值守：judge 需人审的命令自动强制二选一，不再等人"
+          : "已关闭无人值守：judge 需人审的命令重新等待人工审批",
+      );
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    } finally {
+      setTogglingUnattended(false);
+    }
+  }
+
   if (!task) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
@@ -368,6 +390,27 @@ function TaskDetailInner() {
           {task.op_mode === "aggressive" && (
             <Badge variant="destructive" title="激进模式:放宽一切技术限制">激进</Badge>
           )}
+          {task.unattended && (
+            <Badge variant="outline" title="无人值守:judge 需人审的命令自动强制二选一(allow/deny),不进人工审批队列">无人值守</Badge>
+          )}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon-sm"
+                variant={task.unattended ? "secondary" : "ghost"}
+                disabled={togglingUnattended}
+                aria-label={task.unattended ? "关闭无人值守" : "开启无人值守"}
+                onClick={() => void toggleUnattended()}
+              >
+                {togglingUnattended ? <Spinner /> : <ShieldAlertIcon />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>
+              {task.unattended
+                ? "无人值守已开：judge 需人审的命令自动强制二选一，不再等人（点击关闭）"
+                : "无人值守已关：judge 需人审的命令等待人工审批（点击开启）"}
+            </TooltipContent>
+          </Tooltip>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
           <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />

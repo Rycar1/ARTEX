@@ -281,6 +281,7 @@ export const api = {
     reviewEnabled?: boolean;
     reviewSrcType?: string;
     opMode?: string;
+    unattended?: boolean; // 无人值守:judge ask 强制二次裁决,不进人工审批队列(默认关)
     interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
@@ -298,10 +299,12 @@ export const api = {
       review_enabled: input.reviewEnabled ?? false, // 默认关;true=新漏洞自动进入 AI 二次审核
       review_src_type: input.reviewSrcType ?? "edusrc", // 审核标准:edusrc(默认) | enterprise
       op_mode: input.opMode ?? "standard", // 作战模式:standard(默认) | aggressive(激进,红色警示)
+      unattended: input.unattended ?? false, // 无人值守;全局开关(intercept_unattended)开启时被短路
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  updateTask: (id: string, input: { name?: string; pinned?: boolean; unattended?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  setTaskUnattended: (id: string, unattended: boolean) => patch<Task>(`/tasks/${id}`, { unattended }),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),

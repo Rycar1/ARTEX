@@ -3358,6 +3358,8 @@ export const settings: Settings = {
   llm_pool_enabled: true,
   llm_pool_bind_fallback: false,
   noa_compaction: false,
+  stuck_adviser_enabled: true,
+  intercept_unattended: false,
 };
 
 // ── LLM 轮询（故障转移）──────────────────────────────────────────────────────

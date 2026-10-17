@@ -232,7 +232,10 @@ func TestRequireAuthTicketPath(t *testing.T) {
 	}
 
 	// Basic Auth → 200 + Set-Cookie
-	kv.SetSetting("auth.password_hash", string(func() []byte {
+	// 用户名必须与 settings 里的 auth.username 一致(首启随机持久化,不再是硬编码 ARTEX),
+	// 所以这里把用户名和密码哈希一起写死,才能覆盖 Basic Auth 通过的那条路。
+	kv.SetSetting(authUserKey, "ARTEX")
+	kv.SetSetting(authPassKey, string(func() []byte {
 		h, _ := bcrypt.GenerateFromPassword([]byte("testpass123"), bcrypt.MinCost)
 		return h
 	}()))

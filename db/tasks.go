@@ -61,6 +61,11 @@ type Task struct {
 	// 底线:①资产范围边界(不越权打偏到未授权目标)②破坏性/自毁操作(不影响目标正常业务)。
 	// 见 server/op_mode.go。
 	OpMode string `json:"op_mode"`
+	// Unattended 是本任务的无人值守开关(默认 false)。true 时 judge 给出 ask 不再进入
+	// 人工审批队列,而是发起一次「禁止 ask」的强制二次裁决(allow/deny 二选一,无法判断
+	// 安全则 deny)。全局开关(settings 表 intercept_unattended)开启时短路本列。
+	// 见 intercept.SetTaskUnattended / intercept.UnattendedContract。
+	Unattended bool `json:"unattended"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -175,6 +180,8 @@ type TaskCreateOptions struct {
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	// OpMode 是任务作战模式;空=默认 standard(见 NormalizeOpMode)。aggressive=激进模式。
 	OpMode string
+	// Unattended 是本任务的无人值守开关;零值=false(默认,有人值守)。
+	Unattended bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
 }
@@ -251,9 +258,9 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		OpMode:          opMode,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, review_enabled, review_src_type, op_mode)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.ReviewEnabled, reviewSrcType, opMode).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, review_enabled, review_src_type, op_mode, unattended)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.ReviewEnabled, reviewSrcType, opMode, opts.Unattended).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -369,11 +376,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), COALESCE(review_enabled,false), COALESCE(review_src_type,'edusrc'), COALESCE(op_mode,'standard'), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), COALESCE(review_enabled,false), COALESCE(review_src_type,'edusrc'), COALESCE(op_mode,'standard'), COALESCE(unattended,false), first_run_at, deadline_at`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ReviewEnabled, &t.ReviewSrcType, &t.OpMode, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ReviewEnabled, &t.ReviewSrcType, &t.OpMode, &t.Unattended, &t.FirstRunAt, &t.DeadlineAt); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -415,8 +422,9 @@ ORDER BY (pinned_at IS NOT NULL) DESC, pinned_at DESC NULLS LAST, id DESC`)
 
 // TaskPatch updates task list metadata without changing execution state.
 type TaskPatch struct {
-	Name   *string
-	Pinned *bool
+	Name       *string
+	Pinned     *bool
+	Unattended *bool
 }
 
 // UpdateTask applies a partial task name/pin mutation and returns the updated row.
@@ -428,9 +436,10 @@ func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
 		WHEN $4::boolean IS NULL THEN pinned_at
 		WHEN $4::boolean THEN COALESCE(pinned_at, now())
 		ELSE NULL
-	END
+	END,
+	unattended = COALESCE($5::boolean, unattended)
 WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned))
+RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.Unattended))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -22,10 +22,6 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	defer m.Close()
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var data []byte
@@ -33,7 +29,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 			data, _ = json.Marshal(body)
 		}
 		req := httptest.NewRequest(method, path, bytes.NewReader(data))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		var out map[string]any
@@ -96,14 +92,10 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.pg.DeleteConversation(conversation.ID) })
-	token, err := signJWT(s.jwtKey, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	body, _ := json.Marshal(map[string]any{"title": "  pinned title  ", "pinned": true})
 	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -123,7 +115,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("会", maxConversationTitleRunes+1)})
 	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -132,7 +124,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("x", maxConversationRequestBytes+1)})
 	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -143,7 +135,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		"agent_key": "mainagent", "title": strings.Repeat("会", maxConversationTitleRunes+1),
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -154,7 +146,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		"agent_key": "mainagent", "title": strings.Repeat("x", maxConversationRequestBytes+1),
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -170,17 +162,13 @@ func TestBuiltinTaskTemplateProtectedOverHTTP(t *testing.T) {
 	defer m.Close()
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	do := func(method, path string, body any) (int, map[string]any) {
 		var data []byte
 		if body != nil {
 			data, _ = json.Marshal(body)
 		}
 		req := httptest.NewRequest(method, path, bytes.NewReader(data))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		var out map[string]any

@@ -26,3 +26,19 @@ func (s *Server) wireTaskOpMode() {
 func aggressiveTaskOpMode(t *Task) bool {
 	return t != nil && db.IsAggressiveOpMode(t.OpMode)
 }
+
+// wireTaskUnattended 把「任务级无人值守」解析器装进进程级拦截器:Judge 给出 ask 时,
+// 无人值守生效的任务不再进入人工审批队列,而是走「禁止 ask 的强制二次裁决」。
+// 全局开关(settings 表 intercept_unattended)优先于任务级开关,在 interceptor 内部
+// 判定。见 intercept.SetTaskUnattended / intercept.UnattendedContract。
+func (s *Server) wireTaskUnattended() {
+	s.m.interceptor.SetTaskUnattended(func(taskID string) bool {
+		if t, ok := s.m.Task(taskID); ok {
+			return t.Unattended
+		}
+		if id, err := strconv.ParseInt(taskID, 10, 64); err == nil && s.m.pg != nil {
+			return s.m.pg.TaskUnattended(id)
+		}
+		return false
+	})
+}

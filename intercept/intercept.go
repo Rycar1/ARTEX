@@ -133,12 +133,63 @@ type Interceptor struct {
 	// taskOpMode 由 server 层注入:按任务 id 解析作战模式("standard"|"aggressive")。
 	// nil → 一律按 standard。见 SetTaskOpMode。
 	taskOpMode func(taskID string) string
+	// taskUnattended 由 server 层注入:按任务 id 解析任务级无人值守开关。nil → false。
+	// 全局开关(settings 表 intercept_unattended)优先于它。见 SetTaskUnattended。
+	taskUnattended func(taskID string) bool
 	// policy 是拦截策略缓存(规则模式 + 裁判是否启用);nil 表示未加载。
 	// 见 reviewPolicy()。
 	policy *reviewPolicy
 	// 裁判熔断状态(见 judgeBreakerTripped):连续失败次数 + 熔断截止时间。
 	judgeFailStreak int
 	judgeOpenUntil  time.Time
+}
+
+// SettingInterceptUnattended 是无人值守的全局开关(settings 表键)。开启后所有任务的
+// judge ask 都走「禁止 ask 的强制二次裁决」,不再进入人工审批队列;关闭(默认)时以
+// 任务级开关(tasks.unattended)为准。RoE 范围强制 / 用户自建审批规则 / 编码无法解码
+// 三条硬编码 ask 不经过 Judge(),不受本开关影响。
+const SettingInterceptUnattended = "intercept_unattended"
+
+// settingInterceptUnattended 是包内使用的短别名。
+const settingInterceptUnattended = SettingInterceptUnattended
+
+// UnattendedContract 是无人值守模式下强制二次裁决追加到 judge prompt 的输出契约:
+// 禁止 ask,必须在 allow/deny 中二选一;无法判断安全性时选 deny(与人工审批超时的
+// 默认动作语义对齐 —— 宁可错杀不误放)。ParseVerdict 仍认 ask:若模型违反契约,
+// 调用方按 FailAction(deny)兜底,链路上不存在「等人」的可能。
+const UnattendedContract = "\n\n# 无人值守模式(强制输出契约)\n" +
+	"当前平台处于无人值守状态,本次裁决不会有任何人工复核。" +
+	"因此不允许输出 ask:你必须在 allow 与 deny 中二选一。" +
+	"如果无法确信该操作是安全的,选择 deny 并在 comment 里说明不确定的原因。" +
+	"这是你的最终裁决,直接生效。"
+
+// SetTaskUnattended installs the task→unattended resolver used by Judge() to decide
+// whether an ask verdict should be re-asked under the forced-output contract instead
+// of entering the human approval queue. Passing nil disables the task-level switch
+// (the global setting still applies).
+func (i *Interceptor) SetTaskUnattended(fn func(taskID string) bool) {
+	i.mu.Lock()
+	i.taskUnattended = fn
+	i.mu.Unlock()
+}
+
+// unattendedEnabled 报告无人值守是否对当前上下文生效:全局开关开 → 一律生效;
+// 否则看任务级开关(无任务上下文/chat → false,保守)。
+func (i *Interceptor) unattendedEnabled(ctx context.Context) bool {
+	if i.db != nil && i.db.GetBool(settingInterceptUnattended, false) {
+		return true
+	}
+	taskID, _ := taskInfoFromCtx(ctx)
+	if taskID == "" {
+		return false
+	}
+	i.mu.RLock()
+	fn := i.taskUnattended
+	i.mu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	return fn(taskID)
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -605,6 +656,40 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 	if err != nil {
 		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
 	}
+	// 无人值守:judge 给出 ask(拿不准)时不再进入人工审批队列 —— 追加「禁止 ask」的
+	// 强制输出契约重问一次,让模型在 allow/deny 中二选一(无法判断安全则 deny,与人工
+	// 审批超时的默认动作语义对齐)。二次仍 ask/调用失败 → 硬兜底 deny(不取 FailAction:
+	// 它的默认值就是 ask,会绕回审批队列,恰好复现本开关要消灭的冻结),链路上不存在
+	// 「等人」的可能。
+	//
+	// 覆盖范围:J1(模型裁决 ask)与 J2(入参无法解析时的强制 ask,见上面的 contextErr
+	// 分支)。J2 的入参本身不可解析,拿不到可信审查材料,所以**不再发起二次模型调用**
+	// (喂空上下文只会得到噪声),直接按安全默认拒绝 —— 关键是它同样不能进审批队列。
+	// RoE 范围强制 / 用户自建审批规则 / 编码无法解码三条硬编码 ask 不经过 Judge(),
+	// 不受影响。
+	if out.Action == "ask" && i.unattendedEnabled(ctx) {
+		switch {
+		case contextErr != nil:
+			out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: "deny",
+				Message: "无人值守:工具入参无法解析,无法审查,按安全默认拒绝: " + contextErr.Error()}
+		case err == nil:
+			askReason := out.Message
+			reOut, reErr := rv(cctx, cfg.ProfileID, cfg.Prompt+UnattendedContract, input)
+			switch {
+			case reErr != nil:
+				out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: "deny",
+					Message: "无人值守:强制裁决调用失败,按安全默认拒绝: " + reErr.Error()}
+			case reOut.Action == "allow" || reOut.Action == "deny":
+				out = reOut
+				out.Message = "[无人值守强制裁决] judge 首次裁决为 ask(" + askReason + "),已按无人值守契约强制二选一: " + out.Message
+			default:
+				// 二次仍 ask(违反契约)或其它非法动作 → 硬兜底 deny。
+				out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: "deny",
+					Message: "无人值守:强制裁决仍未能给出 allow/deny,按安全默认拒绝"}
+			}
+		}
+		log.Printf("[intercept] 无人值守:工具 %s 的 ask 裁决已强制落地 → %s", tool, out.Action)
+	}
 	switch out.Action {
 	case "allow", "ask", "deny":
 		// valid verdict
@@ -753,6 +838,40 @@ func matchSubjects(raw string) ([]string, map[string]string) {
 // decided=false means no decision layer produced a verdict (rules matched
 // nothing and no judge is wired). Callers keep their own fail-closed fallback.
 func (i *Interceptor) Review(ctx context.Context, toolName string, input []byte) (Decision, bool) {
+	dec, decided := i.review(ctx, toolName, input)
+	// 激进模式「全放行」(任务级,见 aggressiveBypassAll):规则/judge 的 deny 一律转
+	// allow 并留痕 —— ask 在 HandleAsk 里已被激进模式自动放行,这里补齐 deny 侧。
+	// 出口审查(凭据外泄)与跨任务隔离在 guard 的前置层,不经过 Review,不受影响;
+	// RoE 范围强制走 guard 前置层的 HandleAsk 且带 NoAutoAllow,同样不受影响。
+	if decided && dec.Action == "deny" && i.aggressiveBypassAll(ctx) {
+		dec.Action = "allow"
+		dec.Source = "aggressive_bypass"
+		dec.Message = "[激进模式·全放行] " + dec.Message
+		log.Printf("[intercept] 激进模式全放行:工具 %s 的 deny 裁决已转为 allow(审计源 aggressive_bypass)", toolName)
+	}
+	return dec, decided
+}
+
+// aggressiveBypassAll 报告当前上下文的任务是否处于激进模式且应放行一切拦截
+// (规则 deny / judge deny 均转 allow)。ask 的自动放行在 HandleAsk 里已有
+// (decision_source="aggressive")。无任务上下文或未装配解析器 → false(保守)。
+func (i *Interceptor) aggressiveBypassAll(ctx context.Context) bool {
+	taskID, _ := taskInfoFromCtx(ctx)
+	if taskID == "" {
+		return false
+	}
+	i.mu.RLock()
+	fn := i.taskOpMode
+	i.mu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	return db.IsAggressiveOpMode(fn(taskID))
+}
+
+// review 是 Review 的判定主体(原 Review 逻辑),被 Review 包裹以统一施加
+// 激进模式「全放行」映射。
+func (i *Interceptor) review(ctx context.Context, toolName string, input []byte) (Decision, bool) {
 	if i.reviewPolicy().mode == RuleModeJudgeOnly {
 		if dec, judged := i.Judge(ctx, toolName, input); judged {
 			if dec.ModelFallback && i.judgeBreakerTripped() {
@@ -1007,14 +1126,26 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	}
 
 	if !dec.TimeoutEnabled {
-		// No timeout: wait indefinitely until user decides or worker stops.
-		select {
-		case allowed := <-ch:
-			return allowed
-		case <-ctx.Done():
-			_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
-			_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
-			return false
+		if i.unattendedEnabled(ctx) {
+			// 无人值守:规则本身没配超时(内置 ask 规则就是 timeout_enabled=false)时
+			// **不能无限期等人** —— 否则无人值守任务会一直挂在这条审批上;若任务级
+			// timeout_seconds 又是 0(不限时),那就是永不结束。这里按全局 ask 超时策略
+			// 兜底,语义与 judge ask 的超时完全一致(默认 300s → deny)。
+			dec.TimeoutEnabled = true
+			dec.TimeoutSeconds = i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs)
+			dec.TimeoutAction = i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny")
+			log.Printf("[intercept] 无人值守:规则 #%d 未配超时,按全局 ask 超时兜底(%ds → %s)",
+				dec.RuleID, dec.TimeoutSeconds, dec.TimeoutAction)
+		} else {
+			// No timeout: wait indefinitely until user decides or worker stops.
+			select {
+			case allowed := <-ch:
+				return allowed
+			case <-ctx.Done():
+				_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
+				_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+				return false
+			}
 		}
 	}
 

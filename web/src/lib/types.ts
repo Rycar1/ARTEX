@@ -42,6 +42,7 @@ export interface Task {
   review_enabled?: boolean; // 二次审核开关(创建时定,默认关)；true=新漏洞自动进入 AI 二次审核
   review_src_type?: string; // 审核标准:edusrc(默认) | enterprise
   op_mode?: string; // 作战模式:standard(默认,稳健) | aggressive(激进)
+  unattended?: boolean; // 无人值守:judge ask 强制二次裁决,不进人工审批队列(全局开关开启时被短路)
 }
 
 export interface TaskCategory {
@@ -1035,6 +1036,9 @@ export interface Settings {
   // 「停滞顾问」开关(默认开):worker 被判信息梯度为零时,除固定转向纪律外再唤起一次
   // 带全局上下文的顾问调用,把「停止同轴重试」升级成「具体换到哪去」。
   stuck_adviser_enabled?: boolean;
+  // 无人值守(默认关):开启后所有任务的 judge ask 走「禁止 ask 的强制二次裁决」,
+  // 不进人工审批队列;关闭时以任务级开关(tasks.unattended)为准。
+  intercept_unattended?: boolean;
   // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
@@ -1401,7 +1405,7 @@ export interface AssetInterceptRule {
 }
 
 export interface InterceptPending {
-  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "auto_allow" | "";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "aggressive_bypass" | "auto_allow" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1479,7 +1483,7 @@ export interface PendingScopeRow {
 
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
-  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "auto_allow";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "aggressive_bypass" | "auto_allow";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.

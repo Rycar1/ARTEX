@@ -2461,7 +2461,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const status = q.get("status") || "";
     const decisionSource = q.get("decision_source") || "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
-    if (decisionSource && !["model", "rule", "builtin", "unknown", "aggressive", "auto_allow"].includes(decisionSource))
+    if (decisionSource && !["model", "rule", "builtin", "unknown", "aggressive", "aggressive_bypass", "auto_allow"].includes(decisionSource))
       throw new Error("无效判定来源");
     const filtered = mockInterceptHistory.filter((row) => {
       const source =

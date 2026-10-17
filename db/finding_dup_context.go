@@ -75,12 +75,16 @@ func (d *DB) MarkFindingSuspectedDuplicate(findingID, targetID int64, score floa
 }
 
 // ClearFindingSuspectedDuplicate 清掉疑似重复标记(人工判定「不是重复」后调用)。
-func (d *DB) ClearFindingSuspectedDuplicate(findingID int64) error {
+// 返回受影响行数:0 = 该 finding 不存在(调用方据此回 404,而不是静默当成功)。
+func (d *DB) ClearFindingSuspectedDuplicate(findingID int64) (int64, error) {
 	if findingID <= 0 {
-		return nil
+		return 0, nil
 	}
-	_, err := d.Exec(`UPDATE findings SET suspected_dup_of=NULL, suspected_dup_score=NULL WHERE id=$1`, findingID)
-	return err
+	res, err := d.Exec(`UPDATE findings SET suspected_dup_of=NULL, suspected_dup_score=NULL WHERE id=$1`, findingID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func truncateFindingRunes(s string, max int) string {

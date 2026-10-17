@@ -88,7 +88,12 @@ func (s *Server) findingsDuplicates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	taskID := int64(atoiDefault(q.Get("task_id"), 0))
+	// task_id 必须严格解析:非数字/非正数要回 400,不能像 atoiDefault 那样静默变成 0
+	// —— 0 在本查询里等于「全任务」,会让调用方以为按任务过滤、实际拿到全平台重复组。
+	taskID, ok := parseTaskIDQuery(w, r)
+	if !ok {
+		return
+	}
 	limit := findingPaginationParam(q.Get("limit"), 100, 500)
 	groups, err := s.m.pg.ListFindingDuplicateGroups(taskID, limit)
 	if err != nil {
@@ -110,9 +115,16 @@ func (s *Server) dismissDuplicate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad finding id")
 		return
 	}
-	if err := s.m.pg.ClearFindingSuspectedDuplicate(id); err != nil {
+	n, err := s.m.pg.ClearFindingSuspectedDuplicate(id)
+	if err != nil {
 		log.Printf("[dedup] 清除疑似重复标记失败 finding=%d: %v", id, err)
 		writeErr(w, 500, err.Error())
+		return
+	}
+	// 0 行受影响 = 该 finding 不存在。必须回 404:否则前端显示"已忽略重复"但实际
+	// 什么都没改(finding 被删/id 写错时静默通过),与兄弟端点 escalate/checks 不一致。
+	if n == 0 {
+		writeErr(w, 404, "finding not found")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "id": id})

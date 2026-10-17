@@ -726,8 +726,10 @@ func TestMergeFindingsManual(t *testing.T) {
 		t.Fatalf("疑似重复成员应带 score 且未合并: %+v", grp.Members)
 	}
 
-	if err := d.ClearFindingSuspectedDuplicate(other); err != nil {
+	if n, err := d.ClearFindingSuspectedDuplicate(other); err != nil {
 		t.Fatal(err)
+	} else if n == 0 {
+		t.Fatalf("应清掉 finding %d 的疑似重复标记,但 0 行受影响", other)
 	}
 	groups, err = d.ListFindingDuplicateGroups(tk.ID, 0)
 	if err != nil {

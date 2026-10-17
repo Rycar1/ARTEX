@@ -690,9 +690,9 @@ func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
 		return filter, fmt.Errorf("status 必须是 pending、allowed、denied 或 timeout")
 	}
 	switch filter.DecisionSource {
-	case "", "model", "rule", "builtin", "unknown", "aggressive", "auto_allow":
+	case "", "model", "rule", "builtin", "unknown", "aggressive", "aggressive_bypass", "auto_allow":
 	default:
-		return filter, fmt.Errorf("decision_source 必须是 model、rule、builtin、unknown、aggressive 或 auto_allow")
+		return filter, fmt.Errorf("decision_source 必须是 model、rule、builtin、unknown、aggressive、aggressive_bypass 或 auto_allow")
 	}
 	return filter, nil
 }

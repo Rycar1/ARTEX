@@ -307,7 +307,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// 批 5 B2 出口审查:启动时向进程级共享 EgressGuard 注册平台敏感指纹
 	// (LLM key/jwt.key/gate 路径/PG 密码/callback_addr),所有任务的 guard 即时生效。
 	s.registerEgressFingerprints()
-	s.wireTaskOpMode() // 任务作战模式解析:激进模式任务的 ask 审批自动放行(见 server/op_mode.go)
+	s.wireTaskOpMode()    // 任务作战模式解析:激进模式任务的 ask 审批自动放行(见 server/op_mode.go)
+	s.wireTaskUnattended() // 任务级无人值守解析:judge ask 强制二次裁决,不进人工审批队列(见 server/op_mode.go)
 	return s
 }
 
@@ -1713,6 +1714,7 @@ type createTaskReq struct {
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	ReviewEnabled        *bool    `json:"review_enabled,omitempty"`    // 二次审核开关;省略/null=默认关(false)。开启后本任务新登记的漏洞自动进入 AI 二次审核,不合格的自动置为 ignored 并注明原因(见 finding_review.go)。
 	OpMode               string   `json:"op_mode,omitempty"`           // 作战模式:standard(默认)/ aggressive(激进)。aggressive=放宽一切技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),保留资产范围边界与破坏性操作底线。
+	Unattended           *bool    `json:"unattended,omitempty"`        // 无人值守开关;省略/null=默认关(false)。开启后 judge 给出 ask 时不再进入人工审批队列,而是发起一次「禁止 ask」的强制二次裁决(allow/deny 二选一,无法判断安全则 deny)。全局开关(intercept_unattended)开启时本字段被短路。
 	ReviewSrcType        string   `json:"review_src_type,omitempty"`   // 审核标准:edusrc(默认,EduSRC 严格收录)/ enterprise(企业 SRC 高价值影响)。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
@@ -1775,6 +1777,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		ReviewEnabled:   req.ReviewEnabled != nil && *req.ReviewEnabled,
 		ReviewSrcType:   req.ReviewSrcType,
 		OpMode:          req.OpMode,
+		Unattended:      req.Unattended != nil && *req.Unattended,
 		InterceptRules:  interceptRules,
 	})
 	if err != nil {
@@ -3597,6 +3600,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"noa_compaction": s.m.NoaCompactionEnabled(),
 		// 「停滞顾问」开关(默认开)。engine 每 run 读,改完即时生效。
 		"stuck_adviser_enabled": s.m.pg.GetBool(settingStuckAdviser, true),
+		// 无人值守(全局,默认关)。开启后所有任务的 judge ask 走「禁止 ask 的强制二次
+		// 裁决」,不进人工审批队列;关闭时以任务级开关(tasks.unattended)为准。
+		// RoE 范围强制 / 用户自建审批规则 / 编码无法解码三条硬编码 ask 不受影响。
+		"intercept_unattended": s.m.pg.GetBool(intercept.SettingInterceptUnattended, false),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
 		// 这里只放「作用于全部渠道」的三项。
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
@@ -3673,6 +3680,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 一次带全局上下文的顾问调用,把「停止同轴重试」升级成「具体换到哪去」。
 		// 每 run 读,即时生效;关掉只省 token,判据与注入路径不变。
 		StuckAdviser *bool `json:"stuck_adviser_enabled"`
+		// 无人值守(全局,默认关):开启后所有任务的 judge ask 走「禁止 ask 的强制二次
+		// 裁决」,不再进入人工审批队列。即时生效(interceptor 每次裁决读一次)。
+		InterceptUnattended *bool `json:"intercept_unattended"`
 		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
 		// 不需要重建 agent 或重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
@@ -3705,6 +3715,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.StuckAdviser != nil {
 		// 停滞顾问:engine 每 run 读一次,切换即时生效。
 		if err := s.m.pg.SetBool(settingStuckAdviser, *req.StuckAdviser); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.InterceptUnattended != nil {
+		// 无人值守(全局):interceptor 每次裁决读一次 settings,切换即时生效,无需重建。
+		if err := s.m.pg.SetBool(intercept.SettingInterceptUnattended, *req.InterceptUnattended); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

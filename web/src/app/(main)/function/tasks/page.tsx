@@ -3118,6 +3118,7 @@ function CreateTaskSheet({
   const [reviewEnabled, setReviewEnabled] = React.useState(false); // 二次审核开关;默认关。开启后新漏洞自动进入 AI 二次审核
   const [reviewSrcType, setReviewSrcType] = React.useState<"edusrc" | "enterprise">("edusrc"); // 审核标准:EduSRC(默认)/ 企业 SRC
   const [opMode, setOpMode] = React.useState<"standard" | "aggressive">("standard"); // 作战模式;默认 standard。aggressive=激进模式(红色警示,放宽一切技术限制,保留资产范围与破坏性操作底线)
+  const [unattended, setUnattended] = React.useState(false); // 无人值守;默认关。开启后 judge 需人审的命令自动强制二选一,不再等人
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
@@ -3188,6 +3189,7 @@ function CreateTaskSheet({
         reviewEnabled,
         reviewSrcType,
         opMode,
+        unattended,
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
@@ -3483,13 +3485,33 @@ function CreateTaskSheet({
                     <p className="font-semibold">⚠ 高风险：激进模式会放宽平台侧的安全限制</p>
                     <ul className="mt-1 list-disc space-y-0.5 pl-4">
                       <li>拦截规则的「询问」审批（含 LLM 兜底审批）对本任务全部自动放行，不再逐条人工确认；</li>
+                      <li>拦截规则与 LLM 审核给出的「拒绝」也一律转为放行（审计标注「激进模式·全放行」），不再有任何命令拦截；</li>
                       <li>停滞检测阈值大幅抬高、单次 run 预算加倍，深挖途中不会被过早中断。</li>
                     </ul>
-                    <p className="mt-1 font-semibold">仍保留的两条底线：</p>
+                    <p className="mt-1 font-semibold">仍保留的两条底线（在判定链之前，不受全放行影响）：</p>
                     <ul className="mt-1 list-disc space-y-0.5 pl-4">
                       <li>资产范围边界：不越权打偏到未授权目标（RoE 范围强制审批不自动放行）；</li>
-                      <li>破坏性 / 自毁操作：不影响目标正常业务（内置 deny 规则照常拦截）。</li>
+                      <li>平台凭据外泄防线与跨任务数据隔离照常生效。</li>
                     </ul>
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <label htmlFor="unattended-mode" className="flex items-center gap-2 text-sm font-medium">
+                    <Checkbox
+                      id="unattended-mode"
+                      checked={unattended}
+                      onCheckedChange={(v) => setUnattended(v === true)}
+                    />
+                    <span>无人值守（judge 需人审的命令自动强制二选一，不再等人）</span>
+                  </label>
+                  <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+                    <p>
+                      开启后，LLM 审核判定「需要人工审批」的命令将<b>自动发起第二次强制裁决</b>：
+                      在 allow / deny 中二选一（无法判断安全则拒绝），<b>不再进入人工审批队列</b>。
+                      适合夜间长跑、无人盯屏的任务；每次裁决在审计里标注「无人值守强制裁决」，可事后追查。
+                      全局开关（系统设置 → 无人值守）开启时，本任务无论勾选与否都按无人值守处理。
+                      RoE 范围强制与用户自建审批规则不受影响，仍需人工。
+                    </p>
                   </div>
                 </div>
               </CollapsibleContent>

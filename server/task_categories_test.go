@@ -23,14 +23,10 @@ func TestTaskCategoryBatchRoute(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey, 0)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
 
 	post := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/tasks/category/batch", strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)

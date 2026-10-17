@@ -174,7 +174,7 @@ func (f *sideHTTPFixture) call(t *testing.T, method, path string, body any, want
 	t.Helper()
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
-	req.Header.Set("Authorization", "Bearer "+f.token)
+	baAuth(f.s, req)
 	w := httptest.NewRecorder()
 	f.handler.ServeHTTP(w, req)
 	if w.Code != want {
@@ -252,7 +252,7 @@ func TestSideHTTPBusyIsolationClearAndReconnect(t *testing.T) {
 	defer httpServer.Close()
 	for i := 0; i < 2; i++ {
 		req, _ := http.NewRequest("GET", httpServer.URL+"/api/side-questions/"+e.ID+"/events", nil)
-		req.Header.Set("Authorization", "Bearer "+f.token)
+		baAuth(f.s, req)
 		req.Header.Set("Last-Event-ID", "999")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

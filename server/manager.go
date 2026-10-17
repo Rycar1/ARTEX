@@ -65,6 +65,7 @@ type Task struct {
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
 	ReviewEnabled        bool                   `json:"review_enabled"`         // 二次审核开关(创建时定,默认关);见 finding_review.go
 	OpMode               string                 `json:"op_mode"`                // 作战模式:standard(默认) | aggressive(激进)
+	Unattended           bool                   `json:"unattended"`             // 无人值守:judge ask 强制二次裁决,不进人工审批队列
 	ReviewSrcType        string                 `json:"review_src_type"`        // 审核标准:edusrc | enterprise
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
@@ -100,6 +101,10 @@ type taskLifecycleState struct {
 	CompanyIDs    []int64
 	CategoryID    *int64
 	CategoryName  string
+	// Unattended 是任务级无人值守开关:judge 给出 ask 时强制二次裁决,不进人工审批队列。
+	// 与其它可变字段一样必须经 lifecycleSnapshot/updateLifecycle 读写 ——
+	// intercept.SetTaskUnattended 注入的解析器会在 worker 线程读它。
+	Unattended bool
 }
 
 func (t *Task) lifecycleSnapshot() taskLifecycleState {
@@ -127,6 +132,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		CompanyIDs:    append([]int64(nil), t.CompanyIDs...),
 		CategoryID:    cloneInt64Ptr(t.CategoryID),
 		CategoryName:  t.CategoryName,
+		Unattended:    t.Unattended,
 	}
 }
 
@@ -151,6 +157,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
 	t.CategoryName = state.CategoryName
+	t.Unattended = state.Unattended
 	t.lifecycleMu.Unlock()
 }
 
@@ -1138,6 +1145,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CoverageEnabled: pt.CoverageEnabled,
 		ReviewEnabled:   pt.ReviewEnabled, ReviewSrcType: pt.ReviewSrcType,
 		OpMode:          pt.OpMode,
+		Unattended:      pt.Unattended,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: g, notify: make(chan struct{}, 1),
 	}
@@ -1165,6 +1173,9 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 	task.updateLifecycle(func(state *taskLifecycleState) {
 		state.Name = updated.Name
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
+		// 无人值守开关必须同步进内存 Task:intercept 的任务级解析器读的是它,
+		// 只改 DB 会让运行中的任务继续按旧值判定(切换看似无效)。
+		state.Unattended = updated.Unattended
 	})
 	return task, nil
 }

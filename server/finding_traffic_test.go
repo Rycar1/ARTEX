@@ -44,14 +44,10 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	// The archive test below replaces the cancelled service context. Wait for
 	// the side-question snapshot writer too before reusing this fixture.
 	<-s.side.done
-	token, err := signJWT(s.jwtKey, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, r)
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
