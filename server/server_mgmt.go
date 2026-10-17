@@ -166,6 +166,11 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
+	// 内网模块的活运行时必须在台账行被删除前回收：隧道 teardown 要经会话杀目标侧
+	// 进程，会话也要从注册表摘除才能关闭底层连接。台账行本身随后在删除事务里清掉。
+	if opts.DeleteIntranet {
+		s.teardownTaskIntranet(drainCtx, id)
+	}
 	result, err := s.m.DeleteTask(id, opts)
 	if err != nil {
 		var committed *taskDeleteCommittedError

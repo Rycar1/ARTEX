@@ -37,13 +37,9 @@ func TestTaskArchiveAPIQueueListAndLimits(t *testing.T) {
 	dataDir := t.TempDir()
 	s := New(ctx, m, dataDir, dataDir, dataDir)
 	s.archiveWG.Wait()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		req.Header.Set("Content-Type", "application/json")
 		recorder := httptest.NewRecorder()
 		s.Handler().ServeHTTP(recorder, req)

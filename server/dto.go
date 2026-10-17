@@ -61,6 +61,14 @@ type TaskDTO struct {
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ReviewEnabled      bool               `json:"review_enabled"`   // 二次审核开关(创建时定,默认关)
+	OpMode             string             `json:"op_mode"`          // 作战模式:standard(默认) | aggressive(激进)
+	Unattended         bool               `json:"unattended"`       // 无人值守:judge ask 强制二次裁决,不进人工审批队列
+	ReviewSrcType      string             `json:"review_src_type"`  // 审核标准:edusrc | enterprise
+	// LaunchRefused=true 表示任务建好了但平台拒绝启动(无靶机拒跑),原因见
+	// LaunchRefusedReason。仅建任务响应会带上,列表/详情恒为 false。
+	LaunchRefused       bool   `json:"launch_refused,omitempty"`
+	LaunchRefusedReason string `json:"launch_refused_reason,omitempty"`
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -134,6 +142,10 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		ReviewEnabled:      t.ReviewEnabled,
+		ReviewSrcType:      t.ReviewSrcType,
+		OpMode:             t.OpMode,
+		Unattended:         lifecycle.Unattended,
 	}
 }
 
@@ -327,6 +339,30 @@ type FindingDTO struct {
 	Inherited       bool              `json:"inherited,omitempty"`
 	Assets          []FindingAssetDTO `json:"assets,omitempty"`
 	TS              string            `json:"ts"`
+
+	// AI 二次审核结论(参考 AutoHunter Reviewer,见 server/finding_review.go)。
+	// review_verdict 取值 ''(未审)/accepted/ignored;ignored 的漏洞会被
+	// 自动置为 status=ignored,原因写在 review_reasons。
+	ReviewVerdict  string   `json:"review_verdict,omitempty"`
+	ReviewSeverity string   `json:"review_severity,omitempty"`
+	ReviewScore    *float64 `json:"review_score,omitempty"`
+	ReviewReasons  string   `json:"review_reasons,omitempty"`
+	ReviewNotes    string   `json:"review_notes,omitempty"`
+	ReviewedAt     string   `json:"reviewed_at,omitempty"`
+
+	// 四层去重(见 db/finding_dedup.go / db/finding_merge_manual.go)。
+	// merged_into 非空表示这条已被合并到另一条;status 同时为 duplicate。
+	// suspected_dup_of 是审核模型/结构化键给出的「疑似重复」指向,等待人工确认。
+	MergedInto        string   `json:"merged_into,omitempty"`
+	SuspectedDupOf    string   `json:"suspected_dup_of,omitempty"`
+	SuspectedDupScore *float64 `json:"suspected_dup_score,omitempty"`
+
+	// 危害升级(见 server/finding_escalate.go)。已采纳的低危/中危漏洞会自动派一条
+	// 「扩大危害」意图;escalate_status 取值 dispatched/done/failed,base_severity 是
+	// 升级前的级别(升级不成立时回退用)。
+	EscalatedAt    string `json:"escalated_at,omitempty"`
+	EscalateStatus string `json:"escalate_status,omitempty"`
+	BaseSeverity   string `json:"base_severity,omitempty"`
 }
 
 // FindingAssetDTO is one asset a finding is anchored to, pre-labelled for display.
@@ -456,6 +492,26 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		Evidence:  f.Evidence,
 		Report:    f.Report,
 		TS:        rfc3339(f.CreatedAt),
+	}
+	d.ReviewVerdict = f.ReviewVerdict
+	d.ReviewSeverity = f.ReviewSeverity
+	d.ReviewScore = f.ReviewScore
+	d.ReviewReasons = f.ReviewReasons
+	d.ReviewNotes = f.ReviewNotes
+	if f.ReviewedAt != nil {
+		d.ReviewedAt = rfc3339(*f.ReviewedAt)
+	}
+	if f.MergedInto != nil {
+		d.MergedInto = i64s(*f.MergedInto)
+	}
+	if f.SuspectedDupOf != nil {
+		d.SuspectedDupOf = i64s(*f.SuspectedDupOf)
+	}
+	d.SuspectedDupScore = f.SuspectedDupScore
+	d.EscalateStatus = f.EscalateStatus
+	d.BaseSeverity = f.BaseSeverity
+	if f.EscalatedAt != nil {
+		d.EscalatedAt = f.EscalatedAt.UTC().Format(time.RFC3339)
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
@@ -613,6 +669,9 @@ type LLMProfileDTO struct {
 	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
 	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
 	SessionHeaderKey string `json:"session_header_key"`
+	// 自定义会话体字段名：非空时在每次请求的 JSON 体里注入该字段，值=当前会话/意图的
+	// session id。''=不注入。用于「请求体缺 conversation id 就 400」的网关。
+	SessionBodyField string `json:"session_body_field"`
 	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
@@ -640,6 +699,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		SessionBodyField: p.SessionBodyField,
 		Retry:            p.Retry,
 	}
 }

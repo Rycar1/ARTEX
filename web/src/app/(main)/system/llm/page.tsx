@@ -328,6 +328,7 @@ function ProfileSheet({
   const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
+  const [sessionBodyField, setSessionBodyField] = React.useState(""); // 自定义会话体字段名;空=不注入
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -355,6 +356,7 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setSessionBodyField(profile?.session_body_field ?? "");
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -401,6 +403,7 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        sessionBodyField.trim(),
       );
       // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
       if (r.ok)
@@ -444,6 +447,7 @@ function ProfileSheet({
         // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        session_body_field: sessionBodyField.trim(),
         retry,
       });
       if (isNew) toast.success(`已新建：${name.trim()}（在卡片上「设为激活」以启用）`);
@@ -591,6 +595,22 @@ function ProfileSheet({
               填写头名后，每次请求都会带上这个 HTTP 头，头值自动填为 <b>当前会话的 session id</b>（chat 会话如
               conv-12、worker 如 exp3-worker-i87）。用于按 session-id 头做提示缓存 /
               粘性路由的网关；同一会话多轮稳定、不同会话互不相同。留空则不发送。
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            <Label htmlFor="p-session-body">自定义会话体字段（可选）</Label>
+            <Input
+              id="p-session-body"
+              className="font-mono"
+              placeholder="如 conversation_id（留空=不注入）"
+              value={sessionBodyField}
+              onChange={(e) => setSessionBodyField(e.target.value)}
+            />
+            <p className="text-muted-foreground text-xs">
+              填写字段名后，每次请求的 JSON 体里都会多出这个字段，值同样是 <b>当前会话的 session id</b>。
+              用于「请求体里没有 conversation id 就直接 400」的网关（典型报错：upstream 400
+              conversation id missing）；这类网关往往只拒绝一部分请求，看起来像随机的上游抖动。留空则不注入。
             </p>
           </div>
 

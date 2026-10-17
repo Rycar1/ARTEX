@@ -21,12 +21,18 @@ type ReviewBackground struct {
 
 // ReviewInput contains only the current call and explicitly selected background.
 // Execution history and call correlation belong to the separate audit record.
+//
+// Decoded holds platform-decoded candidates for any encoded/obfuscated payload
+// embedded in Arguments (base64/hex/URL/HTML/escape/reverse). It is derived
+// purely from the current call, so it is not history; the judge must base its
+// verdict on the decoded (real) content, not the outer encoding.
 type ReviewInput struct {
 	Version    int               `json:"version"`
 	WorkingDir string            `json:"working_directory,omitempty"`
 	Background *ReviewBackground `json:"background,omitempty"`
 	Tool       string            `json:"tool_name"`
 	Arguments  json.RawMessage   `json:"arguments"`
+	Decoded    []DecodedVariant  `json:"decoded_variants,omitempty"`
 }
 
 type reviewContextKey struct{}
@@ -55,7 +61,10 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 	if !json.Valid(arguments) {
 		return ReviewInput{}, fmt.Errorf("工具参数不是有效 JSON")
 	}
-	in := ReviewInput{Version: 4, Tool: tool, Arguments: append(json.RawMessage(nil), arguments...)}
+	in := ReviewInput{Version: 5, Tool: tool, Arguments: append(json.RawMessage(nil), arguments...)}
+	if vs := SelectVariantsForReview(DecodeVariants(string(arguments), decodeMaxDepth)); len(vs) > 0 {
+		in.Decoded = vs
+	}
 	if env, ok := ctx.Value(reviewContextKey{}).(reviewEnvironment); ok {
 		in.WorkingDir = env.workingDir
 		background := env.background

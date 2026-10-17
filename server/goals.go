@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,9 +26,30 @@ type goalSpec struct {
 //     分解完再 engine.Run —— 引擎在 goal 节点就绪后才启动,避免 planner 抢在 goal 之前跑的竞态。
 //
 // 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
-func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
+//
+// 返回值报告任务是否真的启动:(false, reason) 表示被「无靶机拒跑」拦下,调用方
+// (HTTP 建任务)可以把它回给前端/驱动脚本 —— 否则建任务接口照样返回 201,调用方
+// 只看到任务停在 created,不知道平台拒绝了启动。
+func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) (bool, string) {
 	if !s.engine.beginTaskOperation(t.ID) {
-		return
+		return false, "任务正在执行其它操作(暂停/删除),本次未启动"
+	}
+	// 无靶机任务拒跑(实测事故:CTF 任务建任务时丢了靶机入口,worker 没有可打的目标,
+	// 就跑去翻平台自己的数据目录、nmap 扫自家宿主机 45 分钟、0 产出)。
+	// 一个任务至少要有一个「可打的东西」:登记范围 / 关联企业资产 / 描述或目标里能
+	// 识别的目标(URL / IP / 域名,或显式的【靶机】【附件】声明 —— 静态附件题没有网络
+	// 目标,但附件本身就是工作对象)。三者皆无就不启动 —— 留在 created 状态、把原因
+	// 写进任务活动,补齐目标后手动开始即可。带 parent_ref 的编排子任务继承父任务
+	// 上下文,不在此判定。
+	if t.ParentRef == "" && !s.taskHasDeclaredTarget(t) {
+		const reason = "任务未声明任何目标:没有登记范围(task_scope)、没有关联企业资产," +
+			"描述与目标里也没有可识别的目标(URL / IP / 域名 / 【靶机】或【附件】声明)。" +
+			"请补充靶机入口或关联资产范围后重新开始。"
+		s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "text",
+			Summary: "【平台拒绝启动】" + reason})
+		log.Printf("[task %s] 无靶机任务拒跑:未声明任何目标", t.ID)
+		s.engine.decInflight(t.ID)
+		return false, reason
 	}
 	s.seed(t, seedText)
 	if seedFirstIntent {
@@ -37,6 +59,54 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
 		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
 	}
+	return true, ""
+}
+
+// targetURLRe / targetIPRe / targetHostRe recognize the three ways a description
+// or goal can name a target. The host form requires a TLD from a common list so a
+// file name like "main2.hdr" or a product string like "ISCTF2025" is not mistaken
+// for a target (which would defeat the no-target refusal).
+var (
+	targetURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>()]+`)
+	targetIPRe   = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+	targetHostRe = regexp.MustCompile(`(?i)\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.(?:com|cn|net|org|edu|gov|mil|int|io|ai|dev|app|xyz|top|cc|me|info|biz|tv|site|online|tech|cloud|shop|vip|club|pro|link|live|fun|space|store|work|one|run|co|uk|jp|kr|hk|tw|sg|de|fr|ru|in|au|br|ca|nl|eu|ch|it|es|se|no|fi|dk|pl|cz|at|be|ie|nz|za|mx|ar|cl|tr|vn|th|my|id|ph)\b(?::\d{1,5})?`)
+	// targetDeclRe 是「显式目标声明」段:任务作者写明入口或附件时,即使文本里没有
+	// URL/IP/域名,也算声明了工作对象。静态附件题(逆向/取证/病毒分析)只有附件、
+	// 没有网络目标,靠这一条才不会被「无靶机拒跑」误杀。
+	targetDeclRe = regexp.MustCompile(`【\s*(靶机|目标|入口|附件|样本)\s*】|本地附件题|离线题|无网络目标|attachment[- ]only`)
+)
+
+// textHasTarget reports whether free text names something to attack.
+func textHasTarget(text string) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if targetDeclRe.MatchString(text) {
+		return true
+	}
+	return targetURLRe.MatchString(text) || targetIPRe.MatchString(text) || targetHostRe.MatchString(text)
+}
+
+// taskHasDeclaredTarget reports whether a task has anything to aim at: a bound
+// company (whose assets were snapshotted into the task), registered scope rules,
+// or a recognizable target in the description/goal. Used by launchTask to refuse
+// starting a task that would otherwise have to invent a target — which is how a
+// CTF task whose container entry was lost ended up scanning the platform host.
+func (s *Server) taskHasDeclaredTarget(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	if len(t.CompanyIDs) > 0 {
+		return true
+	}
+	if s.m != nil && s.m.pg != nil {
+		if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil && id > 0 {
+			if rows, err := s.m.pg.Assets().ListTaskScope(id); err == nil && len(rows) > 0 {
+				return true
+			}
+		}
+	}
+	return textHasTarget(t.Description) || textHasTarget(t.Goal)
 }
 
 func (s *Server) startTaskEngine(t *Task) {

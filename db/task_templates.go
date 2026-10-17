@@ -19,6 +19,7 @@ const (
 
 var (
 	ErrTaskTemplateInvalid      = errors.New("invalid task template")
+	ErrTaskTemplateBuiltin      = errors.New("built-in task template is protected")
 	ErrTaskTemplateNameConflict = errors.New("task template name already exists")
 	ErrTaskTemplateNotFound     = errors.New("task template not found")
 )
@@ -33,6 +34,7 @@ type TaskTemplate struct {
 	Goal           string                   `json:"goal"`
 	CategoryID     *int64                   `json:"category_id"`
 	InterceptRules []TaskInterceptRuleInput `json:"intercept_rules"`
+	Builtin        bool                     `json:"builtin"`
 	CreatedAt      time.Time                `json:"created_at"`
 	UpdatedAt      time.Time                `json:"updated_at"`
 }
@@ -59,12 +61,12 @@ type TaskTemplatePatch struct {
 	SetInterceptRules bool
 }
 
-const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, created_at, updated_at`
+const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, created_at, updated_at, builtin`
 
 func scanTaskTemplate(row interface{ Scan(...any) error }) (TaskTemplate, error) {
 	var t TaskTemplate
 	var rulesRaw []byte
-	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &t.CreatedAt, &t.UpdatedAt, &t.Builtin); err != nil {
 		return t, err
 	}
 	t.InterceptRules = []TaskInterceptRuleInput{}
@@ -186,7 +188,7 @@ RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.Categor
 
 // ListTaskTemplates returns the most recently maintained templates first.
 func (d *DB) ListTaskTemplates() ([]*TaskTemplate, error) {
-	rows, err := d.Query(`SELECT ` + taskTemplateCols + ` FROM task_templates ORDER BY updated_at DESC, id DESC`)
+	rows, err := d.Query(`SELECT ` + taskTemplateCols + ` FROM task_templates ORDER BY builtin DESC, updated_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +246,7 @@ SET name=CASE WHEN $2 THEN $3::text ELSE name END,
     goal=CASE WHEN $7 THEN $8::text ELSE goal END,
     category_id=CASE WHEN $9 THEN $10::bigint ELSE category_id END,
     intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END
-WHERE id=$1
+WHERE id=$1 AND (NOT builtin OR NOT $2 OR nkey = $4::text)
 RETURNING `+taskTemplateCols,
 		id,
 		patch.Name != nil, patch.Name, nkey,
@@ -254,6 +256,11 @@ RETURNING `+taskTemplateCols,
 		patch.SetInterceptRules, rulesJSON,
 	))
 	if err == sql.ErrNoRows {
+		// Either the id is gone, or it is a built-in preset and the caller tried to rename it.
+		var builtin bool
+		if qerr := d.QueryRow(`SELECT builtin FROM task_templates WHERE id=$1`, id).Scan(&builtin); qerr == nil && builtin {
+			return nil, ErrTaskTemplateBuiltin
+		}
 		return nil, ErrTaskTemplateNotFound
 	}
 	if taskTemplateUniqueViolation(err) {
@@ -266,11 +273,206 @@ RETURNING `+taskTemplateCols,
 }
 
 // DeleteTaskTemplate deletes one preset and reports whether it existed.
+// DeleteTaskTemplate deletes one user preset and reports whether it existed.
+// Built-in presets (CTF/SRC) are protected and cannot be removed.
 func (d *DB) DeleteTaskTemplate(id int64) (bool, error) {
+	var builtin bool
+	err := d.QueryRow(`SELECT builtin FROM task_templates WHERE id=$1`, id).Scan(&builtin)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if builtin {
+		return false, ErrTaskTemplateBuiltin
+	}
 	result, err := d.Exec(`DELETE FROM task_templates WHERE id=$1`, id)
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
 	return n > 0, err
+}
+
+// builtinTaskTemplates 是随程序发布的内置任务模板正文。描述/目标可被用户改写，
+// 但名称与存在性受保护(不可改名/删除)，每次启动幂等补齐；内置正文随版本升级会用
+// builtinTaskTemplatesVersion 旗标做一次性强制刷新（见 seedBuiltinTaskTemplates）。
+var builtinTaskTemplates = []struct {
+	Name        string
+	Description string
+	Goal        string
+}{
+	{
+		Name:        "CTF",
+		Description: "CTF 竞赛 / 靶场场景：目标处于隔离比赛环境，允许为解题放开手脚做高强度利用与破坏性操作（打点、提权、横向、拿 flag），不承担业务影响。开局强制先做题型判定（web / pwn / reverse / crypto / misc / forensics）并按题型挂对应方法论与工具清单，同时把 flag 格式提取成显式验收目标——每条利用链以「产出符合该格式的字符串」为收敛判据。",
+		Goal: `在隔离的 CTF / 靶场环境中解题并拿到 flag。这是比赛/靶场场景，可以放开手脚：允许高强度利用、破坏性操作、提权、横向与痕迹清理，不承担业务影响。
+
+【第 0 步 · 强制题型判定（判完型才允许动手）】
+开局第一件事是判型，不是直接扫端口。逐条取证再下结论，判定结果与依据必须写进交付：
+1. 题面文字：题干关键词指向题型——上传/绕过/参数/注入/鉴权/源码 → web；nc 交互/溢出/ROP/堆/沙箱 → pwn；注册机/校验/去混淆/自解密/算法还原 → reverse；密文/公钥/模数 n e c/密钥交换 → crypto；流量/磁盘/内存镜像/日志/图片/音频 → forensics；编码杂项/脑洞/冷门协议 → misc。
+2. 附件类型：先 file 看类型与魔数（ELF/PE/.so → pwn 或 reverse；pcap/pcapng → forensics；img/raw/dd/E01 → forensics；apk/dex → mobile；png/jpg/gif/wav/zip/rar → misc 或 forensics；纯文本/源码/前端 JS → web 或 crypto）。
+3. 目标端口与服务特征：nc 目标端口看 banner——HTTP/80/443 或直接给了 URL → web；裸二进制交互、菜单式读写、无提示直接吃输入 → pwn；只给主机端口不给程序 → web 或 misc。
+4. 给出的入口：URL/源码/前端 JS/接口文档 → web；二进制 + libc/ld + 远程地址 → pwn；只有密文与参数 → crypto；日志/流量/内存转储/磁盘镜像 → forensics。
+5. flag 提交格式提示：平台规则、题目描述、样例 flag 的前缀/长度/字符集（直接决定第 1 步怎么做）。
+
+题型集合以 web / pwn / reverse / crypto / misc / forensics 六类为准（mobile、osint 可作补充，但别铺开）。判定结论要落盘成第一条记录：题型 + 判定依据（具体是哪条证据）+ 选定的方法论文档路径；后续所有动作都挂在这条结论下，中途改判也要写明改判依据。
+
+判定后按题型挂方法论与工具清单，先 Read 对应文档再动手，禁止手搓轮子：
+- web → skills/ctf-toolbox/refs/web.md
+- pwn → skills/ctf-toolbox/refs/pwn.md
+- reverse → skills/ctf-toolbox/refs/rev.md
+- crypto → skills/ctf-toolbox/refs/crypto.md
+- forensics → skills/ctf-toolbox/refs/forensics.md
+- misc → skills/ctf-toolbox/refs/misc.md
+- 附件不知从哪下手 → skills/ctf-toolbox/refs/attachments.md（附件指纹 → 工具链映射表）
+- 总索引与环境自检 → skills/ctf-toolbox/SKILL.md（不确定工具在不在，先 command -v 探一下）
+
+判定不确定时的处理（硬性，不许瞎猜一个方向往下扎）：取最可能的两个题型，各写一个最小验证动作，用一次探测把两者区分开。例：web 与 misc 之间，先 curl -i 目标一次，有 HTTP 响应就走 web；pwn 与 reverse 之间，先 file + checksec 再本地跑一次，是交互服务走 pwn、是本地校验程序走 reverse；crypto 与 reverse 之间，看输入是「参数与密文」还是「一个可执行程序」；forensics 与 misc 之间，先 file + binwalk 看有无嵌套结构与文件系统，是磁盘/内存/流量镜像就走 forensics，是单文件隐写就走 misc。探测命令与结论一并写进交付。
+
+【第 1 步 · 把 flag 格式提取成显式目标】
+- 开局先从题面、平台规则、题目样例、已知其它题 flag 中提取格式：前缀（flag{}、DASCTF{}、ctfshow{}、纯 hex、UUID、base64）、长度、字符集，把格式原文写下来，作为本次解题的验收标准。
+- 每条利用链的收敛判据是「产出符合该格式的字符串」，不是「看起来像 flag」。拿到疑似字符串先做格式校验（正则/长度/字符集），不匹配就继续推进，别提前收工。
+- 格式未知时：先按最常见的 xxx{...} 试（前缀用 flag/ctf/题目名），同时把「找到 flag 格式定义」本身列成一条待办；之后任何新信息（平台规则、响应头、附件里的 readme、源码注释、配置项）都要回头补这个定义。
+- 题目已明确给出格式时，把匹配规则写死在交付里（例如 flag\{[0-9a-f]{32}\} 这种前缀 + 长度 + 字符集的组合），每拿到一个候选就现场跑一次校验，不靠肉眼判断。
+- flag 常见落点，按题型优先找：/flag 与环境变量、数据库表与配置文件、进程内存与流量响应体、图片元数据与文件尾部追加数据、源码里的比较逻辑与常量。
+- 候选 flag 必须回显原文，并说明它出现在哪一步的哪个响应或文件里：完整命令 + 原始回显片段 + 文件路径/偏移/时间点。禁止把推测、脑补、格式化拼出来的字符串当 flag 上报；不确定的标「候选 · 未验证」并写清验证缺口。
+
+【第 2 步 · 附件指纹 → 工具链】
+- 每个附件先做指纹：file 看类型与魔数，xxd 看文件头，strings -n 6 看特征串，binwalk 看嵌套结构。
+- 按指纹直接查 skills/ctf-toolbox/refs/attachments.md 的映射表上工具链，不要每道题从零摸索。
+- 映射速览（全表见 attachments.md）：ELF → checksec + objdump/radare2；PE → strings + 反编译；APK → jadx/apktool（未预装，先 command -v）；PCAP → tshark；内存镜像 → volatility3（未预装，先 command -v）；图片 → zsteg/binwalk/exiftool；压缩包 → zip2john + john；音频 → sox 频谱；二维码 → zbarimg；.py/.js/.php → 直接读源码；未知 → binwalk + strings。
+- 工具先确认存在（command -v <工具名>）；缺工具就在交付里标注未执行，并给出可复现的获取或替代命令，禁止假装跑过。
+
+【第 3 步 · 解题主线（判型后按题型走）】
+1. 侦察定面：枚举端口与服务、Web 路径与参数、指纹与已知漏洞版本，先把攻击面铺开。
+2. 漏洞利用：对确认的漏洞直接利用（RCE、反序列化、文件包含、SQL 注入、越权、模板注入等），必要时上传工具、写 webshell、提权。
+3. 后利用与横向：允许内网横向、抓取凭据、读取任意文件，以拿到最终目标（flag / 域控 / 隐藏关卡）为准。
+4. 破坏性操作允许：可以改配置、重启服务、清理痕迹，比赛环境不追求业务连续性。
+5. 交付：写清完整利用链、每步用的命令与 payload、拿到的 flag 原文及其位置（响应/文件/偏移）、flag 格式的提取依据；未打通的部分标注卡点与已排除的路径。
+
+【纪律】
+- 以最快拿到 flag 为第一目标，不要停在信息收集；但第 0 步判型与第 1 步 flag 格式提取不许跳过。
+- 每条结论都要附实际命令与回显，禁止虚构结果；没跑通的标「未执行」。`,
+	},
+	{
+		Name:        "SRC",
+		Description: "SRC / 众测 / 漏洞赏金场景：只在授权范围内做漏洞验证，强调边界——证明漏洞存在即可，禁止破坏性操作与深入利用（不取数据、不上传 webshell、不横向、不驻留）；但【必须遍历并测试完授权范围内的全部资产后才允许结束】，禁止挖到一半提前收尾；且单个资产可能存在多个独立漏洞，禁止「一个资产发现一个洞就停」。",
+		Goal: `在授权的 SRC / 众测范围内做漏洞验证与提交，核心是「边界」，并【必须把授权范围内的资产全部测完才能结束——禁止挖到一半就自己收尾】。
+
+【授权范围】先确认并严格遵守：允许的域名 / IP / 端口 / 子域、允许的时间窗、允许的测试类型。范围外的资产一律不碰。
+
+【结束条件（硬性红线·最高优先，先读这条）】在【授权范围内全部资产都已被测试并给出结论】之前，禁止结束任务——禁止把最后一个目标 prove_goal，禁止调用 goal_met：
+- 开局先枚举并锁定 in-scope 资产清单：用 list_assets 摸清资产，用 add_task_scope 把范围锚定到本任务；范围未锚定就先锚定，再开测。
+- 每轮规划都要核对覆盖情况：读 graph_overview 的 coverage（by_type 的 总数/已测）与 list_untested_assets（未测资产清单），把「仍有未测资产」当成必须继续派意图的待办。
+- 每个 in-scope 资产都必须落到一个明确结论：①已发现漏洞（含可复现证据）；②已按允许的测试类型穷尽该资产主要攻击面且未发现漏洞；③明确排除（附原因：范围外 / 无法访问 / 与已测资产等价去重 / 受边界限制不得测试）。
+- 只要还有 in-scope 资产没有上述结论，就必须继续为它派意图补测；禁止以「拿到一个洞 / 覆盖度大体够了 / 核心资产已拿下 / 报告已经能写」为由提前收尾。
+- 【单资产多漏洞·穷尽挖掘】一个资产不等于一个漏洞：同一域名 / IP / 主机往往同时存在多个互相独立的问题（不同参数、不同接口、不同角色权限、不同中间件 / 版本）。禁止「发现第一个漏洞就收手」——发现一个洞只说明该资产「已验证了部分攻击面」，必须继续把该资产在允许测试类型下的其余入口（其它参数 / 目录 / 接口 / 子域 / 端口 / 鉴权点 / 角色）逐个走完，每个漏洞单独取证、单独记录，直到该资产主要攻击面穷尽或已明确排除，才能给它下结论。
+- 覆盖率百分比（coverage 百分比）会因容器型资产与大量枚举而偏低，不作为唯一判据；判据是「list_untested_assets 里是否还有本任务范围内、尚未给出结论的资产」，不是单纯的百分比。
+- 全部资产都已有结论后，才允许逐个 prove_goal 收尾；收尾报告必须列出资产清单与每个资产的结论（含「未发现漏洞」与「明确排除」的资产）。
+
+【验证尺度】最小化验证：用能证明漏洞存在的最少请求即可，拿到 PoC 证据就停。
+- 只读优先：SQL 注入用布尔 / 时间盲注或只读探测证明，不 dump 数据；命令执行用 id / whoami 等无害命令证明，不读敏感文件、不留后门。
+- 越权 / IDOR：只取「能证明越权」的最小样本，不对真实用户数据做批量遍历。
+- 上传：只上传无害标记文件证明可上传，不上传 webshell、不留可执行后门。
+
+【明确禁止（红线）】
+- 不拖库、不篡改或删除业务数据、不修改目标配置。
+- 不上传 webshell / 不部署隧道 / 不横向移动 / 不驻留 / 不创建账号。
+- 不做 DoS / 压测 / 高频爆破，不干扰业务可用性。
+- 不碰范围外资产，不碰真实用户隐私数据；若不可避免，立即停止并在报告中说明。
+
+【处置与交付】
+- 发现高危（可直接接管、可拖库等）立即停止深入，只保留证明所需证据。
+- 记录：URL、参数、请求 / 响应片段（敏感信息脱敏）、复现步骤、影响说明、修复建议。
+- 按平台规范分级提交；不能确认或影响无法自证的问题标注为「存疑」，不夸大。
+
+【边界优先】任何一步拿不准是否越界，就先停下、只做到能证明为止，不要为了「打得深」而突破边界；确实无法测试的资产按「结束条件」第 ③ 类（明确排除）如实记录，而不是直接跳过或提前收尾。`,
+	},
+	{
+		Name:        "渗透-基础",
+		Description: "内网渗透·基础模式：低噪音优先。先控制扫描与请求频率、避免触发 WAF / IDS 告警与业务抖动，再用低风险手法逐步拿 RCE、取得内网落脚点并做最小必要的横向；适合对稳定性与隐蔽性有要求的授权渗透。",
+		Goal: `在授权的内网渗透场景里，以「低噪音」为前提，尽可能拿到 RCE 并取得内网落脚点，为后续横向打基础。
+
+【总原则：动静要小】
+- 控制扫描与请求频率：端口 / 目录 / 子域枚举降速限并发，避免触发 WAF / IDS / 封禁与业务抖动。
+- 优先低风险手法：先被动信息收集与指纹识别，再打已知漏洞与弱口令，最后才考虑需要写入 / 执行的重手法。
+- 能用只读 / 无害验证证明的，绝不写入；能一次打通的，不做重复高频尝试。
+- 遇到可能影响业务可用性的操作（重启服务、大量写入、爆破）先评估，不确定就不做。
+
+【主目标：拿 RCE、进内网】
+1. 侦察：枚举端口与服务、Web 路径与参数、中间件与版本指纹，圈定可利用入口。
+2. 拿 RCE：优先命中可直接命令执行的入口（文件上传 / 包含、反序列化、SSTI、命令注入、已知组件漏洞、后台功能点的命令执行）；拿到一个稳定命令执行即可，不追求最大化破坏。
+3. 进内网：以该主机为落脚点，做最小必要的内网信息收集（路由、网段、可达服务、凭据线索），确认可继续深入的路径。
+4. 横向：只做证明可达与权限所需的最小动作，拿到新的主机 / 服务权限即记录，不批量扩散。
+
+【证据与交付】
+- 每一步记录：目标、入口、命令 / payload、回显、时间、影响范围。
+- RCE 证明用 id / whoami / hostname 等无害命令即可，不读敏感业务数据、不留后门。
+- 未打通的路径标注卡点与已排除方向；所有结论附真实命令与回显，禁止虚构。
+
+【纪律】低噪音优先，稳扎稳打；不确定是否越界就先停，只做到能证明为止。`,
+	},
+	{
+		Name:        "渗透-激进",
+		Description: "内网渗透·激进模式：以最快拿到 RCE、打进内网并持续深入为唯一目标，在授权范围内不择手段（全端口扫描、高频爆破、全量 payload、批量利用、上传工具与 webshell、提权、抓凭据、横向、驻留）；适用于隔离靶场 / 比赛 / 授权红队演练，不追求业务连续性。",
+		Goal: `在授权的内网渗透 / 红队演练 / 靶场场景里，以「最快拿到 RCE、打进内网并持续深入」为唯一目标，在授权范围内不择手段。
+
+【总原则：效率优先，火力全开】
+- 放开手脚：全端口扫描、全量子域 / 目录 / 参数枚举、高频爆破、全量 payload 轮换、批量利用，只要在授权范围内就大胆尝试。
+- 以拿权限为导向：不做过度收敛，宁可多试几种利用链，也不放过任何一个可能的入口。
+- 允许破坏性操作：写文件、上传 webshell、改配置、重启服务、清理痕迹，在演练 / 靶场场景不追求业务连续性。
+- 并行推进：多个入口 / 多台目标同时开打，谁先出结果就沿谁的链路继续深入。
+
+【主目标：RCE → 内网 → 域控 / 最终目标】
+1. 全面侦察：全端口与服务识别、全量指纹与已知漏洞版本比对，把所有可能入口一次铺开。
+2. 不择手段拿 RCE：把所有能导向命令执行 / 代码执行的手法都试一遍（上传、包含、反序列化、SSTI、注入、已知组件漏洞、弱口令、配置泄露凭证、中间件）。
+3. 提权与驻留：拿到低权 shell 后立即提权，部署隧道 / 代理，建立稳定通道。
+4. 内网横向：抓取凭据（内存 / 配置文件 / 注册表 / 浏览器），横向到更多主机，逐层深入直到拿下域控或最终目标（flag / 核心系统）。
+5. 交付：写清完整攻击链、每步命令与 payload、拿到的凭据与权限层级、最终目标原文及其位置；未打通的部分标注卡点与已排除路径。
+
+【纪律】以最快拿到 RCE、打进内网并拿到最终目标为第一目标，不要停在信息收集；每条结论都要附实际命令与回显，禁止虚构结果。`,
+	},
+}
+
+// builtinTaskTemplatesVersion 是内置任务模板正文的版本旗标：DB 中记录的版本低于当前值时，
+// 本次启动强制把内置模板(CTF/SRC/渗透-基础/渗透-激进)的 description/goal 刷成新版，刷新后写入当前版本；
+// 此后只重申 builtin 标记，不再覆盖用户对正文的修改。
+// 历史版本：v5 给老库补上 SRC 的「必须测完所有资产才能结束 + 单资产穷尽多漏洞」硬约束；
+// v6 给老库补上 CTF 的「开局强制题型判定 + flag 格式驱动 + 附件指纹→工具链」三项正文
+// （不改此旗标，新 CTF 正文永远不会到达已有部署）。
+const (
+	builtinTaskTemplatesVersionKey = "builtin_task_templates_version"
+	builtinTaskTemplatesVersion    = "6"
+)
+
+// seedBuiltinTaskTemplates 幂等播种内置模板(CTF/SRC)。默认只重申 builtin 标记、不覆盖
+// 用户对描述/目标的修改；当内置模板版本升级时（见上面的版本旗标）做一次性强制刷新。
+func (d *DB) seedBuiltinTaskTemplates() error {
+	v, _, err := d.GetSetting(builtinTaskTemplatesVersionKey)
+	if err != nil {
+		return fmt.Errorf("read builtin templates version: %w", err)
+	}
+	refresh := v != builtinTaskTemplatesVersion
+	for _, t := range builtinTaskTemplates {
+		q := `
+INSERT INTO task_templates(name, nkey, description, goal, builtin)
+VALUES ($1,$2,$3,$4,true)
+ON CONFLICT (nkey) DO UPDATE SET builtin = true`
+		if refresh {
+			q = `
+INSERT INTO task_templates(name, nkey, description, goal, builtin)
+VALUES ($1,$2,$3,$4,true)
+ON CONFLICT (nkey) DO UPDATE SET description = EXCLUDED.description, goal = EXCLUDED.goal, builtin = true`
+		}
+		if _, err := d.Exec(q, t.Name, taskTemplateNKey(t.Name), t.Description, t.Goal); err != nil {
+			return fmt.Errorf("builtin template %q: %w", t.Name, err)
+		}
+	}
+	if refresh {
+		if err := d.SetSetting(builtinTaskTemplatesVersionKey, builtinTaskTemplatesVersion); err != nil {
+			return fmt.Errorf("record builtin templates version: %w", err)
+		}
+	}
+	return nil
 }

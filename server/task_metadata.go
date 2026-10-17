@@ -25,8 +25,9 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxTaskMetadataRequestSize)
 	var request struct {
-		Name   *string `json:"name"`
-		Pinned *bool   `json:"pinned"`
+		Name       *string `json:"name"`
+		Pinned     *bool   `json:"pinned"`
+		Unattended *bool   `json:"unattended"`
 	}
 	if err := decode(r, &request); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -37,8 +38,8 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if request.Name == nil && request.Pinned == nil {
-		writeErr(w, http.StatusBadRequest, "至少需要提供 name 或 pinned")
+	if request.Name == nil && request.Pinned == nil && request.Unattended == nil {
+		writeErr(w, http.StatusBadRequest, "至少需要提供 name、pinned 或 unattended")
 		return
 	}
 	if request.Name != nil {
@@ -53,7 +54,7 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 		request.Name = &name
 	}
-	task, err := s.m.UpdateTaskMetadata(taskID, db.TaskPatch{Name: request.Name, Pinned: request.Pinned})
+	task, err := s.m.UpdateTaskMetadata(taskID, db.TaskPatch{Name: request.Name, Pinned: request.Pinned, Unattended: request.Unattended})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

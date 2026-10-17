@@ -7,10 +7,16 @@ server/webui/dist
 data
 *.db
 transcripts
-bench/kv
-bench/debug
-bench/__pycache__
-bench/.env
-bench/scheduler.py
-bench/entrypoint_v2.sh
-bench/seed_v2.sh
+
+# 敏感文件：绝不进入 docker build 上下文
+# 注意：.gitignore 只管 git，管不到 docker build；Dockerfile.source 有 COPY . .
+.env
+.env.*
+!.env.example
+jwt.key
+*.key
+*.pem
+config.json
+scheduler_state.json
+*.db-wal
+*.db-shm

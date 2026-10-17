@@ -51,6 +51,11 @@ type taskLLMRuntime struct {
 	s        *Server
 	taskID   string
 	agentKey string
+	// noReasoning 让这条链路解析「不带思考参数」的 provider 变体(见
+	// Server.reviewProviderForProfile)。审核调用必须输出一个紧凑 JSON,而 profile
+	// 上配的 reasoning_effort 会绕过请求级 thinking=disabled 继续生效(norma 无条件
+	// 发送 reasoning_effort),把整个 max_tokens 预算烧在隐藏推理上 → JSON 截断。
+	noReasoning bool
 }
 
 type taskLLMError struct {
@@ -122,7 +127,16 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
-	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+	// noReasoning 只改「拿到的 provider 是哪个变体」,不改 profile 选择优先级:
+	// 绑定 → 任务链 → 全局,与普通链路完全一致。
+	if r.noReasoning {
+		if id := r.s.effectiveProfileForAgent(r.agentKey, nil); id != nil {
+			if prov, cfg, ok := r.s.reviewProviderForProfile(*id); ok {
+				sel.provider, sel.retry = prov, cfg.Retry
+				return sel, nil
+			}
+		}
+	} else if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		sel.provider, sel.retry = prov, cfg.Retry
 		return sel, nil
 	}
@@ -131,14 +145,14 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
-		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
+		prov, cfg, ok := r.s.providerForProfileSel(sel.profileID, r.noReasoning)
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
 		sel.provider, sel.retry = prov, cfg.Retry
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	prov, cfg, ok := r.s.globalProviderSel(r.noReasoning)
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
@@ -567,10 +581,18 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
+	workerRunSecs := s.agentRunSeconds("worker")
+	if db.IsAggressiveOpMode(t.OpMode) && workerRunSecs > 0 {
+		workerRunSecs *= 2 // 激进模式:单次 run 墙钟预算加倍,深挖不被过早截断
+	}
+	wk.SetRunTimeout(time.Duration(workerRunSecs) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetTaskProxyResolver(s.m.TaskProxyForTask) // 期 3b:按任务 MITM(经隧道时 任务实例→任务 socks)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	wk.SetIntranetResolver(s.taskIntranet)           // 期 4:内网期(立足点/隧道)切 worker.intranet 提示词变体
+	wk.SetUAResolver(s.uaForTask)                    // 批 5 B4:按任务稳定分配的客户端 UA → BashEnv ARTEX_UA
+	wk.SetEscalationWriter(s.writeEscalationResult)  // 「扩大危害」意图:写回原漏洞(report_escalation)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
@@ -582,6 +604,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
+	pl.SetGuard(s.agentGuard())                       // 审批门:planner 的工具调用同样过 PreToolUse 拦截
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。
@@ -595,6 +618,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
+	main.SetKillWork(func(intentID int64) error {
+		return s.engine.KillWorkAs(intentID, agent.AbortKilledByMainagent)
+	}) // kill_work：人立即终止运行中 work(killed_by_mainagent)
+	main.SetGuard(s.agentGuard()) // 审批门:mainagent 的工具调用同样过 PreToolUse 拦截
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

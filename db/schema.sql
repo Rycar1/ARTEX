@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS companies (
 CREATE INDEX IF NOT EXISTS idx_companies_nkey ON companies(nkey);
 DROP TRIGGER IF EXISTS trg_companies_upd ON companies;
 CREATE TRIGGER trg_companies_upd BEFORE UPDATE ON companies
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS assets (
     id              BIGSERIAL PRIMARY KEY,
@@ -110,7 +110,7 @@ ALTER TABLE assets ADD CONSTRAINT assets_company_source_check
     CHECK (company_source IN ('explicit','scope'));
 DROP TRIGGER IF EXISTS trg_av2_upd ON assets;
 CREATE TRIGGER trg_av2_upd BEFORE UPDATE ON assets
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS company_scope (
     id         BIGSERIAL PRIMARY KEY,
@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS explorations (
 ALTER TABLE explorations ADD COLUMN IF NOT EXISTS round_no BIGINT NOT NULL DEFAULT 0;
 DROP TRIGGER IF EXISTS trg_exp_upd ON explorations;
 CREATE TRIGGER trg_exp_upd BEFORE UPDATE ON explorations
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS exploration_nodes (
     id             BIGSERIAL PRIMARY KEY,
@@ -243,7 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_expnodes_frontier ON exploration_nodes(exploratio
     WHERE kind='intent' AND state='open';
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS exploration_edges (
     exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
@@ -333,8 +333,9 @@ CREATE INDEX IF NOT EXISTS idx_act_main_seg ON activity(exploration_id, main_seg
 -- Task-list polls aggregate result usage and find the latest event repeatedly.
 -- Cover the token columns for index-only aggregation and the timestamp order for
 -- per-exploration latest-activity lookups.
-CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id)
-    INCLUDE (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+-- 兼容注:写成多列索引而非 PG11+ 的 INCLUDE 覆盖索引,效果等价且兼容 PG10
+-- (Ubuntu 18.04 自带 PG10,EXECUTE PROCEDURE 同理)。
+CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
     WHERE kind='result';
 CREATE INDEX IF NOT EXISTS idx_act_latest ON activity(exploration_id, created_at DESC);
 
@@ -395,6 +396,11 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- 自定义会话头：非空时每次请求带一个该名字的 HTTP 头，头值=当前运行的 session id
     -- (chat 会话/worker 意图)。用于某些按 session-id 头做提示缓存/粘性路由的网关。''=不发送。
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- 自定义会话体字段：非空时在请求 JSON 体里塞一个该名字的字段，值=当前运行的
+    -- session id。用于「不带 conversation id 就 400」的网关(实测某中转按请求长度
+    -- 命中严格通道时返回 upstream 400 code 11-128 "conversation id missing"，加
+    -- body.conversation_id 即 200)。''=不注入，旧配置行为不变。
+    session_body_field TEXT NOT NULL DEFAULT '',
     -- 重试覆盖：次数 0=用全局默认/-1=关闭/>0=该值；间隔 0=用默认指数退避/>0=固定毫秒。
     -- 三组分别对应建连重试、空响应重试、同 provider 安全窗口重试，详见下方 ALTER 处注释。
     retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
@@ -409,7 +415,7 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_one_default ON llm_profiles(is_default) WHERE is_default;
 DROP TRIGGER IF EXISTS trg_llm_upd ON llm_profiles;
 CREATE TRIGGER trg_llm_upd BEFORE UPDATE ON llm_profiles
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 -- 轮询顺位/排除标记；补旧库。默认 0 / false = 全部配置都参与轮询。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
@@ -434,6 +440,8 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- 自定义会话头名；补旧库。默认 '' = 不发送，旧配置行为不变。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- 自定义会话体字段名(见 CREATE 处注释)；补旧库。默认 '' = 不注入，旧配置行为不变。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_body_field TEXT NOT NULL DEFAULT '';
 
 -- 单配置的重试覆盖（见 docs/LLM重试设计.md）。三组各自一对「次数 + 固定间隔」，
 -- 语义统一：次数 0=沿用全局默认、-1=关闭该层重试、>0=用该值；间隔 0=沿用该层的
@@ -500,7 +508,7 @@ CREATE TABLE IF NOT EXISTS task_categories (
 CREATE INDEX IF NOT EXISTS idx_task_categories_name ON task_categories(name, id);
 DROP TRIGGER IF EXISTS trg_task_categories_upd ON task_categories;
 CREATE TRIGGER trg_task_categories_upd BEFORE UPDATE ON task_categories
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS tasks (
     id             BIGSERIAL PRIMARY KEY,
@@ -524,6 +532,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
+    review_enabled BOOLEAN NOT NULL DEFAULT false,
+    review_src_type TEXT NOT NULL DEFAULT 'edusrc',
+    op_mode        TEXT NOT NULL DEFAULT 'standard',
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -537,7 +548,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_alive  ON tasks(created_at DESC) WHERE dele
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)          WHERE deleted_at IS NULL;
 DROP TRIGGER IF EXISTS trg_tasks_upd ON tasks;
 CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 -- planner 心跳触发间隔(秒);补旧库。默认 300s(5min)。见 docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
 -- 并发上限挂起态;补旧库。true=因并发上限排队、等待空位自动启动。
@@ -546,6 +557,19 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false
 -- 给 agent 开放 add_task_scope/list_untested_assets;false=全部关闭(见 task_scope.go)。
 -- 存量任务默认 true 保持原行为;company 关联(task_scope kind=company)不受此开关影响。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEFAULT true;
+-- 二次审核(参考 AutoHunter Reviewer);补旧库。true=该任务新登记的漏洞自动进入 AI 二次审核。
+-- review_src_type 决定审核标准:edusrc(EduSRC 严格收录标准)/ enterprise(企业 SRC 高价值影响)。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_src_type TEXT NOT NULL DEFAULT 'edusrc';
+-- 任务作战模式;补旧库。standard(默认,稳健)/ aggressive(激进):激进模式下放宽一切
+-- 技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),但保留资产范围边界与
+-- 破坏性操作底线。见 db/op_mode.go、server/op_mode.go。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS op_mode TEXT NOT NULL DEFAULT 'standard';
+-- 无人值守(任务级);补旧库。true=本任务 judge 给出 ask 时不再进入人工审批队列,
+-- 而是发起一次「禁止 ask」的强制二次裁决(allow/deny 二选一,无法判断安全则 deny)。
+-- 全局开关(settings 表 intercept_unattended)开启时,所有任务均按无人值守处理,本列被
+-- 短路;全局关闭时以本列为准。见 intercept.SetTaskUnattended / intercept.UnattendedContract。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS unattended BOOLEAN NOT NULL DEFAULT false;
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.
@@ -606,7 +630,7 @@ CREATE INDEX IF NOT EXISTS idx_task_archives_archived ON task_archives(archived_
 CREATE INDEX IF NOT EXISTS idx_task_archives_sources ON task_archives USING GIN(source_task_ids);
 DROP TRIGGER IF EXISTS trg_task_archives_upd ON task_archives;
 CREATE TRIGGER trg_task_archives_upd BEFORE UPDATE ON task_archives
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- Reusable task description/goal presets. nkey is the normalized, case-insensitive
 -- identity used to reject visually equivalent duplicate names.
@@ -616,6 +640,8 @@ CREATE TABLE IF NOT EXISTS task_templates (
     nkey        TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
     goal        TEXT NOT NULL,
+    -- 内置模板（随程序播种；禁止删除/改名，内容可改）。
+    builtin     BOOLEAN NOT NULL DEFAULT false,
     -- 预设的任务分类；分类删除时置空（与 tasks.category_id 一致，不阻断）。
     category_id     BIGINT REFERENCES task_categories(id) ON DELETE SET NULL,
     -- 预设的任务级拦截/允许规则快照(AssetInterceptRuleInput 数组)；应用模板时灌进新任务。
@@ -626,10 +652,11 @@ CREATE TABLE IF NOT EXISTS task_templates (
 -- 补旧库(已发版,加列带 IF NOT EXISTS)。
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS builtin BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- Direct, read-only task context inheritance. Relations are intentionally not
 -- recursive: a task sees only the source tasks explicitly chosen at creation.
@@ -660,7 +687,7 @@ CREATE INDEX IF NOT EXISTS idx_task_asset_links_node ON task_asset_links(source_
     WHERE source_node_id IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_task_asset_links_upd ON task_asset_links;
 CREATE TRIGGER trg_task_asset_links_upd BEFORE UPDATE ON task_asset_links
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- Keep provenance rows synchronized when existing asset upsert paths append or
 -- remove task ids. Detailed callers overwrite the generic source after upsert.
@@ -680,7 +707,7 @@ END;
 $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_assets_task_links ON assets;
 CREATE TRIGGER trg_assets_task_links AFTER INSERT OR UPDATE OF task_ids ON assets
-    FOR EACH ROW EXECUTE FUNCTION sync_task_asset_links();
+    FOR EACH ROW EXECUTE PROCEDURE sync_task_asset_links();
 
 -- Existing installations receive an auditable legacy source without rewriting
 -- task_ids. Ignore stale array ids that no longer resolve to a live task.
@@ -712,7 +739,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_llm_profile ON tasks(llm_profile_id) WHERE 
 CREATE INDEX IF NOT EXISTS idx_tasks_active_llm_profile ON tasks(active_llm_profile_id) WHERE active_llm_profile_id IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_task_llm_profiles_upd ON task_llm_profiles;
 CREATE TRIGGER trg_task_llm_profiles_upd BEFORE UPDATE ON task_llm_profiles
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- One-time-compatible backfill: old pinned tasks become one-entry chains. A user
 -- can still clear the chain later because the update path also clears the legacy
@@ -760,12 +787,27 @@ CREATE INDEX IF NOT EXISTS idx_ts_domain  ON task_scope(domain) WHERE kind IN ('
 CREATE INDEX IF NOT EXISTS idx_ts_net     ON task_scope USING GIST(net inet_ops) WHERE kind IN ('ip','cidr');
 CREATE INDEX IF NOT EXISTS idx_ts_company ON task_scope(company_id) WHERE kind = 'company';
 
+-- 期 4:内网被动侦察发现的【未授权网段】登记(按 /24 聚合)。人工批准(approved)后才
+-- 写进 task_scope 扩范围;拒绝(dismissed)后同一条目不再累计 hits,防重复骚扰。
+CREATE TABLE IF NOT EXISTS pending_scope (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL,
+    kind        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','dismissed')),
+    hits        INT NOT NULL DEFAULT 1,
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at  TIMESTAMPTZ,
+    UNIQUE (task_id, kind, value)
+);
+
 -- =====================================================================
 -- E. Agents / 提示词模板 / 变量目录
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS agents (
     id                BIGSERIAL PRIMARY KEY,
-    key               TEXT NOT NULL UNIQUE CHECK (key ~ '^[a-z][a-z0-9_]*$'),
+    key               TEXT NOT NULL UNIQUE CHECK (key ~ '^[a-z][a-z0-9_.]*$'),
     name              TEXT NOT NULL,
     description       TEXT,
     role              TEXT NOT NULL,
@@ -796,10 +838,13 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NUL
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 -- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
 ALTER TABLE agents ALTER COLUMN run_seconds SET DEFAULT 1200;
+-- 期 4:agent key 允许点号(worker.intranet 这类提示词变体 key);旧库约束重建(幂等)。
+ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_key_check;
+ALTER TABLE agents ADD CONSTRAINT agents_key_check CHECK (key ~ '^[a-z][a-z0-9_.]*$');
 CREATE INDEX IF NOT EXISTS idx_agents_llm_profile ON agents(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_agents_upd ON agents;
 CREATE TRIGGER trg_agents_upd BEFORE UPDATE ON agents
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS agent_prompts (
     id            BIGSERIAL PRIMARY KEY,
@@ -852,7 +897,7 @@ ALTER TABLE mcp_servers ADD CONSTRAINT mcp_servers_transport_check
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS insecure BOOLEAN NOT NULL DEFAULT false;
 DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- 默认数据源占位：ScopeSentry 资产同步 MCP（地址与认证均留空、未启用）。
 -- 供「资产同步」页检测数据源是否已配置；用户在页面填入 url 与 X-API-Key 后再启用。
@@ -946,7 +991,7 @@ CREATE TABLE IF NOT EXISTS tools (
 );
 DROP TRIGGER IF EXISTS trg_tools_upd ON tools;
 CREATE TRIGGER trg_tools_upd BEFORE UPDATE ON tools
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 -- =====================================================================
 -- I. 会话（对话页）
@@ -965,7 +1010,7 @@ CREATE INDEX IF NOT EXISTS idx_conversations_llm_profile ON conversations(llm_pr
 CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at DESC) WHERE pinned_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_conversations_upd ON conversations;
 CREATE TRIGGER trg_conversations_upd BEFORE UPDATE ON conversations
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS conversation_activities (
     id                 BIGSERIAL PRIMARY KEY,
@@ -1020,7 +1065,7 @@ ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS on_task_create      BOOLEAN 
 ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS task_create_message TEXT    NOT NULL DEFAULT '';
 DROP TRIGGER IF EXISTS trg_agent_triggers_upd ON agent_triggers;
 CREATE TRIGGER trg_agent_triggers_upd BEFORE UPDATE ON agent_triggers
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS scheduler_state (
     key   TEXT PRIMARY KEY,
@@ -1043,12 +1088,15 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     timeout_enabled BOOLEAN NOT NULL DEFAULT true,
     timeout_seconds INTEGER NOT NULL DEFAULT 60,
     timeout_action  TEXT    NOT NULL DEFAULT 'deny',
+    -- builtin=true 的规则是平台底线(如 F13 的临时 HTTP 服务拦截),禁止删除/禁用。
+    builtin         BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE intercept_rules ADD COLUMN IF NOT EXISTS builtin BOOLEAN NOT NULL DEFAULT false;
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
 
 CREATE TABLE IF NOT EXISTS intercept_pending (
     id              BIGSERIAL PRIMARY KEY,
@@ -1097,16 +1145,64 @@ CREATE TABLE IF NOT EXISTS findings (
     status      TEXT NOT NULL DEFAULT 'pending',
     -- 漏洞详细报告(Markdown)；默认空,仅详情页读取/展示,不进列表接口以免 payload 膨胀。
     report      TEXT NOT NULL DEFAULT '',
+    review_verdict  TEXT NOT NULL DEFAULT '',
+    review_severity TEXT NOT NULL DEFAULT '',
+    review_score    DOUBLE PRECISION,
+    review_reasons  TEXT NOT NULL DEFAULT '',
+    review_notes    TEXT NOT NULL DEFAULT '',
+    reviewed_at     TIMESTAMPTZ,
+    -- worker 提交前的结构化自检(参考 AutoHunter 的 SelfCheck):7 个布尔位,
+    -- 如 {is_reflected_xss,needs_admin_login,needs_mitm,is_pure_info_leak,
+    -- scanner_only_no_poc,is_public_interface,info_leak_hits_strict_list}。
+    -- 挖掘期闸门据此直接拒收;审核层据此一票否决/核对。空 = 旧数据或未填。
+    self_check  JSONB NOT NULL DEFAULT '{}',
+    -- 危害升级(参考 AutoHunter 的「扩大危害 Hunter」):已采纳的低危/中危漏洞会自动
+    -- 派一条「扩大危害」意图再挖一轮。escalated_at 非空 = 已派过(每个漏洞最多一轮);
+    -- escalate_status:''(未派)/dispatched(已派待结果)/done(升级已交回,待复核)/
+    -- failed(打不动,保留原级);base_severity 保存升级前的严重度,升级不成立时回退用。
+    escalated_at    TIMESTAMPTZ,
+    escalate_status TEXT NOT NULL DEFAULT '',
+    base_severity   TEXT NOT NULL DEFAULT '',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- AI 二次审核结论(参考 AutoHunter Reviewer):review_verdict 取值 ''(未审)/accepted/ignored。
+-- ignored 时由 server 自动把 status 置为 ignored,并把原因写进 review_reasons。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_verdict  TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_severity TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_score    DOUBLE PRECISION;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_reasons  TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS review_notes    TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS reviewed_at     TIMESTAMPTZ;
+-- worker 提交前结构化自检(见上方 CREATE 注释);旧库靠这一行补列。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS self_check     JSONB NOT NULL DEFAULT '{}';
+-- 危害升级(见上方 CREATE 注释);旧库靠这三行补列。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS escalated_at    TIMESTAMPTZ;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS escalate_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS base_severity   TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_findings_review ON findings(review_verdict, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
+
+-- 漏洞去重(四层方案):写入时合并键 + 文本指纹 + 合并关系 + 疑似重复标记。
+-- 全部可空/默认空,旧行零迁移成本;dedup_key 与 fingerprint 由 Go 侧
+-- (db/finding_dedup.go)计算。刻意不加唯一约束:线上历史数据可能已存在同键多行,
+-- 建唯一索引会在启动期直接失败;并发双插由 RecordFindingTx 内的
+-- pg_advisory_xact_lock(合并键) 串行化兜底。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedup_key           TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint         TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS merged_into         BIGINT;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS suspected_dup_of    BIGINT;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS suspected_dup_score DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_findings_dedup_key ON findings(dedup_key) WHERE dedup_key <> '';
+CREATE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint) WHERE fingerprint <> '';
+CREATE INDEX IF NOT EXISTS idx_findings_merged_into ON findings(merged_into) WHERE merged_into IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_findings_suspected ON findings(suspected_dup_of) WHERE suspected_dup_of IS NOT NULL;
 
 -- 手动复测属于独立会话；结论与原漏洞处置状态分开保存。
 CREATE TABLE IF NOT EXISTS finding_retests (
@@ -1138,7 +1234,43 @@ END;
 $$;
 DROP TRIGGER IF EXISTS trg_conversation_retest_delete ON conversations;
 CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
-    FOR EACH ROW EXECUTE FUNCTION stop_deleted_conversation_retest();
+    FOR EACH ROW EXECUTE PROCEDURE stop_deleted_conversation_retest();
+
+-- 反证验证(需求二方案甲):finding_checks 是「验证(出生证)/复测(年检)」统一管线。
+-- 现有 finding_retests 保持不动、不迁移;kind='retest' 为后续管线合一预留。
+-- verdict 三选一:verified 真漏洞 / false_positive 误报 / inconclusive 无法确认(留人工)。
+CREATE TABLE IF NOT EXISTS finding_checks (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'verify' CHECK (kind IN ('verify','retest')),
+    conversation_id BIGINT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','stopped')),
+    verdict TEXT NOT NULL DEFAULT '' CHECK (verdict IN ('','verified','false_positive','inconclusive')),
+    -- 创建时冻结的 finding+资产+约束快照(同 finding_retests.snapshot),agent 经工具读取。
+    snapshot JSONB NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_finding_checks_history ON finding_checks(finding_id, id DESC);
+-- 一个 finding 同时只允许一个活跃 check(同 finding_retests 的活跃占用)。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_checks_active ON finding_checks(finding_id)
+    WHERE status IN ('pending','running');
+
+-- 删除会话保留验证记录，同时解除尚未结束的验证占用。
+CREATE OR REPLACE FUNCTION stop_deleted_conversation_check() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE finding_checks SET status='stopped', error='验证会话已删除', finished_at=now()
+    WHERE conversation_id=OLD.id AND status IN ('pending','running');
+    RETURN OLD;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_conversation_check_delete ON conversations;
+CREATE TRIGGER trg_conversation_check_delete BEFORE DELETE ON conversations
+    FOR EACH ROW EXECUTE PROCEDURE stop_deleted_conversation_check();
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
@@ -1384,3 +1516,162 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+-- =====================================================================
+-- J. 立足点会话(内网渗透期 1a,见 INTRANET-PIVOT-DESIGN.md §4.2)
+-- =====================================================================
+-- webshell/ssh/reverse 立足点的一等管理。secret 是连接参数 JSON,AES-GCM
+-- 加密存储(密钥由 jwt.key 派生,见 db/sessions.go),串形如 "gcm1:<base64>"。
+CREATE TABLE IF NOT EXISTS sessions (
+    id                BIGSERIAL PRIMARY KEY,
+    kind              TEXT NOT NULL,           -- http_php/http_jsp/http_aspx/ssh/reverse(预留)
+    host_asset_id     BIGINT,                  -- webshell 登记为 endpoint 资产后的资产 id(可空)
+    url               TEXT NOT NULL DEFAULT '',
+    secret            TEXT NOT NULL DEFAULT '',
+    lang              TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'alive' CHECK(status IN ('alive','dead')),
+    created_by_task   BIGINT,
+    created_by_intent BIGINT,
+    last_beat         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(created_by_task);
+
+-- =====================================================================
+-- K. 凭据一等实体(内网渗透期 2,见 INTRANET-PIVOT-DESIGN.md §4.4)
+-- =====================================================================
+-- 从目标收割的口令/hash/密钥/ticket 全部登记。secret AES-GCM 加密存储,
+-- 密钥由 jwt.key 派生(与 sessions 不同域分离标签,见 db/credentials.go)。
+CREATE TABLE IF NOT EXISTS credentials (
+    id            BIGSERIAL PRIMARY KEY,
+    task_id       BIGINT NOT NULL,
+    host_asset_id BIGINT,                  -- 凭据来源主机资产 id(可空)
+    username      TEXT NOT NULL DEFAULT '',
+    cred_type     TEXT NOT NULL CHECK(cred_type IN
+        ('password','hash_nt','hash_lm','hash_sha1','ticket','ssh_key','token')),
+    secret        TEXT NOT NULL DEFAULT '', -- gcm1:<base64> 密文
+    domain        TEXT NOT NULL DEFAULT '', -- 域(如 CORP / corp.local),空=本地账号
+    source        TEXT NOT NULL DEFAULT '', -- 来源描述(如 "sqli dump users 表" / "/etc/shadow")
+    verified      BOOLEAN NOT NULL DEFAULT false, -- 已实测可登录
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_task ON credentials(task_id);
+
+-- =====================================================================
+-- L. 多层代理隧道台账(内网渗透期 3a,见 INTRANET-PIVOT-DESIGN.md §4.3/4.3a)
+-- =====================================================================
+-- 隧道是长寿命受管资源:平台侧 chisel server 进程、目标侧 chisel client 进程、
+-- stage 投递条目全部落台账(deploy_params 存完整部署参数,供断链自动重拉),
+-- 归属任务,用完 tunnel_teardown 回收。
+CREATE TABLE IF NOT EXISTS tunnels (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL DEFAULT 0,   -- 归属任务(受管资源原则)
+    kind           TEXT NOT NULL CHECK(kind IN ('socks','portfwd')),
+    adapter        TEXT NOT NULL DEFAULT 'chisel',
+    listen_host    TEXT NOT NULL DEFAULT '',    -- 平台侧 chisel server 绑定地址
+    listen_port    INT  NOT NULL DEFAULT 0,     -- 平台侧 chisel server 端口(目标回连口)
+    target_host    TEXT NOT NULL DEFAULT '',    -- portfwd:经隧道访问的内网目标
+    target_port    INT  NOT NULL DEFAULT 0,
+    via_session_id BIGINT NOT NULL DEFAULT 0,   -- 经哪个立足点会话部署
+    remote_pid     INT  NOT NULL DEFAULT 0,     -- 目标侧 chisel client pid
+    deploy_params  JSONB NOT NULL DEFAULT '{}', -- 完整部署参数(含 auth/server_pid/stage_token/远端路径),重拉全靠它
+    state          TEXT NOT NULL DEFAULT 'deploying'
+                   CHECK(state IN ('deploying','alive','error','stopped')),
+    last_check     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error          TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tunnels_task ON tunnels(task_id);
+CREATE INDEX IF NOT EXISTS idx_tunnels_state ON tunnels(state);
+
+-- =====================================================================
+-- M. 批 6 L1 蜜罐静态签名识别(HONEYPOT-DETECTION-DESIGN.md 二·L1)
+-- =====================================================================
+-- honeypot_score: 0-1,命中静态签名的最高置信度(0=无信号);重复评估取更高分。
+-- honeypot_evidence: 命中签名证据,JSON 数组文本(如 ["cowrie_default_ssh_banner(Cowrie, 0.99)"]),合并去重。
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_evidence TEXT NOT NULL DEFAULT '';
+
+-- =====================================================================
+-- N. 资产筛选结果(预筛/优先级评分/同款聚类)  —— 参考 AutoHunter 的资产漏斗
+-- =====================================================================
+-- insert_assets 落库时由 assetscreen 包算出的评分与聚类键写在这里,供:
+--   ① 派发排序(高分先测)  ② 同款聚类冷却(同一 cluster 的 pending 上限)
+--   ③ graph_overview 的筛选摘要(让 planner 能解释「这批资产为何没展开」)
+-- 与 assets 一对多:同一资产在不同任务下可有不同评分,按 (asset_id, task_id) 幂等覆盖。
+CREATE TABLE IF NOT EXISTS asset_screening (
+    asset_id   BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    task_id    BIGINT NOT NULL,
+    score      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    reasons    TEXT[] NOT NULL DEFAULT '{}',
+    cluster    TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (asset_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_screening_task ON asset_screening(task_id);
+CREATE INDEX IF NOT EXISTS idx_asset_screening_cluster ON asset_screening(task_id, cluster);
+
+-- 预筛跳过计数(按任务 + 原因聚合):让 planner 能解释「为什么 N 千个资产只测了几百个」。
+CREATE TABLE IF NOT EXISTS task_screening_skip (
+    task_id    BIGINT NOT NULL,
+    reason     TEXT NOT NULL,
+    count      BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_task_screening_skip_task ON task_screening_skip(task_id);
+
+-- 同款聚类派发闸门状态(schema §N):cluster → 连续失败计数 + 冷却截止时间。
+-- 与 asset_screening.cluster 同源(assetscreen.ClusterKey);由 engine 在意图
+-- 以 blocked 结束时累加,达到阈值进入冷却,冷却期内该 cluster 的意图不派发。
+CREATE TABLE IF NOT EXISTS cluster_cooldown (
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    cluster        TEXT NOT NULL,
+    dead_count     INTEGER NOT NULL DEFAULT 0,
+    cooldown_until TIMESTAMPTZ,
+    reason         TEXT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exploration_id, cluster)
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_cooldown_exp ON cluster_cooldown(exploration_id, cooldown_until);
+
+-- 声明范围(company_scope)物化的 RoE 跳过台账:被任务级/全局资产拦截挡下的规则
+-- 不物化,但必须记账——否则「未物化规则数」永远 >0,收尾闸门再也关不上。
+-- 每次物化会重估本表:规则若已不再被拦截则删除跳过记录,重新纳入物化。
+CREATE TABLE IF NOT EXISTS company_scope_materialize_skip (
+    task_id    BIGINT NOT NULL,
+    company_id BIGINT NOT NULL,
+    kind       TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, company_id, kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_cs_materialize_skip_task ON company_scope_materialize_skip(task_id, company_id);
+
+
+-- =====================================================================
+-- O. 全局情报库(intel)  —— 参考 AutoHunter 的 intel 库
+-- =====================================================================
+-- 跨任务可复用的情报:一个任务里验证过的凭据、确认的漏洞特征、
+-- 发现的端点、目标画像,沉淀成 (kind,key) 唯一的全局条目。后续任务先查库再开打,
+-- 不必从零开始。只存可复用的说明/证据,不存明文密钥(凭据只存类型+主机+credential id)。
+--   kind: cred(凭据线索) / fingerprint(漏洞特征) / endpoint(端点) / profile(画像)
+--   key : 去重键(cred=username@domain; fingerprint=归一化 vulnclass; endpoint=method url; profile=标签)
+--   confidence: 0..1 可信度;命中/确认后上调;hits: 被检索命中次数。
+-- 全局可选关/默认开:ARTEX_INTEL=0/false/off 关闭。
+CREATE TABLE IF NOT EXISTS intel (
+    id             BIGSERIAL PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    value          TEXT NOT NULL DEFAULT '',
+    source_task_id BIGINT,
+    source         TEXT NOT NULL DEFAULT '',
+    confidence     REAL NOT NULL DEFAULT 0,
+    hits           BIGINT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_intel_kind ON intel(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intel_hits ON intel(kind, hits DESC, updated_at DESC);

@@ -25,7 +25,10 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/artex/session"
+	stagepkg "github.com/Autumn-27/artex/stage"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/tunnel"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -43,8 +46,19 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	skillDir  string              // root directory for skill subdirectories
+	jwtKey    []byte              // HS256 signing key loaded from / generated into dataDir/jwt.key
+	gate      *Gate               // 反测绘伪装门控(F14,见 gate.go);nil = 关闭
+	stage     *stagepkg.Manager   // 受管文件投递暂存(F13,见 stage.go);nil = 降级关闭
+	sessReg   *session.Registry   // 立足点会话注册表(期 1a,见 session.go);nil = DB 未就绪
+	sessStore *db.SessionStore    // 会话落库访问层(secret AES-GCM,密钥由 jwtKey 派生)
+	credStore *db.CredentialStore // 凭据落库访问层(期 2,secret AES-GCM,与 sessions 不同域标签)
+	tunnels   *tunnel.Manager     // 多层代理隧道(期 3a,见 tunnel.go);nil = DB 未就绪
+	reverse   *PenelopeHandler    // 反弹 shell handler(期 5,见 reverse.go);nil = DB 未就绪
+	tickets   sseTicketStore      // SSE 一次性票据(F6,见 auth.go),零值可用
+	authkv    authKV              // auth 持久层注入(测试用);nil = 走 m.pg
+	// reviewer 是漏洞 AI 二次审核引擎(见 finding_review.go);nil = 未装配(DB 未就绪)。
+	reviewer *Reviewer
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -60,6 +74,11 @@ type Server struct {
 	llmCfg    agent.Config // current LLM config (key not exposed)
 	llmOn     bool
 	llmProf   string // active LLM profile name (for llmrec tagging)
+	// revProvGlobal is the reviewer's variant of the global provider: identical to
+	// llmProv except the config's reasoning_effort is stripped (thinking forced off).
+	// Built lazily on first review call; cleared by applyLLM whenever the global
+	// config is (re)installed. Guarded by cfgMu.
+	revProvGlobal *provEntry
 
 	// chatBusy guards the per-task main-agent run: the chat handler launches the
 	// agent on the server's background ctx (not the request ctx) and returns
@@ -100,7 +119,14 @@ type Server struct {
 	// configured request rate. Cleared on profile edits, then repopulated by active reapply.
 	provCacheMu   sync.Mutex
 	provByProfile map[int64]*provEntry
-	provCacheGen  uint64
+	// revProvByProfile caches the reviewer's provider variant per profile id: same
+	// credentials/model as provByProfile but with reasoning_effort stripped, so the
+	// reviewer's single-JSON reply is never truncated by hidden reasoning. norma
+	// sends reasoning_effort unconditionally, so a profile-level effort re-enables
+	// thinking even when the request asks for thinking=disabled. Cleared together
+	// with provByProfile on any profile edit.
+	revProvByProfile map[int64]*provEntry
+	provCacheGen     uint64
 
 	// llmHealth is the process-wide circuit-breaker state for LLM failover (轮询).
 	// It deliberately lives OUTSIDE the provider caches: rebuilding the chain
@@ -150,8 +176,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		revProvByProfile: map[int64]*provEntry{},
+		taskAgents:       map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	if m.pg != nil {
+		s.ensureRandomBasicAuth()
+	}
+	s.initStage(dataDir)        // 受管文件投递暂存(F13);失败降级为关闭,不影响启动
+	checkToolsManifest(dataDir) // 期 6 外部工具清单自检(缺失常态,只打汇总日志)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -222,9 +254,25 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		s.seedStageShareTool()     // F13 受管文件投递工具 seed 进 tools 表(默认绑 worker)
+		s.initSessions()           // 期 1a 立足点会话子系统:Registry + 启动恢复(DB 存活会话)
+		s.seedSessionTools()       // 会话工具 seed 进 tools 表(默认绑 worker)
+		s.initCredentials()        // 期 2 凭据一等实体:落库访问层(secret AES-GCM)
+		s.seedCredentialTools()    // 凭据工具 seed 进 tools 表(默认绑 worker)
+		s.initTunnels(dataDir)     // 期 3a 多层代理隧道:Manager + 孤儿标 error + 健康巡检
+		s.seedTunnelTools()        // 隧道工具 seed 进 tools 表(默认绑 worker)
+		s.initReverse(dataDir)     // 期 5 反弹 handler:penelope 受管进程 + 上期 reverse 会话诚实标 dead
+		s.seedReverseTools()       // reverse_listen 工具 seed 进 tools 表(默认绑 worker)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
+		if err := s.seedFindingVerifier(); err != nil { // 反证验证 agent(需求二方案甲)
+			log.Printf("[verifier] seed: %v", err)
+		}
+		// 漏洞 AI 二次审核引擎(参考 AutoHunter Reviewer)。与 Notifier/Scheduler 并列
+		// 独立:审核要调 LLM、慢且可能失败,不能拖慢证据落库;落库钩子只做入队。
+		s.reviewer = newReviewer(s)
+		go s.reviewer.Run(s.ctx)
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
@@ -256,6 +304,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	// 批 5 B2 出口审查:启动时向进程级共享 EgressGuard 注册平台敏感指纹
+	// (LLM key/jwt.key/gate 路径/PG 密码/callback_addr),所有任务的 guard 即时生效。
+	s.registerEgressFingerprints()
+	s.wireTaskOpMode()    // 任务作战模式解析:激进模式任务的 ask 审批自动放行(见 server/op_mode.go)
+	s.wireTaskUnattended() // 任务级无人值守解析:judge ask 强制二次裁决,不进人工审批队列(见 server/op_mode.go)
 	return s
 }
 
@@ -306,15 +359,20 @@ func (s *Server) agentMaxTurns(key string) int {
 	return a.MaxTurns
 }
 
+// defaultAgentRunSeconds 是未显式配置时，一条意图单次 run 的墙钟预算(秒)。
+// 45 分钟：够把一批探测跑完并写回，又不至于一棒卡死太久。原为 1200(20 分钟)——
+// 实测长脚本常跑到一半被强制打断、整棒零产出(见 engine 的零产出兜底)。
+const defaultAgentRunSeconds = 2700
+
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
-// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// agent key (0 = unlimited; defaultAgentRunSeconds fallback when no DB or no row).
 func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
-		return 1200
+		return defaultAgentRunSeconds
 	}
 	a, err := s.m.pg.GetAgentByKey(key)
 	if err != nil || a == nil {
-		return 1200
+		return defaultAgentRunSeconds
 	}
 	return a.RunSecs
 }
@@ -333,6 +391,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.SessionBodyField = p.SessionBodyField
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -358,6 +417,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	var sessionHeaderKey string
+	var sessionBodyField string
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -365,6 +425,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
+				sessionBodyField = p.SessionBodyField
 				retry = p.Retry
 				break
 			}
@@ -375,7 +436,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
-		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
+		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, SessionBodyField: sessionBodyField,
 		Retry: retry,
 	})
 	if err != nil {
@@ -407,6 +468,20 @@ func (s *Server) webSearchFor(key string) agent.WebSearchOpts {
 		o.Enabled = false
 	}
 	return o
+}
+
+// uaForTask 返回本任务稳定分配的客户端 UA(批 5 B4):池子读 settings 键
+// web_ua_pool(JSON 字符串数组,每次 run 现读、改池即时生效),未配置用默认池;
+// 选择是 hash(taskID) % len(pool),同一任务永远同一个。无 DB 时直接给默认池结果。
+func (s *Server) uaForTask(taskID int64) string {
+	if s.m == nil || s.m.pg == nil {
+		return agent.PickUA(nil, taskID)
+	}
+	raw, _, err := s.m.pg.GetSetting(settingWebUAPool)
+	if err != nil {
+		raw = ""
+	}
+	return agent.PickUA(agent.UAPoolFromSetting(raw), taskID)
 }
 
 // nonStreamingResolver returns a resolver capturing a profile's streaming choice.
@@ -449,6 +524,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	}
 	s.cfgMu.Lock()
 	s.llmDirect = prov
+	s.revProvGlobal = nil // 全局配置换新 → 审核变体作废,下次审核调用重建
 	s.cfgMu.Unlock()
 	// LLM 轮询(默认关):把激活配置包进故障转移链,当前配置不可用时自动切下一个。
 	// 只影响「走全局激活配置」的这条路径——agent 绑定 / 任务 pin 的走 providerForProfile,
@@ -472,7 +548,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.chatAgent = agent.NewChatAgent(prov, cfg.Model, s.m.dir, tx, win) // chat page runner
 	s.chatAgent.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	s.chatAgent.SetWebSearch(s.m.WebSearchOpts())
-	s.chatAgent.SetGuard(s.chatGuard())
+	s.chatAgent.SetGuard(s.agentGuard())
 	s.chatAgent.SetNonStreaming(nonStreamingResolver(cfg))
 	s.chatAgent.SetMaxTokens(maxTokensResolver(cfg))
 	s.chatAgent.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
@@ -481,6 +557,9 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	s.llmOn = true
 	s.cfgMu.Unlock()
 	s.invalidateTaskAgents()
+	// 批 5 B2 出口审查:applyLLM 是 LLM profile 变更的唯一漏斗(保存/激活/删除
+	// 都经 reapplyActiveProfile→applyLLM),在这里整体替换 llm_api_key 指纹。
+	s.registerEgressFingerprints()
 
 	// wake the active task so a task created while idle starts exploring.
 	if t := s.m.ActiveTask(); t != nil {
@@ -504,6 +583,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.SessionBodyField = p.SessionBodyField
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" {
 		return cfg, false
@@ -596,6 +676,114 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	return prov, cfg, true
 }
 
+// reviewVariant strips every reasoning/thinking parameter from a provider config.
+// The reviewer must answer with one compact JSON object; hidden reasoning shares the
+// same max_tokens budget and would truncate it.
+func reviewVariant(cfg agent.Config) agent.Config {
+	cfg.ReasoningEffort = ""
+	cfg.ThinkingType = "disabled"
+	return cfg
+}
+
+// providerForProfileSel picks the shared provider or, for the reviewer path, the
+// effort-free variant of the same profile. Identical selection precedence either way.
+func (s *Server) providerForProfileSel(id int64, noReasoning bool) (llm.Provider, agent.Config, bool) {
+	if noReasoning {
+		return s.reviewProviderForProfile(id)
+	}
+	return s.providerForProfile(id)
+}
+
+// globalProviderSel is providerForProfileSel for the process-wide fallback.
+func (s *Server) globalProviderSel(noReasoning bool) (llm.Provider, agent.Config, bool) {
+	if noReasoning {
+		return s.reviewGlobalProvider()
+	}
+	return s.globalProvider()
+}
+
+// reviewProviderForProfile returns a cached provider for the reviewer path that never
+// sends reasoning/thinking parameters. When the profile carries no reasoning_effort
+// the shared provider is already safe (the per-request thinking=disabled override
+// suppresses the thinking type and no effort field goes out), so it is reused as-is
+// to keep one rate limiter. Only a profile with a configured effort needs the
+// separate, effort-free instance.
+func (s *Server) reviewProviderForProfile(id int64) (llm.Provider, agent.Config, bool) {
+	s.provCacheMu.Lock()
+	if e := s.revProvByProfile[id]; e != nil {
+		s.provCacheMu.Unlock()
+		return e.prov, e.cfg, true
+	}
+	generation := s.provCacheGen
+	s.provCacheMu.Unlock()
+	cfg, ok := s.loadProfileConfig(id)
+	if !ok {
+		return nil, agent.Config{}, false
+	}
+	if cfg.ReasoningEffort == "" {
+		return s.providerForProfile(id)
+	}
+	rcfg := reviewVariant(cfg)
+	prov, err := rcfg.NewProvider()
+	if err != nil {
+		log.Printf("[engine] build review provider for LLM profile %d failed: %v", id, err)
+		return nil, agent.Config{}, false
+	}
+	if p, _ := s.m.pg.ProfileByID(id); p != nil {
+		prov = llmrec.Wrap(prov, s.m.PG(), rcfg.Model, p.Name, rcfg.ThinkingType, rcfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	}
+	s.provCacheMu.Lock()
+	if generation != s.provCacheGen {
+		s.provCacheMu.Unlock()
+		return s.reviewProviderForProfile(id)
+	}
+	if e := s.revProvByProfile[id]; e != nil { // lost the race → keep the winner
+		prov, rcfg = e.prov, e.cfg
+	} else {
+		s.revProvByProfile[id] = &provEntry{prov: prov, cfg: rcfg}
+		log.Printf("[engine] built review provider for LLM profile %d (%s / %s, thinking off)", id, rcfg.Provider(), rcfg.Model)
+	}
+	s.provCacheMu.Unlock()
+	return prov, rcfg, true
+}
+
+// reviewGlobalProvider is reviewProviderForProfile for the env/global fallback: the
+// global config rarely sets reasoning_effort, so the installed provider is reused
+// unless an effort is actually configured.
+func (s *Server) reviewGlobalProvider() (llm.Provider, agent.Config, bool) {
+	s.cfgMu.Lock()
+	if !s.llmOn || s.llmProv == nil {
+		s.cfgMu.Unlock()
+		return nil, agent.Config{}, false
+	}
+	base, profName := s.llmCfg, s.llmProf
+	if base.ReasoningEffort == "" {
+		prov := s.llmProv
+		s.cfgMu.Unlock()
+		return prov, base, true
+	}
+	if e := s.revProvGlobal; e != nil {
+		s.cfgMu.Unlock()
+		return e.prov, e.cfg, true
+	}
+	s.cfgMu.Unlock()
+	cfg := reviewVariant(base)
+	prov, err := cfg.NewProvider()
+	if err != nil {
+		log.Printf("[engine] build review provider for global config failed: %v", err)
+		return nil, agent.Config{}, false
+	}
+	prov = llmrec.Wrap(prov, s.m.PG(), cfg.Model, profName, cfg.ThinkingType, cfg.ReasoningEffort, s.m.LLMRecordEnabled)
+	s.cfgMu.Lock()
+	if s.revProvGlobal == nil { // lost the race → keep the winner
+		s.revProvGlobal = &provEntry{prov: prov, cfg: cfg}
+		log.Printf("[engine] built review provider for global config (%s / %s, thinking off)", cfg.Provider(), cfg.Model)
+	}
+	e := s.revProvGlobal
+	s.cfgMu.Unlock()
+	return e.prov, e.cfg, true
+}
+
 // chatAgentForProfile returns a ChatAgent built from a specific LLM profile, cached
 // per profile id. Returns nil if the profile is missing or has no API key.
 func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
@@ -613,7 +801,7 @@ func (s *Server) chatAgentForProfile(id int64) *agent.ChatAgent {
 	ca := agent.NewChatAgent(s.poolForBinding(id, prov, cfg), cfg.Model, s.m.dir, tx, cfg.CompactionWindow())
 	ca.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	ca.SetWebSearch(s.m.WebSearchOpts())
-	ca.SetGuard(s.chatGuard())
+	ca.SetGuard(s.agentGuard())
 	ca.SetNonStreaming(nonStreamingResolver(cfg))
 	ca.SetMaxTokens(maxTokensResolver(cfg))
 	ca.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(每 run 读)
@@ -637,7 +825,11 @@ func (s *Server) invalidateProfileAgents() {
 	s.provCacheMu.Lock()
 	s.provCacheGen++
 	s.provByProfile = map[int64]*provEntry{}
+	s.revProvByProfile = map[int64]*provEntry{}
 	s.provCacheMu.Unlock()
+	s.cfgMu.Lock()
+	s.revProvGlobal = nil
+	s.cfgMu.Unlock()
 	s.invalidateTaskAgents()
 }
 
@@ -656,6 +848,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("POST /api/auth/refresh", s.authRefresh)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
+
+	// SSE 一次性票据(F6):凭 access token 换 60s 单用 ticket,EventSource 拼
+	// ?ticket= 连接,不再把 access token 放进 URL。
+	mux.HandleFunc("POST /api/sse-ticket", s.sseTicket)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
@@ -717,6 +915,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
+	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)        // 期 4:待授权网段列表
+	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide)    // 期 4:审批扩 scope
 	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
@@ -757,14 +957,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/groups", s.findingGroups)
 	mux.HandleFunc("GET /api/exploration/findings/asset-tree", s.findingAssetTree)
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
+	mux.HandleFunc("GET /api/exploration/reviews/stats", s.reviewStats)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
+	// 四层去重第四层:人工合并 / 疑似重复视图(见 server/finding_dedup.go)
+	mux.HandleFunc("GET /api/exploration/findings/duplicates", s.findingsDuplicates)
+	mux.HandleFunc("POST /api/exploration/findings/merge", s.mergeFindings)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/lineage", s.findingLineage)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/deepen", s.deepenFinding)
+	// 人工发起「扩大危害」:在已确认据点上纵向升级(与审核自动派单同一套回路)。
+	mux.HandleFunc("POST /api/exploration/findings/{id}/escalate", s.escalateFindingManual)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/review", s.reviewFinding)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/dismiss-duplicate", s.dismissDuplicate)
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
+	mux.HandleFunc("GET /api/exploration/findings/{id}/checks", s.listFindingChecks)
+	mux.HandleFunc("POST /api/exploration/findings/{id}/checks", s.startFindingCheck)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
@@ -931,15 +1141,55 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
+	mux.HandleFunc("GET /api/intercept/mode", s.interceptGetMode)           // 拦截判定链:规则优先 / 纯模型
+	mux.HandleFunc("PUT /api/intercept/mode", s.interceptSetMode)
+
+	// 一键放行(guard auto-allow):带时限的 ask 审批自动放行开关
+	mux.HandleFunc("GET /api/guard/auto-allow", s.guardAutoAllowGet)
+	mux.HandleFunc("PUT /api/guard/auto-allow", s.guardAutoAllowSet)
+
+	// 受管文件投递(F13):管理 API 在 JWT 之后;下载路径 /s/ 在 root mux(JWT 之外,
+	// 目标机器没有 token——安全靠 24 字节随机 token + 每 token 限速 + 一致性 404)。
+	mux.HandleFunc("POST /api/stage", s.stageCreate)
+	mux.HandleFunc("GET /api/stage", s.stageList)
+	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)
+
+	// 内网作战页（人工操作通道,JWT 后；与 agent host 工具隔离，见 intranet.go)。
+	// 人工 exec/write/delete/teardown 全部打 [intranet] 服务端审计日志。
+	mux.HandleFunc("GET /api/sessions", s.intranetListSessions)
+	mux.HandleFunc("GET /api/sessions/{id}", s.intranetGetSession)
+	mux.HandleFunc("POST /api/sessions/{id}/exec", s.intranetExec)
+	mux.HandleFunc("POST /api/sessions/{id}/probe", s.intranetProbeSession)
+	mux.HandleFunc("POST /api/sessions/{id}/list", s.intranetListDir)
+	mux.HandleFunc("POST /api/sessions/{id}/read", s.intranetReadFile)
+	mux.HandleFunc("POST /api/sessions/{id}/write", s.intranetWriteFile)
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.intranetDeleteSession)
+	mux.HandleFunc("POST /api/sessions/{id}/handoff", s.sessionHandoff) // 期 4:外网→内网任务移交
+	mux.HandleFunc("GET /api/tunnels", s.intranetListTunnels)
+	mux.HandleFunc("POST /api/tunnels/{id}/teardown", s.intranetTeardownTunnel)
+	mux.HandleFunc("GET /api/credentials", s.intranetListCredentials)
+	mux.HandleFunc("GET /api/intranet/topology", s.intranetTopology)
 
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
+	// 伪装门控(F14)包在最外层:静态 SPA、/api/*(含 /api/health)、SSE、favicon
+	// 全部在门控后,未过门控一律返回假 nginx 欢迎页而不是 JSON 401。
+	// /s/ 是唯一例外:暂存下载面目标机器不可能有门控 cookie,gate 对该前缀放行(见 gate.go)。
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
-	root.Handle("/", s.webuiHandler())
-	return root
+	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload)
+	root.Handle("/", s.requireAuth(s.webuiHandler()))
+	return s.gate.wrap(root)
+}
+
+// SetGate 安装反测绘伪装门控(gate.go 的 NewGate 产物;nil = 直通)。
+// 门控位于 requireAuth 外层,过了门控后 JWT 流程一切照旧。
+func (s *Server) SetGate(g *Gate) {
+	s.gate = g
+	// 批 5 B2:入口路径是平台敏感信息,门控安装/变更后重新注册出口审查指纹。
+	s.registerEgressFingerprints()
 }
 
 // --- handlers ---
@@ -1375,6 +1625,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
 		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
 		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		SessionBodyField string `json:"session_body_field"` // 非空=测试时也在请求体里注入该字段，值为一次性随机 session id
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1394,16 +1645,22 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	// 自定义会话体字段名同理：某些网关(实测某中转按请求长度命中严格通道)在请求体
+	// 缺 conversation id 时直接 400，测试路径必须与生产一致，否则"测试通、跑起来 400"。
+	cfg.SessionBodyField = req.SessionBodyField
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
 	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "" || cfg.SessionBodyField == "") {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if cfg.APIKey == "" {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
+			}
+			if cfg.SessionBodyField == "" {
+				cfg.SessionBodyField = p.SessionBodyField
 			}
 		}
 	}
@@ -1455,6 +1712,10 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	ReviewEnabled        *bool    `json:"review_enabled,omitempty"`    // 二次审核开关;省略/null=默认关(false)。开启后本任务新登记的漏洞自动进入 AI 二次审核,不合格的自动置为 ignored 并注明原因(见 finding_review.go)。
+	OpMode               string   `json:"op_mode,omitempty"`           // 作战模式:standard(默认)/ aggressive(激进)。aggressive=放宽一切技术性限制(拦截 ask 自动放行、停滞检测放宽、run 预算加倍),保留资产范围边界与破坏性操作底线。
+	Unattended           *bool    `json:"unattended,omitempty"`        // 无人值守开关;省略/null=默认关(false)。开启后 judge 给出 ask 时不再进入人工审批队列,而是发起一次「禁止 ask」的强制二次裁决(allow/deny 二选一,无法判断安全则 deny)。全局开关(intercept_unattended)开启时本字段被短路。
+	ReviewSrcType        string   `json:"review_src_type,omitempty"`   // 审核标准:edusrc(默认,EduSRC 严格收录)/ enterprise(企业 SRC 高价值影响)。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1513,6 +1774,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
+		ReviewEnabled:   req.ReviewEnabled != nil && *req.ReviewEnabled,
+		ReviewSrcType:   req.ReviewSrcType,
+		OpMode:          req.OpMode,
+		Unattended:      req.Unattended != nil && *req.Unattended,
 		InterceptRules:  interceptRules,
 	})
 	if err != nil {
@@ -1529,9 +1794,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
-	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
-	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。被「无靶机拒跑」拦下时
+	// 把原因一并回给调用方(否则 201 + 任务停在 created,驱动脚本看不出平台拒绝了启动)。
+	started, refusedReason := s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	if !started {
+		dto.LaunchRefused = true
+		dto.LaunchRefusedReason = refusedReason
+	}
+	writeJSON(w, 201, dto)
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -1734,6 +2005,20 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
+	// 与 listTasks 同源补齐聚合指标：此前单任务 DTO 的 goals/tokens/in_flight
+	// 恒为 0(只有列表端点填这些字段),任务详情页因此永远显示 0 目标 0 token。
+	if metrics, err := s.m.PG().TaskListMetricsAll(); err == nil {
+		if metric, ok := metrics[t.ExpID]; ok {
+			dto.Tokens = tokenTotalDTO(metric.Tokens)
+			dto.GoalsTotal = metric.Goals.Total
+			dto.GoalsMet = metric.Goals.Met
+			dto.InFlight = metric.RunningIntents
+			dto.LastActivity = metric.LastActivity
+			if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
+				dto.LastActivity = live
+			}
+		}
+	}
 	writeJSON(w, 200, dto)
 }
 
@@ -3313,6 +3598,12 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
+		// 「停滞顾问」开关(默认开)。engine 每 run 读,改完即时生效。
+		"stuck_adviser_enabled": s.m.pg.GetBool(settingStuckAdviser, true),
+		// 无人值守(全局,默认关)。开启后所有任务的 judge ask 走「禁止 ask 的强制二次
+		// 裁决」,不进人工审批队列;关闭时以任务级开关(tasks.unattended)为准。
+		// RoE 范围强制 / 用户自建审批规则 / 编码无法解码三条硬编码 ask 不受影响。
+		"intercept_unattended": s.m.pg.GetBool(intercept.SettingInterceptUnattended, false),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
 		// 这里只放「作用于全部渠道」的三项。
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
@@ -3385,6 +3676,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
 		// 实验功能:noa 上下文压缩开关(默认关);每 run 读,对之后启动的 run 生效,无需重建 agent。
 		NoaCompaction *bool `json:"noa_compaction"`
+		// 「停滞顾问」开关(默认开):worker 被判信息梯度为零时,除固定转向纪律外再唤起
+		// 一次带全局上下文的顾问调用,把「停止同轴重试」升级成「具体换到哪去」。
+		// 每 run 读,即时生效;关掉只省 token,判据与注入路径不变。
+		StuckAdviser *bool `json:"stuck_adviser_enabled"`
+		// 无人值守(全局,默认关):开启后所有任务的 judge ask 走「禁止 ask 的强制二次
+		// 裁决」,不再进入人工审批队列。即时生效(interceptor 每次裁决读一次)。
+		InterceptUnattended *bool `json:"intercept_unattended"`
 		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
 		// 不需要重建 agent 或重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
@@ -3410,6 +3708,20 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.NoaCompaction != nil {
 		// 每 run 读的解析器,切换即时对之后启动的 run 生效,无需 applyLLM 重建。
 		if err := s.m.SetNoaCompaction(*req.NoaCompaction); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.StuckAdviser != nil {
+		// 停滞顾问:engine 每 run 读一次,切换即时生效。
+		if err := s.m.pg.SetBool(settingStuckAdviser, *req.StuckAdviser); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.InterceptUnattended != nil {
+		// 无人值守(全局):interceptor 每次裁决读一次 settings,切换即时生效,无需重建。
+		if err := s.m.pg.SetBool(intercept.SettingInterceptUnattended, *req.InterceptUnattended); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -3749,7 +4061,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal)
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "（主 Agent 出错：" + err.Error() + "）", MainSeg: segPtr})

@@ -211,6 +211,9 @@ function deleteDetails(result: DeleteCounts): string[] {
   if (result.files_deleted) details.push("删除任务文件");
   if (result.findings_deleted > 0) details.push(`删除漏洞 ${result.findings_deleted} 条`);
   if (result.llm_records_deleted > 0) details.push(`删除 LLM 请求/响应记录 ${result.llm_records_deleted} 条`);
+  if (result.sessions_deleted > 0) details.push(`删除立足点会话 ${result.sessions_deleted} 条`);
+  if (result.tunnels_deleted > 0) details.push(`删除隧道 ${result.tunnels_deleted} 条`);
+  if (result.credentials_deleted > 0) details.push(`删除凭据 ${result.credentials_deleted} 条`);
   return details;
 }
 
@@ -622,6 +625,9 @@ export default function TasksPage() {
         files_deleted: false,
         findings_deleted: 0,
         llm_records_deleted: 0,
+        sessions_deleted: 0,
+        tunnels_deleted: 0,
+        credentials_deleted: 0,
       };
       const deleted: string[] = [];
       const failed: { id: string; message: string }[] = [];
@@ -636,6 +642,9 @@ export default function TasksPage() {
           total.files_deleted = total.files_deleted || r.files_deleted;
           total.findings_deleted += r.findings_deleted;
           total.llm_records_deleted += r.llm_records_deleted;
+          total.sessions_deleted += r.sessions_deleted;
+          total.tunnels_deleted += r.tunnels_deleted;
+          total.credentials_deleted += r.credentials_deleted;
           if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
           deleted.push(id);
         } catch (e) {
@@ -1193,6 +1202,11 @@ const TaskRow = React.memo(function TaskRow({
         <div className="flex max-w-xs items-center gap-2">
           <TaskNameEditor task={task} onRename={onRename} />
           {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
+          {task.op_mode === "aggressive" && (
+            <Badge variant="destructive" className="shrink-0" title="激进模式:放宽一切技术限制">
+              激进
+            </Badge>
+          )}
           {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="已置顶" />}
         </div>
       </TableCell>
@@ -2017,6 +2031,7 @@ const emptyDeleteOptions = (): DeleteTaskOptions => ({
   delete_files: false,
   delete_findings: false,
   delete_llm_records: false,
+  delete_intranet: false,
 });
 
 const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
@@ -2025,6 +2040,7 @@ const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
   "delete_files",
   "delete_findings",
   "delete_llm_records",
+  "delete_intranet",
 ];
 
 // DeleteOptionFields renders the「同时清理关联数据」checkbox block shared by the
@@ -2060,6 +2076,7 @@ function DeleteOptionFields({
       delete_files: checked,
       delete_findings: checked,
       delete_llm_records: checked,
+      delete_intranet: checked,
     });
   };
 
@@ -2075,7 +2092,7 @@ function DeleteOptionFields({
           />
           <FieldContent>
             <FieldLabel htmlFor={`delete-all-${idPrefix}`}>全部删除</FieldLabel>
-            <FieldDescription>选中下方全部关联数据，包括资产、流量、文件、漏洞和 LLM 请求/响应记录。</FieldDescription>
+            <FieldDescription>选中下方全部关联数据，包括资产、流量、文件、漏洞、LLM 请求/响应记录和内网会话/隧道/凭据。</FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">
@@ -2131,6 +2148,17 @@ function DeleteOptionFields({
           <FieldContent>
             <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>LLM 请求/响应记录</FieldLabel>
             <FieldDescription>永久删除该任务录制的 LLM 请求、响应、Token 与错误详情。</FieldDescription>
+          </FieldContent>
+        </Field>
+        <Field orientation="horizontal">
+          <Checkbox
+            id={`delete-intranet-${idPrefix}`}
+            checked={options.delete_intranet}
+            onCheckedChange={(checked) => updateOption("delete_intranet", checked === true)}
+          />
+          <FieldContent>
+            <FieldLabel htmlFor={`delete-intranet-${idPrefix}`}>内网模块（会话/隧道/凭据）</FieldLabel>
+            <FieldDescription>回收该任务的立足点会话与隧道运行时，并永久删除会话、隧道、凭据台账记录。</FieldDescription>
           </FieldContent>
         </Field>
       </FieldGroup>
@@ -3087,6 +3115,10 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
+  const [reviewEnabled, setReviewEnabled] = React.useState(false); // 二次审核开关;默认关。开启后新漏洞自动进入 AI 二次审核
+  const [reviewSrcType, setReviewSrcType] = React.useState<"edusrc" | "enterprise">("edusrc"); // 审核标准:EduSRC(默认)/ 企业 SRC
+  const [opMode, setOpMode] = React.useState<"standard" | "aggressive">("standard"); // 作战模式;默认 standard。aggressive=激进模式(红色警示,放宽一切技术限制,保留资产范围与破坏性操作底线)
+  const [unattended, setUnattended] = React.useState(false); // 无人值守;默认关。开启后 judge 需人审的命令自动强制二选一,不再等人
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
@@ -3154,6 +3186,10 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        reviewEnabled,
+        reviewSrcType,
+        opMode,
+        unattended,
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
@@ -3171,6 +3207,9 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setReviewEnabled(false);
+      setReviewSrcType("edusrc");
+      setOpMode("standard");
       setInterceptRules([]);
       setUploadCount(0);
       draftIdRef.current = "";
@@ -3396,6 +3435,84 @@ function CreateTaskSheet({
                     默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
                   </p>
+                </div>
+                <div className="grid gap-2">
+                  <label htmlFor="review-enabled" className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      id="review-enabled"
+                      checked={reviewEnabled}
+                      onCheckedChange={(v) => setReviewEnabled(!!v)}
+                    />
+                    开启二次审核（AI 复核漏洞）
+                  </label>
+                  <p className="text-muted-foreground text-xs">
+                    开启后，任务新登记的每条漏洞都会由 AI 按收录标准复核：不符合标准的自动标记为「忽略」并注明原因，
+                    有深入价值的会给出深挖建议。关闭则不做自动复核（仍可在「二次审核」页手动重审）。
+                  </p>
+                  {reviewEnabled && (
+                    <div className="grid gap-2 pt-1">
+                      <Label htmlFor="review-src-type">审核标准</Label>
+                      <Select
+                        value={reviewSrcType}
+                        onValueChange={(v) => setReviewSrcType(v as "edusrc" | "enterprise")}
+                      >
+                        <SelectTrigger id="review-src-type" className="w-56">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            <SelectItem value="edusrc">EduSRC（教育行业收录标准）</SelectItem>
+                            <SelectItem value="enterprise">企业 SRC（企业高价值影响）</SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <p className="text-muted-foreground text-xs">
+                        EduSRC 只收录教育行业认定的敏感信息 / 高危漏洞；企业 SRC 侧重业务与数据影响。
+                      </p>
+                    </div>
+                  )}
+                </div>
+                <div className="grid gap-2">
+                  <label htmlFor="op-mode" className="flex items-center gap-2 text-sm font-medium">
+                    <Checkbox
+                      id="op-mode"
+                      checked={opMode === "aggressive"}
+                      onCheckedChange={(v) => setOpMode(v ? "aggressive" : "standard")}
+                    />
+                    <span className="text-destructive">启用激进模式（放宽一切技术限制）</span>
+                  </label>
+                  <div className="border-destructive/50 bg-destructive/10 text-destructive rounded-md border p-3 text-xs">
+                    <p className="font-semibold">⚠ 高风险：激进模式会放宽平台侧的安全限制</p>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                      <li>拦截规则的「询问」审批（含 LLM 兜底审批）对本任务全部自动放行，不再逐条人工确认；</li>
+                      <li>拦截规则与 LLM 审核给出的「拒绝」也一律转为放行（审计标注「激进模式·全放行」），不再有任何命令拦截；</li>
+                      <li>停滞检测阈值大幅抬高、单次 run 预算加倍，深挖途中不会被过早中断。</li>
+                    </ul>
+                    <p className="mt-1 font-semibold">仍保留的两条底线（在判定链之前，不受全放行影响）：</p>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                      <li>资产范围边界：不越权打偏到未授权目标（RoE 范围强制审批不自动放行）；</li>
+                      <li>平台凭据外泄防线与跨任务数据隔离照常生效。</li>
+                    </ul>
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <label htmlFor="unattended-mode" className="flex items-center gap-2 text-sm font-medium">
+                    <Checkbox
+                      id="unattended-mode"
+                      checked={unattended}
+                      onCheckedChange={(v) => setUnattended(v === true)}
+                    />
+                    <span>无人值守（judge 需人审的命令自动强制二选一，不再等人）</span>
+                  </label>
+                  <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+                    <p>
+                      开启后，LLM 审核判定「需要人工审批」的命令将<b>自动发起第二次强制裁决</b>：
+                      在 allow / deny 中二选一（无法判断安全则拒绝），<b>不再进入人工审批队列</b>。
+                      适合夜间长跑、无人盯屏的任务；每次裁决在审计里标注「无人值守强制裁决」，可事后追查。
+                      全局开关（系统设置 → 无人值守）开启时，本任务无论勾选与否都按无人值守处理。
+                      RoE 范围强制与用户自建审批规则不受影响，仍需人工。
+                    </p>
+                  </div>
                 </div>
               </CollapsibleContent>
             </Collapsible>

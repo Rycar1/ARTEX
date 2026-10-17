@@ -1315,6 +1315,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       name,
       description,
       goal,
+      builtin: false,
       created_at: now,
       updated_at: now,
     };
@@ -1325,6 +1326,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const template = mockTaskTemplates.find((item) => item.id === Number(seg[1]));
     if (!template) return {};
     const name = typeof b.name === "string" ? normalizedTemplateName(b.name) : template.name;
+    if (template.builtin && name.toLowerCase() !== normalizedTemplateName(template.name).toLowerCase()) {
+      throw new Error("内置模板不可改名");
+    }
     const description = typeof b.description === "string" ? b.description.trim() : template.description;
     const goal = typeof b.goal === "string" ? b.goal.trim() : template.goal;
     if (!name || !description || !goal) throw new Error("请填写模板名称、描述和目标");
@@ -1345,6 +1349,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "task-templates" && seg.length === 2 && m === "DELETE") {
     const id = Number(seg[1]);
     const index = mockTaskTemplates.findIndex((item) => item.id === id);
+    if (index >= 0 && mockTaskTemplates[index].builtin) {
+      throw new Error("内置模板不可删除");
+    }
     if (index >= 0) mockTaskTemplates.splice(index, 1);
     return { deleted: id };
   }
@@ -1414,6 +1421,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       files_deleted: Boolean(b.delete_files),
       findings_deleted: findingsDeleted,
       llm_records_deleted: llmRecordsDeleted,
+      sessions_deleted: 0,
+      tunnels_deleted: 0,
+      credentials_deleted: 0,
     };
   }
   if (seg[0] === "tasks" && seg[2] === "llm" && m === "PUT") {
@@ -2002,6 +2012,27 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       queued: false,
     };
   }
+  // 人工发起「扩大危害」(demo 内存态):与审核自动派单同一套回路,每漏洞最多一轮。
+  if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "escalate" && m === "POST") {
+    const finding = mockFindings.find((candidate) => candidate.id === seg[2]);
+    if (!finding) throw new Error("finding not found");
+    if (!finding.task_id || !mockTasks.some((candidate) => candidate.id === finding.task_id)) {
+      throw new Error("finding origin task or node is no longer available");
+    }
+    if (finding.escalated_at) throw new Error("该漏洞已发起过「扩大危害」(每个漏洞最多一轮)");
+    const notes = String(b.notes ?? "").trim();
+    if ([...notes].length > 4000) throw new Error("notes must be at most 4000 characters");
+    finding.escalated_at = new Date().toISOString();
+    finding.escalate_status = "dispatched";
+    finding.base_severity = finding.review_severity || finding.severity;
+    return {
+      task_id: finding.task_id,
+      intent_id: `mock-escalate-${Date.now()}`,
+      state: "open",
+      queued: false,
+      severity: finding.base_severity,
+    };
+  }
   // 关联流量证据:列表 / 绑定 / 编辑 / 解绑 / 排序 / 单条报文详情(demo 内存态)。
   // seg = ["exploration","findings",<id>,"traffic", ...]
   if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "traffic") {
@@ -2430,10 +2461,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const status = q.get("status") || "";
     const decisionSource = q.get("decision_source") || "";
     if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
-    if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    if (decisionSource && !["model", "rule", "builtin", "unknown", "aggressive", "aggressive_bypass", "auto_allow"].includes(decisionSource))
+      throw new Error("无效判定来源");
     const filtered = mockInterceptHistory.filter((row) => {
       const source =
-        row.decision_source || (row.rule_id ? "rule" : row.reason?.startsWith("[模型]") ? "model" : "unknown");
+        row.decision_source ||
+        (row.rule_id
+          ? "rule"
+          : row.reason?.startsWith("[模型]")
+            ? "model"
+            : row.reason?.includes("内置")
+              ? "builtin"
+              : "unknown");
       return (
         (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
         (!status || row.status === status) &&
@@ -2461,9 +2500,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       timeout_seconds: 15,
       fail_action: "allow",
       ask_timeout_seconds: 300,
-      ask_timeout_action: "deny",
-    };
+      ask_timeout_action: "deny", retry_attempts: 2 };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
+  if (path === "/intercept/mode" && m === "GET") return { mode: "rules", judge_available: false };
+  if (path === "/intercept/mode" && m === "PUT") return { ok: true, mode: "rules" };
   if (path === "/intercept/judge/usage" && m === "GET")
     return {
       calls: 0,

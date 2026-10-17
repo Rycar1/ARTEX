@@ -22,8 +22,8 @@ import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { statusMeta } from "@/lib/status";
-import type { Finding, FindingStatus, Severity } from "@/lib/types";
+import { statusMeta, toneClasses, type Tone } from "@/lib/status";
+import type { Finding, FindingDupMember, FindingStatus, Severity } from "@/lib/types";
 
 import { FindingLineageView } from "./lineage";
 
@@ -39,6 +39,13 @@ const FINDING_STATUSES: FindingStatus[] = [
   "duplicate",
   "risk_accepted",
 ];
+
+// AI 二次审核结论的展示元数据(与 /function/reviews 页保持同一套配色)。
+const REVIEW_VERDICT_META: Record<string, { label: string; tone: Tone }> = {
+  accepted: { label: "已收录", tone: "green" },
+  deepen: { label: "回炉深挖", tone: "blue" },
+  ignored: { label: "已忽略", tone: "neutral" },
+};
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN");
@@ -61,6 +68,8 @@ function FindingDetailInner() {
   const [finding, setFinding] = React.useState<Finding | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [tab, setTab] = React.useState("overview");
+  // 四层去重:已合并进本条的成员(反查「疑似重复 / 已合并」分组里 target=本条 的成员)。
+  const [dupMembers, setDupMembers] = React.useState<FindingDupMember[]>([]);
 
   const load = React.useCallback(() => {
     if (!id) {
@@ -72,10 +81,28 @@ function FindingDetailInner() {
       .then((f) => setFinding(f))
       .catch(() => setFinding(null))
       .finally(() => setLoaded(true));
+    api
+      .findingsDuplicates(undefined, 500)
+      .then((groups) => {
+        const g = groups.find((x) => String(x.target_id) === String(id));
+        setDupMembers((g?.members ?? []).filter((m) => m.merged));
+      })
+      .catch(() => setDupMembers([]));
   }, [contextTaskId, id]);
   React.useEffect(() => {
     load();
   }, [load]);
+
+  // dismissDup 人工判定「不是重复」:清掉疑似重复标记。
+  const dismissDup = React.useCallback(async () => {
+    try {
+      await api.dismissFindingDuplicate(id);
+      setFinding((cur) => (cur ? { ...cur, suspected_dup_of: undefined, suspected_dup_score: undefined } : cur));
+      toast.success("已标记为不是重复");
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    }
+  }, [id]);
 
   const changeSeverity = React.useCallback(
     async (next: Severity) => {
@@ -172,6 +199,117 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              {finding.review_verdict ? (
+                <Card>
+                  <CardHeader className="flex-row items-center justify-between">
+                    <CardTitle className="text-sm">AI 二次审核</CardTitle>
+                    <span
+                      className={`rounded border px-1.5 py-0.5 font-medium text-xs ${
+                        toneClasses[REVIEW_VERDICT_META[finding.review_verdict]?.tone ?? "neutral"]
+                      }`}
+                    >
+                      {REVIEW_VERDICT_META[finding.review_verdict]?.label ?? finding.review_verdict}
+                    </span>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-muted-foreground text-xs">
+                      {finding.review_severity ? (
+                        <span>审核严重度：{statusMeta("severity", finding.review_severity).label}</span>
+                      ) : null}
+                      {typeof finding.review_score === "number" ? (
+                        <span>价值分：{finding.review_score.toFixed(1)}</span>
+                      ) : null}
+                      {finding.reviewed_at ? <span>审核时间：{fmtTime(finding.reviewed_at)}</span> : null}
+                      {finding.escalate_status ? (
+                        <span>
+                          危害升级：
+                          {finding.escalate_status === "dispatched"
+                            ? "已派「扩大危害」任务"
+                            : finding.escalate_status === "done"
+                              ? `升级已交回待复核${finding.base_severity ? `（原 ${statusMeta("severity", finding.base_severity).label}）` : ""}`
+                              : "升级未成立，保留原级"}
+                        </span>
+                      ) : null}
+                    </div>
+                    {finding.review_reasons ? (
+                      <div>
+                        <p className="mb-1 font-medium text-muted-foreground text-xs">判定原因</p>
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{finding.review_reasons}</p>
+                      </div>
+                    ) : null}
+                    {finding.review_notes ? (
+                      <div>
+                        <p className="mb-1 font-medium text-muted-foreground text-xs">审核备注</p>
+                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{finding.review_notes}</p>
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ) : null}
+              {finding.merged_into || finding.suspected_dup_of || dupMembers.length > 0 ? (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">去重</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3 text-sm">
+                    {finding.merged_into ? (
+                      <p>
+                        本条已被人工合并到{" "}
+                        <Link
+                          className="text-primary hover:underline"
+                          href={`/function/findings/detail?id=${finding.merged_into}`}
+                        >
+                          #{finding.merged_into}
+                        </Link>
+                        ，其严重度与证据已并入主漏洞。
+                      </p>
+                    ) : null}
+                    {finding.suspected_dup_of ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline" className="border-amber-500/60 text-amber-600 dark:text-amber-500">
+                          疑似重复
+                        </Badge>
+                        <span>
+                          疑似与{" "}
+                          <Link
+                            className="text-primary hover:underline"
+                            href={`/function/findings/detail?id=${finding.suspected_dup_of}`}
+                          >
+                            #{finding.suspected_dup_of}
+                          </Link>{" "}
+                          重复
+                          {typeof finding.suspected_dup_score === "number"
+                            ? `（相似度 ${(finding.suspected_dup_score * 100).toFixed(0)}%）`
+                            : ""}
+                          。
+                        </span>
+                        <Button size="sm" variant="outline" onClick={() => void dismissDup()}>
+                          不是重复
+                        </Button>
+                      </div>
+                    ) : null}
+                    {dupMembers.length > 0 ? (
+                      <div>
+                        <p className="mb-1 font-medium text-muted-foreground text-xs">
+                          已合并进本条的漏洞（{dupMembers.length} 条）
+                        </p>
+                        <div className="flex flex-wrap gap-1">
+                          {dupMembers.map((m) => (
+                            <Link
+                              key={m.id}
+                              href={`/function/findings/detail?id=${m.id}`}
+                              className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground hover:text-foreground"
+                              title={m.name || m.vulnclass}
+                            >
+                              #{m.id}
+                            </Link>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ) : null}
               <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               <Card>
                 <CardHeader>

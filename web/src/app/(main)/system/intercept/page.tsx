@@ -9,8 +9,19 @@ import {
   PlusIcon,
   ShieldAlertIcon,
   Trash2Icon,
+  ZapIcon,
 } from "lucide-react";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -52,8 +63,11 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import type {
+  AutoAllowState,
   InterceptAction,
+  InterceptModeState,
   InterceptRule,
+  InterceptRuleMode,
   JudgeConfig,
   JudgeDayUsage,
   JudgeUsage,
@@ -191,6 +205,100 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+// ---- review-mode card (判定链:规则优先 / 纯模型审核) ----
+
+function ReviewModeCard() {
+  const [st, setSt] = React.useState<InterceptModeState | null>(null);
+  const [busy, setBusy] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    try {
+      setSt(await api.interceptGetMode());
+    } catch {
+      // 状态条非关键,失败静默
+    }
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  async function select(mode: InterceptRuleMode) {
+    setBusy(true);
+    try {
+      await api.interceptSetMode(mode);
+      await load();
+      toast.success(mode === "judge_only" ? "已切换为纯模型审核(拦截规则不参与判定)" : "已切换为规则优先 + 模型兜底");
+    } catch (e) {
+      toast.error("切换失败: " + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const mode = st?.mode ?? "rules";
+  const pure = mode === "judge_only";
+  const judgeAvailable = st?.judge_available ?? false;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        className={`flex flex-col gap-3 rounded-lg border px-4 py-3 ${
+          pure ? "border-violet-400/50 bg-violet-50/40 dark:bg-violet-950/20" : "bg-muted/40"
+        }`}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlertIcon className={`h-5 w-5 shrink-0 ${pure ? "text-violet-600" : "text-muted-foreground"}`} />
+            <div>
+              <p className="text-sm font-semibold leading-tight">审核判定链</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {pure
+                  ? "纯模型审核:跳过全部拦截规则,每一次工具调用都由裁判模型判定"
+                  : "规则优先:命中拦截规则即生效,未命中才交给裁判模型兜底"}
+              </p>
+            </div>
+          </div>
+          <Badge variant={pure ? "default" : "secondary"} className="shrink-0">
+            {pure ? "纯模型" : "规则 + 模型"}
+          </Badge>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant={pure ? "outline" : "default"}
+            disabled={busy || st === null || mode === "rules"}
+            onClick={() => select("rules")}
+          >
+            规则优先 + 模型兜底
+          </Button>
+          <Button
+            size="sm"
+            variant={pure ? "default" : "outline"}
+            disabled={busy || st === null || mode === "judge_only" || !judgeAvailable}
+            onClick={() => select("judge_only")}
+            title={judgeAvailable ? undefined : "需要先在「模型配置」启用裁判模型"}
+          >
+            纯模型审核
+          </Button>
+          {!judgeAvailable && (
+            <span className="text-xs text-amber-600 dark:text-amber-500">
+              纯模型审核需要先在「模型配置」启用裁判模型
+            </span>
+          )}
+        </div>
+
+        {pure && (
+          <p className="text-xs text-muted-foreground">
+            规则仍在库中(未删除),随时切回即可恢复;裁判不可用时按 fail-closed 转人工,不会静默放行。
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---- LLM fallback judge card ----
 
 const FOLLOW_ACTIVE = "0"; // profile_id 0 = 跟随激活/默认配置
@@ -203,6 +311,7 @@ const defaultJudge = (): JudgeConfig => ({
   fail_action: "allow",
   ask_timeout_seconds: 300,
   ask_timeout_action: "deny",
+  retry_attempts: 2,
 });
 
 function JudgeCard() {
@@ -386,6 +495,18 @@ function JudgeCard() {
                     }}
                   />
                 </Field>
+                <Field label="模型输出不合规时重试次数">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5}
+                    value={cfg.retry_attempts}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value, 10);
+                      if (n >= 0) patch({ retry_attempts: Math.min(5, n) });
+                    }}
+                  />
+                </Field>
                 <Field label="模型失败时（出错 / 超时 / 无法解析）">
                   <Select value={cfg.fail_action} onValueChange={(v) => patch({ fail_action: v as JudgeConfig["fail_action"] })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
@@ -433,6 +554,141 @@ function JudgeCard() {
           {saving ? "保存中…" : "保存配置"}
         </Button>
       </div>
+    </div>
+  );
+}
+
+// ---- auto-allow (一键放行) card ----
+
+const AUTO_ALLOW_HOURS = [2, 4, 8] as const;
+
+function autoAllowRemainingLabel(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.ceil((secs % 3600) / 60);
+  if (h <= 0) return `${Math.max(1, m)} 分钟`;
+  return m > 0 && m < 60 ? `${h} 小时 ${m} 分` : `${h + (m >= 60 ? 1 : 0)} 小时`;
+}
+
+function AutoAllowCard() {
+  const [st, setSt] = React.useState<AutoAllowState | null>(null);
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [hours, setHours] = React.useState<number>(2);
+  const [busy, setBusy] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    try {
+      setSt(await api.getAutoAllow());
+    } catch {
+      // 状态条非关键,失败静默(30s 轮询会重试)
+    }
+  }, []);
+
+  React.useEffect(() => {
+    load();
+    const t = setInterval(load, 30_000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function enable() {
+    setBusy(true);
+    try {
+      setSt(await api.setAutoAllow(true, hours));
+      setConfirmOpen(false);
+      toast.success(`一键放行已开启(${hours} 小时后自动恢复拦截)`);
+    } catch (e) {
+      toast.error("开启失败: " + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disable() {
+    setBusy(true);
+    try {
+      setSt(await api.setAutoAllow(false, 0));
+      toast.success("一键放行已关闭,恢复人工审批");
+    } catch (e) {
+      toast.error("关闭失败: " + (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const enabled = st?.enabled ?? false;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 ${
+          enabled ? "border-red-400/60 bg-red-50/50 dark:bg-red-950/20" : "bg-muted/40"
+        }`}
+      >
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <ZapIcon className={`h-4 w-4 shrink-0 ${enabled ? "text-red-600" : "text-muted-foreground"}`} />
+          <span className="shrink-0 font-medium">一键放行</span>
+          <span className="truncate text-muted-foreground">
+            限时自动批准所有需审批操作,仅真·破坏性命令仍被拦截
+          </span>
+        </div>
+        <Switch
+          checked={enabled}
+          disabled={busy || st === null}
+          onCheckedChange={(v) => (v ? setConfirmOpen(true) : disable())}
+        />
+      </div>
+
+      {enabled && st && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-red-500/60 bg-red-100/60 px-4 py-2.5 dark:bg-red-950/40">
+          <p className="text-sm font-medium text-red-700 dark:text-red-400">
+            自动放行中 · 剩余 {autoAllowRemainingLabel(st.remaining_seconds)}(到期自动恢复拦截)
+          </p>
+          <Button variant="destructive" size="sm" className="shrink-0" onClick={disable} disabled={busy}>
+            关闭
+          </Button>
+        </div>
+      )}
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>开启一键放行?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3">
+                <p>
+                  开启后,AI agent 的所有需审批操作(横向移动、隧道工具、爆破、临时服务等)将
+                  <span className="font-semibold text-red-600 dark:text-red-400">【无人值守自动放行】</span>
+                  ,仅真·破坏性命令仍被拦截。仅在授权靶场/授权测试环境使用。请选择有效时长。
+                </p>
+                <div className="flex items-center gap-2">
+                  {AUTO_ALLOW_HOURS.map((h) => (
+                    <Button
+                      key={h}
+                      variant={hours === h ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => setHours(h)}
+                    >
+                      {h} 小时
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={busy}
+              onClick={(e) => {
+                e.preventDefault(); // 等接口返回后再关弹窗
+                enable();
+              }}
+            >
+              {busy ? "开启中…" : "确认开启"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -616,6 +872,9 @@ export default function InterceptPage() {
         </div>
       </div>
 
+      {/* ---- 一键放行(带时限的 ask 自动批准) ---- */}
+      <AutoAllowCard />
+
       {/* ---- 拦截范围信息条（规则匹配与模型兜底共用：不在范围内的工具两者都不介入）---- */}
       <div
         className={`flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 ${
@@ -754,7 +1013,8 @@ export default function InterceptPage() {
         </TabsContent>
 
         {/* ---- tab: 模型配置 ---- */}
-        <TabsContent value="judge" className="mt-4">
+        <TabsContent value="judge" className="mt-4 flex flex-col gap-4">
+          <ReviewModeCard />
           <JudgeCard />
         </TabsContent>
       </Tabs>

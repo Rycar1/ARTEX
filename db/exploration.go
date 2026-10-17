@@ -289,6 +289,28 @@ func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) e
 	return nil
 }
 
+// ConfirmFact 把本 exploration 的一条 fact 节点 confidence 升级为 confirmed，并写入审计
+// 字段（confirmed_by/confirmed_at）。scoped 到 kind='fact'，不会误改 intent/goal；无此
+// 事实时报错。content_version 与 SetNodeState 同步 bump，让已折叠 digest 的缓存体失效。
+func (s *ExplorationStore) ConfirmFact(id int64, origin string) error {
+	if origin == "" {
+		origin = "system"
+	}
+	audit, _ := json.Marshal(map[string]any{
+		"confidence":   "confirmed",
+		"confirmed_by": origin,
+		"confirmed_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload = payload || $1::jsonb, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3 AND kind='fact'`, string(audit), id, s.expID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("事实不存在")
+	}
+	return nil
+}
+
 // DeleteGoal hard-deletes a goal node; scoped to kind='goal' so it can never drop
 // an intent/fact by id. The edges (spawns) and anchors reference it with ON DELETE
 // CASCADE, so they go with it; activity.node_id is ON DELETE SET NULL. Returns an
@@ -332,6 +354,32 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 		return false, err
 	}
 	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// BumpIntentBudgetRetry reopens an exhausted intent for one more run when it has
+// not yet used up its budget-retry allowance. The attempt count is stored in the
+// intent payload under "budget_retry" so the cap survives restarts. Returns
+// (true, nil) when the intent was reopened (state -> open); (false, nil) when the
+// allowance is spent or the intent is not in the retryable 'exhausted' state.
+func (s *ExplorationStore) BumpIntentBudgetRetry(id int64, maxRetries int) (bool, error) {
+	if maxRetries <= 0 {
+		return false, nil
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL,
+    content_version=content_version+1,
+    payload = jsonb_set(payload, '{budget_retry}',
+        to_jsonb(COALESCE(NULLIF(payload->>'budget_retry','')::int, 0) + 1), true)
+WHERE id=$1 AND exploration_id=$2 AND kind='intent' AND state='exhausted'
+  AND COALESCE(NULLIF(payload->>'budget_retry','')::int, 0) < $3`, id, s.expID, maxRetries)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
 	return n > 0, nil
 }
 

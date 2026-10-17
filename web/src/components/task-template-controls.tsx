@@ -16,6 +16,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Combobox,
@@ -86,6 +87,10 @@ function TaskTemplateManager({
 }: TaskTemplateManagerProps) {
   const [selectedID, setSelectedID] = React.useState<number | null>(null);
   const [draft, setDraft] = React.useState<TemplateDraft>(emptyDraft);
+  const selectedBuiltin = React.useMemo(
+    () => templates.find((template) => template.id === selectedID)?.builtin ?? false,
+    [selectedID, templates],
+  );
   const [saving, setSaving] = React.useState(false);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -230,7 +235,14 @@ function TaskTemplateManager({
                       )}
                       onClick={() => selectTemplate(template)}
                     >
-                      <span className="block truncate font-medium text-sm">{template.name}</span>
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate font-medium text-sm">{template.name}</span>
+                        {template.builtin && (
+                          <Badge variant="outline" className="h-4 shrink-0 px-1.5 text-[10px]">
+                          内置
+                        </Badge>
+                        )}
+                      </span>
                       <span className="block truncate text-muted-foreground text-xs">{template.description}</span>
                     </button>
                   ))}
@@ -245,9 +257,11 @@ function TaskTemplateManager({
                     id="task-template-name"
                     value={draft.name}
                     maxLength={120}
+                    disabled={selectedBuiltin}
                     placeholder="例如：外部 Web 渗透"
                     onChange={(event) => updateDraft("name", event.target.value)}
                   />
+                  {selectedBuiltin && <FieldDescription>内置模板的名称固定，不可改名。</FieldDescription>}
                 </Field>
                 <Field>
                   <FieldLabel htmlFor="task-template-description">描述</FieldLabel>
@@ -303,7 +317,14 @@ function TaskTemplateManager({
           </div>
           <SheetFooter className="border-t px-6 py-4 sm:flex-row sm:items-center">
             {selectedID != null && (
-              <Button type="button" variant="destructive" className="sm:mr-auto" onClick={() => setDeleteOpen(true)}>
+              <Button
+                type="button"
+                variant="destructive"
+                className="sm:mr-auto"
+                disabled={selectedBuiltin}
+                title={selectedBuiltin ? "内置模板不可删除" : undefined}
+                onClick={() => setDeleteOpen(true)}
+              >
                 <Trash2Icon data-icon="inline-start" />
                 删除模板
               </Button>
@@ -488,7 +509,14 @@ export function TaskTemplateControls({
                 <ComboboxItem key={template.id} value={template}>
                   <LibraryIcon />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate font-medium text-sm">{template.name}</p>
+                    <p className="flex items-center gap-1.5 truncate font-medium text-sm">
+                      {template.name}
+                      {template.builtin && (
+                        <Badge variant="outline" className="h-4 shrink-0 px-1.5 text-[10px]">
+                        内置
+                      </Badge>
+                      )}
+                    </p>
                     {template.description && (
                       <p className="truncate text-muted-foreground text-xs">{template.description}</p>
                     )}

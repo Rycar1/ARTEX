@@ -42,7 +42,7 @@ VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, seco
 		var preparedHosts []string
 		deleteDone := make(chan error, 1)
 		go func() {
-			_, deleteErr := deleter.DeleteTaskCascadePrepared(first.ID, true, false, false, func(p TaskDeletePreparation) error {
+			_, deleteErr := deleter.DeleteTaskCascadePrepared(first.ID, true, false, false, false, func(p TaskDeletePreparation) error {
 				preparedHosts = append([]string(nil), p.TrafficHosts...)
 				return nil
 			})
@@ -84,7 +84,7 @@ VALUES ('service', $1, 'http', $2, ARRAY[$3]::bigint[])`, serviceURL, host, seco
 		releasePrepare := make(chan struct{})
 		deleteDone := make(chan error, 1)
 		go func() {
-			_, deleteErr := deleter.DeleteTaskCascadePrepared(first.ID, true, false, false, func(p TaskDeletePreparation) error {
+			_, deleteErr := deleter.DeleteTaskCascadePrepared(first.ID, true, false, false, false, func(p TaskDeletePreparation) error {
 				prepared <- p
 				<-releasePrepare
 				return nil

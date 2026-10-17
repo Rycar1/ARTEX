@@ -87,6 +87,8 @@ func writeTaskTemplateErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, db.ErrTaskTemplateNameConflict):
 		writeErr(w, http.StatusConflict, "模板名称已存在")
+	case errors.Is(err, db.ErrTaskTemplateBuiltin):
+		writeErr(w, http.StatusConflict, "内置模板受保护，不可删除或改名")
 	case errors.Is(err, db.ErrTaskTemplateNotFound):
 		writeErr(w, http.StatusNotFound, "task template not found")
 	default:
@@ -198,7 +200,7 @@ func (s *Server) pgDeleteTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	deleted, err := pg.DeleteTaskTemplate(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeTaskTemplateErr(w, err)
 		return
 	}
 	if !deleted {

@@ -27,10 +27,6 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	m := &Manager{pg: d, interceptor: intercept.New(d)}
 	s := &Server{m: m, jwtKey: []byte("approval-http-test-signing-key")}
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	id, err := m.pg.CreateInterceptPending(0, 0, "approval-http", "test", "Write", []byte(`{}`), "[模型] 确认", &db.InterceptAudit{InitialAction: "ask", UserMessage: "snapshot", ExecutionStatus: "not_started"})
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +35,7 @@ func TestInterceptDetailHTTP(t *testing.T) {
 	do := func(method, path, body string, authenticated bool) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
 		if authenticated {
-			req.Header.Set("Authorization", "Bearer "+token)
+			baAuth(s, req)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)

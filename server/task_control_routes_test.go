@@ -18,14 +18,10 @@ func TestWorkerControlRoutes(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
 
 	request := func(path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"action":"pause"}`))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)

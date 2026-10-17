@@ -13,6 +13,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { auth } from "@/lib/auth";
+import { api } from "@/lib/api";
 import { cn, getInitials } from "@/lib/utils";
 
 import { ChangePasswordDialog } from "./change-password-dialog";
@@ -32,8 +33,7 @@ export function AccountSwitcher({
   const [pwOpen, setPwOpen] = useState(false);
 
   function handleLogout() {
-    auth.clearToken();
-    window.location.href = "/login";
+    window.location.reload();
   }
 
   if (!activeUser) {

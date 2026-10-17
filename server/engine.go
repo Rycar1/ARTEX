@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +14,9 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/dispatch"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -136,8 +140,13 @@ type Engine struct {
 
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
+	// P0 意图领取超时上报(红日 3 R2:决胜意图 #207 从未被领取)的冷却台账:
+	// taskID -> *sync.Map(intentID -> bool),同一意图只上报一次。见 intent_watchdog.go。
+	p0Reported sync.Map
+
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
 	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	scopeGate    sync.Map // taskID -> int, 收尾闸门连续拦截轮数(goalless 分支)
 	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
@@ -280,6 +289,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.paused.Delete(taskID)
 	e.dropCnt.Delete(taskID)
 	e.plannerRound.Delete(taskID)
+	e.p0Reported.Delete(taskID)
 	e.settling.Delete(taskID)
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
@@ -288,6 +298,13 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
+
+	// 期 3b:任务删除/归档连带销毁其 MITM 实例(端口注销;CA/录制树保留)。
+	if e.m != nil {
+		if id, err := strconv.ParseInt(taskID, 10, 64); err == nil {
+			e.m.CloseTaskProxy(id)
+		}
+	}
 }
 
 // cancelExec cancels a task's current per-task exec context (any in-flight
@@ -527,7 +544,8 @@ func (e *Engine) drainSteer(intentID int64) (string, bool) {
 // before each tool call it drains a queued course-correction (if any) and blocks the
 // call, handing the message back to the model — which re-plans its next step instead
 // of running the tool. No queued message → the guard behaves exactly as before.
-// 它同时负责「空转回合」的续跑，见 Stop。
+// 它同时负责「空转回合」的续跑(见 Stop)与「同质响应停滞检测」(见 PostToolUse,
+// chains L1,CHAINS-INTEGRATION-DESIGN.md §3)。
 type steerHooks struct {
 	inner harness.HookRunner
 	drain func() (string, bool)
@@ -539,6 +557,15 @@ type steerHooks struct {
 	limit int
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
+	// det 是同响应停滞检测器(chains L1,POSTMORTEM-RED-SUN-3.md R4):PostToolUse
+	// 喂入每步 tool_result,判定"信息梯度为零"后经 PreToolUse drain 注入转向指令。
+	// 指针,与 nudges 同理——且有意建在 model_error 重跑循环外(见 runIntent),一条
+	// 意图的触发额度(冷却/上限)跨重跑共享,重跑一轮不清零。nil = 关闭。
+	det *agent.StuckDetector
+	// onStuck 在检测器触发时回调(engine 接线:写 system activity + hint 挂探索图,
+	// 让 planner 感知;并唤起「停滞顾问」把固定纪律升级成具体转向建议)。
+	// ctx 来自 PostToolUse,顾问调用受它约束(可被 kill_work / 暂停取消)。
+	onStuck func(ctx context.Context, ev *agent.StuckEvent)
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -550,6 +577,17 @@ type steerHooks struct {
 // 收场;只有真正发生过一次工具回合，配额才刷新(norma/harness/query.go:534)。所以这个
 // 闸挡的是「工具 → 空转 → 推 → 工具 → 空转」这种病态循环，别让它把意图预算耗光。
 const defaultEmptyTurnNudges = 2
+
+// defaultBudgetRetryLimit 是「预算耗尽且零产出」时自动重开意图的默认次数上限。
+// 1 = 只兜底一次(「1 次就够」)：既不放过被掐死的一棒，又不会无限重开。
+const defaultBudgetRetryLimit = 1
+
+// settingBudgetRetryLimit 是 settings 表里覆盖上面默认值的键(负值=关闭兜底)。
+const settingBudgetRetryLimit = "budget_retry_limit"
+
+// toolInterruptedMarker 是 SDK(norma/harness)在预算/取消打断工具时写入 tool_result
+// 的固定文案；零产出判定据此区分「工具跑完了」与「工具被掐断」。
+const toolInterruptedMarker = "tool execution interrupted"
 
 // emptyTurnNudge 是空转回合注入的续跑指令。
 //
@@ -580,6 +618,13 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 		return true, "【规划者实时纠偏】" + msg +
 			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
 	}
+	// 停滞检测的干预消息排在规划者纠偏之后:都是"先别动手、听完再说",规划者的
+	// 指令优先级更高。消息自带完整上下文(签名/次数/未执行说明),无需再加前缀。
+	if h.det != nil {
+		if msg, ok := h.det.Drain(); ok {
+			return true, msg, nil
+		}
+	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
 	}
@@ -587,6 +632,16 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	// chains L1:每步 tool_result 先喂停滞检测器(纯函数,~0 成本);触发时注入消息
+	// 已由检测器排入 pending(下一次 PreToolUse drain),这里只负责留痕回调。
+	if h.det != nil {
+		if ev := h.det.Observe(name, string(result), isErr); ev != nil {
+			log.Printf("[work %s] 停滞检测触发(%s,连续 %d 次,签名 %s,第 %d 次)", h.label, ev.Kind, ev.Count, ev.Signature, ev.N)
+			if h.onStuck != nil {
+				h.onStuck(ctx, ev)
+			}
+		}
+	}
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
@@ -622,13 +677,20 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 // KillWork cancels the in-flight work running intentID (planner's kill_work tool).
 // The work's agent-core session honors ctx cancellation and aborts promptly.
 func (e *Engine) KillWork(intentID int64) error {
+	return e.KillWorkAs(intentID, agent.AbortKilledByPlanner)
+}
+
+// KillWorkAs is KillWork with an explicit named cause, so the activity trace can
+// tell WHO terminated the work (planner vs main agent — cancelcause.go 的具名取消
+// 规范要求每个取消点都登记原因).
+func (e *Engine) KillWorkAs(intentID int64, cause *agent.AbortCause) error {
 	e.workMu.Lock()
 	run := e.work[intentID]
 	e.workMu.Unlock()
 	if run == nil {
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
-	run.cancel(agent.AbortKilledByPlanner)
+	run.cancel(cause)
 	return nil
 }
 
@@ -845,6 +907,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+				// 收尾闸门(引擎侧兜底):目标虽已全 met,但任务范围内还有未展开的企业声明
+				// 范围(company_scope)时不许落 done——先物化一批,等下一轮心跳继续。
+				// 正常情况下 agent 侧 prove_goal 会拦住「所有目标 met」;这里防的是历史
+				// 数据/其他路径已把目标标 met、范围却没展开完的情况。
+				if taskIDInt, perr := strconv.ParseInt(t.ID, 10, 64); perr == nil && e.scopeGateBlocks(t, taskIDInt) {
+					return
+				}
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
 				// pause/delete/超时收尾的状态转换。
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -876,6 +945,8 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		// 声明范围物化:把 company_scope 展开成本任务的待测资产(纯 DB,不触发 LLM)。
+		e.materializeTaskCompanyScope(t, taskIDInt)
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
 		e.EndLLMCall(t.ID)
@@ -898,10 +969,19 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.touch(t.ID)
 	}
 
+	// P0 意图领取超时巡检:独立于规划心跳(心跳间隔 ≥10min,而 P0 超时是 5min,
+	// 且全部 worker 忙碌时 worker 循环都在 runIntent 里,没人会发现 frontier 里的
+	// P0 积压)。纯 db 读 + 一次性 hint 写入,不触发 LLM 调用。见 intent_watchdog.go。
+	watchdog := time.NewTicker(p0WatchInterval)
+	defer watchdog.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-watchdog.C:
+			e.reportOverdueP0Intents(t)
+			continue // 巡检不是规划触发,不重臂规划心跳
 		case <-t.notify:
 			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
 		case <-heartbeat.C:
@@ -971,6 +1051,53 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	return e.runIntent(ctx, t, name, worker, intent, "", "")
 }
 
+// budgetRetryLimit 解析零产出兜底的重开次数上限，读全局 settings 的
+// budget_retry_limit 键；未配置/非法 → defaultBudgetRetryLimit，负值 → 0(关闭)。
+func (e *Engine) budgetRetryLimit() int {
+	if e == nil || e.m == nil || e.m.pg == nil {
+		return defaultBudgetRetryLimit
+	}
+	v, ok, err := e.m.pg.GetSetting(settingBudgetRetryLimit)
+	if err != nil || !ok {
+		return defaultBudgetRetryLimit
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return defaultBudgetRetryLimit
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// settingStuckAdviser 是「停滞顾问」的开关(默认开)。关掉后退回原来的固定转向纪律,
+// 不再产生额外的顾问调用(省 token);触发判据与注入路径完全不变。
+const settingStuckAdviser = "stuck_adviser_enabled"
+
+// stuckAdviserEnabled 报告是否启用停滞顾问。读全局策略、不跟 profile 走 —— 它是
+// 「卡住时要不要请顾问」的平台级取舍,与当前用哪个模型无关。
+func (e *Engine) stuckAdviserEnabled() bool {
+	if e == nil || e.m == nil || e.m.pg == nil {
+		return true
+	}
+	return e.m.pg.GetBool(settingStuckAdviser, true)
+}
+
+// intentText 取意图正文(payload 的 summary),供停滞顾问理解「这一棒在干什么」。
+func intentText(intent *db.Node) string {
+	if intent == nil || len(intent.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Summary)
+}
+
 // runIntent executes and fully settles one already-claimed (state=running) intent.
 // Both the pool worker loop (via runWorkerStep) and the human-message handler (via
 // runDetachedIntent, a dedicated goroutine outside the worker pool) call it, so the
@@ -983,7 +1110,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
-	emit := func(r db.Activity) { e.emitActivity(t, r) }
+	// okTools 统计本次 run 里「真正跑完」的工具调用数。SDK 因预算/取消打断的工具会
+	// 返回 "tool execution interrupted"(IsError=true)，不计入——它是「这一棒被掐死在
+	// 起跑线」的判据，供下方零产出兜底决定是否自动重开。
+	var okTools atomic.Int64
+	emit := func(r db.Activity) {
+		if r.Kind == "tool_result" && !strings.Contains(r.Summary, toolInterruptedMarker) {
+			okTools.Add(1)
+		}
+		e.emitActivity(t, r)
+	}
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
@@ -1012,6 +1148,59 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
+	}
+	// chains L1 停滞检测器同理:建在重跑循环外,冷却/触发上限按「这条意图」计,
+	// 跨 model_error 重跑共享(见 steerHooks.det 注释)。触发时除注入转向指令外,
+	// 留两道痕供 planner 感知:
+	//  1) system activity —— 进 worker trace,planner 用 get_worker_output 能看到;
+	//  2) hint 节点挂探索图 —— TriggerEvent 没有 system 类事件(manager.go 的
+	//     pendingTriggers 只有 done/finding/goal*/cancelled),而 planner 每轮
+	//     graph overview 必读 hints(agent/tools.go graphOverviewData),这是
+	//     现有结构里检测信号进 planner 视野的既有通道(参照 add_hint 路径)。
+	stuckCfg := agent.DefaultStuckConfig()
+	if db.IsAggressiveOpMode(t.OpMode) {
+		// 激进模式:抬高同质/失败触发阈值、提高每意图触发上限,深挖途中不轻易判定「信息梯度为零」。
+		stuckCfg = agent.AggressiveStuckConfig()
+	}
+	hooks.det = agent.NewStuckDetector(stuckCfg)
+	// chains L3 → L1:停滞触发时附上类别化转向建议(按意图 chain_tags 从对应类
+	// 骨架抽"转向"条目,无匹配则为空、维持通用措辞)。一次性算好,整条意图不变。
+	hooks.det.PivotHint = chainskel.PivotHintsForIntent(intent.Payload, 3)
+	// P0-1「停滞顾问」:触发时除了固定纪律,再唤起一次带全局上下文的顾问调用,
+	// 把「立即停止同轴重试」升级成「具体该换到哪去」。顾问不可用/失败/超时一律
+	// 保留固定纪律(干预绝不丢),判据仍由确定性检测器决定。
+	adviser := agent.NewStuckAdviser(worker.Provider())
+	adviserOn := adviser.Available() && e.stuckAdviserEnabled()
+	hooks.onStuck = func(ctx context.Context, ev *agent.StuckEvent) {
+		taskEmit(db.Activity{Kind: "system", Tool: ev.Tool,
+			Summary: fmt.Sprintf("停滞检测:连续 %d 次同质响应(%s,签名 %s)", ev.Count, ev.Kind, ev.Signature),
+			Detail:  agent.StuckIntervention(*ev)})
+		if t.Store != nil {
+			if _, err := t.Store.AddNode(db.KindHint, map[string]any{"text": fmt.Sprintf(
+				"【停滞检测】意图 #%d 的 worker 连续 %d 次同质/相似失败响应(签名 %s,工具 %s),信息梯度为零,平台已注入转向指令(第 %d 次)。规划时请避开同轴方向(换参数/信道/漏洞类/入口),或确认该方向已榨干再收尾。",
+				iid, ev.Count, ev.Signature, ev.Tool, ev.N)}, 0, "active", "system", nil); err != nil {
+				log.Printf("[work %s] 停滞检测 hint 写图失败: %v", label, err)
+			}
+		}
+		if !adviserOn {
+			return
+		}
+		advice, err := adviser.Advise(ctx, agent.StuckAdviceRequest{
+			Goal:        t.Goal,
+			Intent:      intentText(intent),
+			Stuck:       *ev,
+			PivotHint:   hooks.det.PivotHint,
+			RecentTools: hooks.det.RecentTools(12),
+			PriorFires:  ev.N,
+		})
+		if err != nil || advice == "" {
+			log.Printf("[work %s] 停滞顾问未给出建议(保留固定干预): %v", label, err)
+			return
+		}
+		hooks.det.UpgradeLastPending(advice)
+		taskEmit(db.Activity{Kind: "system", Tool: ev.Tool,
+			Summary: "停滞顾问已给出转向建议",
+			Detail:  agent.AdviserIntervention(advice)})
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
@@ -1143,11 +1332,39 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
+	// 零产出兜底(C)：预算耗尽(exhausted)且这一棒没真正跑成——没有任何工具成功返回，
+	// 或整棒零写回——就自动重开一次，带着原 transcript 换个槽位继续，而不是把这一棒
+	// 直接作废。仅兜底一次(settings.budget_retry_limit，默认 1)，防止无限重开。
+	if state == "exhausted" && (okTools.Load() == 0 || wrote.Total() == 0) {
+		if limit := e.budgetRetryLimit(); limit > 0 {
+			reopened, rerr := t.Store.BumpIntentBudgetRetry(intent.ID, limit)
+			if rerr != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 零产出兜底重开失败: %v", name, t.ID, intent.ID, rerr)
+			} else if reopened {
+				log.Printf("[worker %s] task %s 意图 #%d 预算耗尽且零产出(成功工具 %d，写回 %s) → 自动重开重试",
+					name, t.ID, intent.ID, okTools.Load(), wrote)
+				e.touch(t.ID)
+				return true
+			}
+		}
+	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
+		}
+	}
+	// 派发闸门:意图以 blocked(传输层/模型层失败,即"5xx 类")收尾时,给它的同款
+	// 聚类各记一次失败;连续失败达阈值 → 该簇进入冷却,不再占派发水位。
+	// LLM 配额耗尽属于平台侧问题,不计入目标失败(避免误冷却)。
+	if state == "blocked" && !isTaskLLMChainExhausted(err) {
+		if cfg := dispatch.DefaultConfig(); cfg.EnabledFor(db.IsAggressiveOpMode(t.OpMode)) && cfg.DeadThreshold > 0 {
+			if cooled, cerr := t.Store.BumpClusterDead(db.ClustersFromPayload(intent.Payload), cfg.DeadThreshold, cfg.Cooldown); cerr != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 聚类失败计数出错: %v", name, t.ID, intent.ID, cerr)
+			} else if len(cooled) > 0 {
+				log.Printf("[worker %s] task %s 同款聚类进入冷却(连续失败): %v", name, t.ID, cooled)
+			}
 		}
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
@@ -1234,12 +1451,116 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 	}
 }
 
+// scopeGateMaxRounds 是收尾闸门(引擎侧)在 goalless 分支上连续拦截的轮数上限。
+// 超过即放行收官并告警,避免任务因闸门关不上而永久悬挂。
+const scopeGateMaxRounds = 20
+
+// scopeGateBlocks 是收尾闸门的引擎侧兜底(见 plannerLoop 的 goalless 分支)。
+// 任务范围内仍有未展开的企业声明范围(company_scope)时返回 true:先物化一批,
+// 不落 done,等下一轮心跳继续;连续超过 scopeGateMaxRounds 轮仍关不上则放行收官。
+func (e *Engine) scopeGateBlocks(t *Task, taskID int64) bool {
+	if !db.CompanyMaterializeEnabled() || taskID <= 0 {
+		return false
+	}
+	pending, err := e.m.assets.CountPendingTaskCompanyScope(taskID)
+	if err != nil || pending <= 0 {
+		e.scopeGate.Delete(taskID)
+		return false
+	}
+	n := 0
+	if v, ok := e.scopeGate.Load(taskID); ok {
+		n, _ = v.(int)
+	}
+	n++
+	e.scopeGate.Store(taskID, n)
+	e.materializeTaskCompanyScope(t, taskID)
+	if n > scopeGateMaxRounds {
+		e.scopeGate.Delete(taskID)
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("收尾闸门:仍有 %d 条企业声明范围未展开,已连续 %d 轮无法清零,放行收官(请人工复核范围)", pending, n)})
+		return false
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("收尾闸门:任务范围内仍有 %d 条企业声明范围未展开成待测资产,暂不收官(第 %d 轮)", pending, n)})
+	return true
+}
+
+// claimNext 从 frontier 领取一条可派发意图。领取前先过同款聚类派发闸门
+// (dispatch):同簇并发达上限、或处于冷却期的意图本轮跳过——避免同一套系统被
+// 一口气铺开成几百条意图,也避免持续失败的目标占满派发水位。
+// 激进模式一律不做聚类限流(EnabledFor=false)。
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
 	fr, _ := t.Store.Frontier(20)
+	if len(fr) == 0 {
+		return nil
+	}
+	cfg := dispatch.DefaultConfig()
+	gated := cfg.EnabledFor(db.IsAggressiveOpMode(t.OpMode))
+	var cooldowns map[string]time.Time
+	var running map[string]int
+	if gated {
+		cooldowns, _ = t.Store.ClusterCooldowns()
+		running, _ = t.Store.ClusterRunningCounts()
+	}
+	now := time.Now()
 	for _, in := range fr {
+		if gated {
+			if v := dispatch.Evaluate(db.ClustersFromPayload(in.Payload), cooldowns, running, cfg, now); v.Skip {
+				log.Printf("[worker %s] task %s 意图 #%d 被派发闸门跳过: %s", name, t.ID, in.ID, v.Reason)
+				continue
+			}
+		}
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
 			return in
 		}
 	}
 	return nil
+}
+
+// companyMaterializeEnabled 控制「声明范围物化」开关(默认开;ARTEX_COMPANY_MATERIALIZE=0 关闭)。
+func companyMaterializeEnabled() bool { return db.CompanyMaterializeEnabled() }
+
+// companyMaterializeBatch 是每轮规划前单家企业最多展开的规则条数。
+func companyMaterializeBatch() int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("ARTEX_COMPANY_MATERIALIZE_BATCH"))); err == nil && n > 0 {
+		return n
+	}
+	return db.DefaultCompanyMaterializeBatch
+}
+
+// materializeTaskCompanyScope 在每轮规划前把任务范围内企业声明的资产范围按批
+// 展开成本任务的待测资产(见 db/company_materialize.go)。声明范围不再只是「归属
+// 认领」——它真正进入待测漏斗,覆盖度分母随之变大,planner 也就不能凭几个碰巧
+// 被发现的资产判 100% 收官。纯 DB 操作,不触发 LLM 调用。
+func (e *Engine) materializeTaskCompanyScope(t *Task, taskID int64) {
+	if !companyMaterializeEnabled() {
+		return
+	}
+	res, err := e.m.assets.MaterializeTaskCompanyScopes(taskID, companyMaterializeBatch())
+	if err != nil {
+		log.Printf("[planner] task %s 声明范围物化失败: %v", t.ID, err)
+		return
+	}
+	total, blocked := 0, 0
+	var parts []string
+	for _, r := range res {
+		if r.Rules == 0 && r.Blocked == 0 {
+			continue
+		}
+		total += r.Rules
+		blocked += r.Blocked
+		name := r.Company
+		if name == "" {
+			name = fmt.Sprintf("#%d", r.CompanyID)
+		}
+		parts = append(parts, fmt.Sprintf("%s +%d", name, r.Rules))
+	}
+	if total == 0 && blocked == 0 {
+		return
+	}
+	summary := fmt.Sprintf("企业声明范围物化:本批新增/并入 %d 条待测资产(%s)", total, strings.Join(parts, "、"))
+	if blocked > 0 {
+		summary += fmt.Sprintf(";%d 条被拦截规则挡下未物化", blocked)
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: summary})
 }

@@ -21,10 +21,6 @@ func TestMgmtAPI(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
-	tok, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var r *http.Request
@@ -34,7 +30,7 @@ func TestMgmtAPI(t *testing.T) {
 		} else {
 			r = httptest.NewRequest(method, path, nil)
 		}
-		r.Header.Set("Authorization", "Bearer "+tok)
+		baAuth(s, r)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
 		var out map[string]any

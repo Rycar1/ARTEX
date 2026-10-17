@@ -53,14 +53,10 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 	}
 
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 	fetchDetail := func(stepID int64) string {
 		req := httptest.NewRequest(http.MethodGet,
 			fmt.Sprintf("/api/exploration/activity/%d?task=%s", stepID, current.ID), nil)
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		rec := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {

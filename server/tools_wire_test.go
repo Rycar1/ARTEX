@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -34,10 +35,8 @@ func TestWireTools(t *testing.T) {
 
 	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
 	t.Cleanup(func() { agent.ToolResolve = nil })
-	// Prevent interactive-shell Bash decoration: if the worker agent has
-	// interactive_shell=true in the DB, ToolResolve would append a note to
-	// Bash's description. Disable that for this test so the undecorated
-	// pass-through assertion holds regardless of DB state.
+	// 关掉交互式 shell 注入(norma 的 InteractiveShellDisabled 读这个变量),否则
+	// worker 的 Bash 描述会再叠加一段"交互程序改用 shell_open"的说明。
 	t.Setenv("AGENT_CORE_DISABLE_INTERACTIVE_SHELL", "1")
 
 	// Seeding populated the catalog.
@@ -56,13 +55,19 @@ func TestWireTools(t *testing.T) {
 	if _, ok := worker["record_fact"]; !ok {
 		t.Error("worker lost record_fact")
 	}
-	// SDK generic tools aren't seeded → ToolResolve passes them through unchanged
-	// (same object, original description — not decorated). No startup prune touches
-	// non-catalog rows, so future user-defined custom tools survive too.
+	// SDK generic tools aren't seeded → ToolResolve 不改它们的绑定关系;但 worker 的
+	// Bash 描述会被**有意**追加 UA 纪律(bashUANote,批 5 B4 的反蜜罐纪律),这是设计
+	// 行为,不是"装饰泄漏"。所以这里断言:前缀仍是 SDK 原始描述、且以 UA 纪律结尾。
 	if bash, ok := worker["Bash"]; !ok {
 		t.Error("worker lost Bash (should pass through)")
-	} else if bash.Description() != actool.NewBash().Description() {
-		t.Error("Bash should pass through undecorated, but description changed")
+	} else {
+		desc := bash.Description()
+		if !strings.HasPrefix(desc, actool.NewBash().Description()) {
+			t.Errorf("worker Bash 描述应保留 SDK 原文前缀,got %q", desc)
+		}
+		if !strings.HasSuffix(desc, bashUANote) {
+			t.Errorf("worker Bash 描述应以 UA 纪律结尾,got %q", desc)
+		}
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
 	planner := names(agent.ToolResolve(ctx, "planner", base))

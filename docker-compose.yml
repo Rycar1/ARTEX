@@ -15,13 +15,19 @@ services:
     restart: unless-stopped
 
   artex:
-    # 镜像源由本仓库自维护（原 autumn27/artex 已从 Docker Hub 删除）。
-    # 正常部署直接拉取本镜像；拉取失败（或想改代码）时本地构建：
-    #   docker compose build
-    image: mianhuatang11/artex:${ARTEX_TAG:-latest}
+    # 从源码构建二开版镜像(Dockerfile.source 自包含构建:前端+Go+工具层)。
+    # 不要用 autumn27/artex 官方镜像——那是上游原版,不含二开代码。
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.source
+      args:
+        # 国内构建建议在 .env 里给镜像源；默认官方源。CTF_EXTRA=1 追加 radare2/upx/angr。
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_MIRROR: ${PIP_MIRROR:-}
+        GEM_SOURCE: ${GEM_SOURCE:-}
+        CTF_EXTRA: ${CTF_EXTRA:-0}
+        GH_PROXY: ${GH_PROXY:-}
+    image: artex-ymh:local
     depends_on:
       postgres:
         condition: service_healthy

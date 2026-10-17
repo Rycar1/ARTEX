@@ -22,10 +22,6 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	defer m.Close()
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var data []byte
@@ -33,7 +29,7 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 			data, _ = json.Marshal(body)
 		}
 		req := httptest.NewRequest(method, path, bytes.NewReader(data))
-		req.Header.Set("Authorization", "Bearer "+token)
+		baAuth(s, req)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		var out map[string]any
@@ -96,14 +92,10 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = m.pg.DeleteConversation(conversation.ID) })
-	token, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	body, _ := json.Marshal(map[string]any{"title": "  pinned title  ", "pinned": true})
 	req := httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -123,7 +115,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("会", maxConversationTitleRunes+1)})
 	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -132,7 +124,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 
 	body, _ = json.Marshal(map[string]any{"title": strings.Repeat("x", maxConversationRequestBytes+1)})
 	req = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/conversations/%d", conversation.ID), bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -143,7 +135,7 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		"agent_key": "mainagent", "title": strings.Repeat("会", maxConversationTitleRunes+1),
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -154,10 +146,57 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 		"agent_key": "mainagent", "title": strings.Repeat("x", maxConversationRequestBytes+1),
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/conversations", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
+	baAuth(s, req)
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized conversation create status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBuiltinTaskTemplateProtectedOverHTTP(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	h := s.Handler()
+	do := func(method, path string, body any) (int, map[string]any) {
+		var data []byte
+		if body != nil {
+			data, _ = json.Marshal(body)
+		}
+		req := httptest.NewRequest(method, path, bytes.NewReader(data))
+		baAuth(s, req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+
+	templates, err := m.pg.ListTaskTemplates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builtin *db.TaskTemplate
+	for _, tpl := range templates {
+		if tpl.Builtin {
+			builtin = tpl
+			break
+		}
+	}
+	if builtin == nil {
+		t.Fatal("no built-in task template found")
+	}
+
+	code, _ := do(http.MethodDelete, fmt.Sprintf("/api/task-templates/%d", builtin.ID), nil)
+	if code != http.StatusConflict {
+		t.Fatalf("delete builtin status=%d, want %d", code, http.StatusConflict)
+	}
+	code, _ = do(http.MethodPatch, fmt.Sprintf("/api/task-templates/%d", builtin.ID), map[string]any{"name": "renamed-builtin"})
+	if code != http.StatusConflict {
+		t.Fatalf("rename builtin status=%d, want %d", code, http.StatusConflict)
 	}
 }

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { CompassIcon, CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -43,6 +43,9 @@ export default function SystemSettingsPage() {
   const [injectWorker, setInjectWorker] = React.useState(true);
   // 实验功能:noa 上下文压缩(默认关)。
   const [noaCompaction, setNoaCompaction] = React.useState(false);
+  const [stuckAdviser, setStuckAdviser] = React.useState(true);
+  // 无人值守(默认关):judge ask 强制二次裁决,不进人工审批队列。
+  const [interceptUnattended, setInterceptUnattended] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
   const sendMode = useChatSendMode();
 
@@ -60,6 +63,8 @@ export default function SystemSettingsPage() {
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
+    setStuckAdviser(s.stuck_adviser_enabled !== false); // 默认开
+    setInterceptUnattended(!!s.intercept_unattended); // 默认关
   }, []);
 
   const saveWorkers = () => {
@@ -159,6 +164,38 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => {
         setNoaCompaction(!v); // revert on failure
+        toast.error(`保存失败：${(e as Error).message}`);
+      });
+  };
+
+  // 「停滞顾问」开关:worker 被判信息梯度为零时,除固定转向纪律外再唤起一次带全局
+  // 上下文的顾问调用,把「停止同轴重试」升级成「具体该换到哪去」。切换即时生效。
+  const toggleStuckAdviser = (v: boolean) => {
+    setStuckAdviser(v); // optimistic
+    api
+      .setSettings({ stuck_adviser_enabled: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启停滞顾问（卡住时给出具体转向建议）" : "已关闭停滞顾问（退回固定转向纪律，省 token）");
+      })
+      .catch((e) => {
+        setStuckAdviser(!v); // revert on failure
+        toast.error(`保存失败：${(e as Error).message}`);
+      });
+  };
+
+  // 「无人值守」开关:judge 给出 ask 时强制二次裁决(allow/deny 二选一,无法判断安全
+  // 则 deny),不再进入人工审批队列。全局开关,任务级开关被它短路。切换即时生效。
+  const toggleInterceptUnattended = (v: boolean) => {
+    setInterceptUnattended(v); // optimistic
+    api
+      .setSettings({ intercept_unattended: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启无人值守（judge 需人审的命令自动强制二选一，不再等人）" : "已关闭无人值守（judge 需人审的命令重新等待人工审批）");
+      })
+      .catch((e) => {
+        setInterceptUnattended(!v); // revert on failure
         toast.error(`保存失败：${(e as Error).message}`);
       });
   };
@@ -428,6 +465,62 @@ export default function SystemSettingsPage() {
               checked={noaCompaction}
               disabled={!loaded}
               onCheckedChange={toggleNoaCompaction}
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <CompassIcon className="size-4" />
+              停滞顾问
+            </CardTitle>
+            <CardDescription>
+              worker 在同一方向上连续多次拿到同质响应（信息梯度为零）时，除注入固定转向纪律外，
+              再唤起一次带<b>全局上下文</b>的顾问调用（任务目标 / 当前意图 / 卡住形态与签名 / 最近试过的工具 /
+              平台按意图类别预给的转向建议），产出「该换到哪个维度、为什么、下一步具体做什么」的定向指令，
+              替换掉原来那句泛泛的「立即停止同轴重试」。顾问不可用或调用失败时自动保留固定纪律，干预不会丢。
+              每次触发一次额外模型调用（每条意图默认最多 3 次），关闭后只省 token，判据与注入路径不变。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="stuck-adviser" className="text-sm font-normal text-muted-foreground">
+              停滞顾问{stuckAdviser ? " · 已开启" : " · 已关闭"}
+            </Label>
+            <Switch
+              id="stuck-adviser"
+              checked={stuckAdviser}
+              disabled={!loaded}
+              onCheckedChange={toggleStuckAdviser}
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldAlertIcon className="size-4" />
+              无人值守（拦截审批）
+            </CardTitle>
+            <CardDescription>
+              开启后，judge 判定「需要人工审批（ask）」的命令将<b>自动发起第二次强制裁决</b>：
+              禁止 ask，在 <b>allow / deny</b> 中二选一，无法判断安全则一律 <b>deny</b>，
+              <b>不再进入人工审批队列</b>。适合夜间长跑、无人盯屏的任务，消除「等审批超时」的空转。
+              每次裁决会在审计里标注「无人值守强制裁决」，可事后追查。
+              <br />
+              <b>不受影响的硬边界</b>：RoE 范围强制（越权目标仍需人审）、用户自建的审批规则、编码无法解码的兜底转人工。
+              关闭时恢复现状（ask 等人，超时按超时策略处理）。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="intercept-unattended" className="text-sm font-normal text-muted-foreground">
+              无人值守{interceptUnattended ? " · 已开启（ask 自动强制二选一）" : " · 已关闭（ask 等待人工）"}
+            </Label>
+            <Switch
+              id="intercept-unattended"
+              checked={interceptUnattended}
+              disabled={!loaded}
+              onCheckedChange={toggleInterceptUnattended}
             />
           </CardContent>
         </Card>

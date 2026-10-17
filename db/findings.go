@@ -20,20 +20,42 @@ type DBFinding struct {
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
-	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
-	CreatedAt       time.Time
-	TaskDescription string // populated via LEFT JOIN on tasks
+	ID        int64
+	TaskID    *int64
+	NodeID    *int64
+	VulnClass string
+	Name      string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity  string
+	Summary   string
+	Evidence  string
+	Worker    string
+	AssetIDs  []int64
+	Status    string
+	Report    string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	// AI 二次审核结论(见 server/finding_review.go)。ReviewVerdict 取值 ''/accepted/ignored。
+	ReviewVerdict  string
+	ReviewSeverity string
+	ReviewScore    *float64
+	ReviewReasons  string
+	ReviewNotes    string
+	ReviewedAt     *time.Time
+	// SelfCheck 是 worker 提交前的结构化自检(原样保存的 JSON;空 = 未填)。
+	// 挖掘期闸门据此拒收,二次审核据此一票否决/核对。见 agent/finding_selfcheck.go。
+	SelfCheck json.RawMessage
+	// 危害升级(见 server/finding_escalate.go)。EscalatedAt 非空 = 已派过升级意图
+	// (每个漏洞最多一轮);EscalateStatus 取值见 Escalate* 常量;BaseSeverity 是升级
+	// 前的严重度,升级不成立时回退用。
+	EscalatedAt    *time.Time
+	EscalateStatus string
+	BaseSeverity   string
+	// 去重(四层方案,见 db/finding_dedup.go / db/finding_merge.go):
+	DedupKey          string   // 结构化合并键(归一化类别 + 主资产/弱锚)
+	Fingerprint       string   // 归一化正文 SHA-1
+	MergedInto        *int64   // 本行已被合并到哪条 finding(被合并时非空)
+	SuspectedDupOf    *int64   // 疑似与哪条 finding 重复(未自动合并时)
+	SuspectedDupScore *float64 // 疑似重复的相似度(0~1)
+	CreatedAt         time.Time
+	TaskDescription   string // populated via LEFT JOIN on tasks
 }
 
 // Finding triage states (findings.status).
@@ -91,11 +113,16 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 	if nodeID > 0 {
 		nid = &nodeID
 	}
+	// 记录结构化合并键与文本指纹:本函数刻意不做合并(保持裸插入语义,测试与
+	// 旁路调用依赖它一次调用一行),但落下的键让后续 report_finding 能命中并
+	// 合并进来,也让相似度扫描能把它当候选。
+	key := FindingDedupKey(vulnclass, assetIDs, FindingComparableText(vulnclass, name, summary, evidence))
+	fp := FindingFingerprint(vulnclass, name, summary, evidence)
 	var id int64
 	err := d.QueryRow(
-		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON),
+		`INSERT INTO findings (task_id, node_id, vulnclass, name, severity, summary, evidence, worker, asset_ids, dedup_key, fingerprint)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+		tid, nid, vulnclass, name, severity, summary, evidence, worker, string(aidsJSON), key, fp,
 	).Scan(&id)
 	return id, err
 }
@@ -105,7 +132,12 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+ (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
+	       COALESCE(f.review_verdict,''), COALESCE(f.review_severity,''), f.review_score,
+	       COALESCE(f.review_reasons,''), COALESCE(f.review_notes,''), f.reviewed_at,
+	       COALESCE(f.dedup_key,''), COALESCE(f.fingerprint,''), f.merged_into,
+	       f.suspected_dup_of, f.suspected_dup_score, COALESCE(f.self_check, '{}'::jsonb),
+	       f.escalated_at, COALESCE(f.escalate_status,''), COALESCE(f.base_severity,'')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -118,7 +150,9 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore, &f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -159,6 +193,9 @@ type FindingFilter struct {
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
+	// Review 是「二次审核」结论筛选:空=不过滤;pending=开了审核但还没审;
+	// accepted/ignored=按审核结论过滤。只在二次审核页用,与其它筛选正交。
+	Review string
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
 	assetIDs  []int64 // 子树里所有资产 id
@@ -212,6 +249,15 @@ func (f FindingFilter) where() (string, []any) {
 	case len(f.assetIDs) > 0:
 		args = append(args, assetIDContainments(f.assetIDs))
 		conds = append(conds, fmt.Sprintf("f.asset_ids @> ANY($%d::jsonb[])", len(args)))
+	}
+	// 二次审核结论筛选(见 finding_reviews.go 的 ReviewVerdict* 常量)。
+	switch f.Review {
+	case "pending":
+		// 与 ReviewStats.Pending 口径一致:只算「开了二次审核但尚未出结论」的漏洞。
+		conds = append(conds, "COALESCE(f.review_verdict,'') = '' AND COALESCE(t.review_enabled,false)")
+	case "accepted", "ignored", "deepen":
+		args = append(args, f.Review)
+		conds = append(conds, fmt.Sprintf("f.review_verdict = $%d", len(args)))
 	}
 	if query := strings.TrimSpace(f.Query); query != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
@@ -372,6 +418,12 @@ var ErrFindingOriginUnavailable = errors.New("finding origin is no longer availa
 // The returned activity is the committed row and can be broadcast as-is without
 // calling AppendActivity again.
 func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int64, description string, audit Activity) (int64, Activity, error) {
+	return s.AddFindingFollowUpIntentEx(findingID, findingNodeID, description, nil, audit)
+}
+
+// AddFindingFollowUpIntentEx 同 AddFindingFollowUpIntent,但允许往意图 payload 里追加
+// 字段 —— 用于标记这条意图的性质(如 {"escalate":true} 表示「扩大危害」任务)。
+func (s *ExplorationStore) AddFindingFollowUpIntentEx(findingID, findingNodeID int64, description string, extra map[string]any, audit Activity) (int64, Activity, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, Activity{}, err
@@ -420,6 +472,11 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
+	}
+	// extra 让调用方标记这条意图的性质(如 {"escalate":true} 表示「扩大危害」),
+	// worker 侧据此挂载升级手册与 report_escalation 工具。
+	for k, v := range extra {
+		payload[k] = v
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -511,7 +568,10 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+			&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
+			&f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -639,7 +699,10 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+		&f.ReviewVerdict, &f.ReviewSeverity, &f.ReviewScore, &f.ReviewReasons, &f.ReviewNotes, &f.ReviewedAt,
+		&f.DedupKey, &f.Fingerprint, &f.MergedInto, &f.SuspectedDupOf, &f.SuspectedDupScore,
+		&f.SelfCheck, &f.EscalatedAt, &f.EscalateStatus, &f.BaseSeverity, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -700,6 +763,24 @@ func (d *DB) SetFindingStatus(id int64, status string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// FindingStatusByNodeID returns the triage status of the standalone finding row
+// behind an exploration node ("" when the node has no row — synthetic/legacy
+// nodes). C4: planner 语义按它区分待验证(pending)与已确认(confirmed)漏洞。
+func (d *DB) FindingStatusByNodeID(nodeID int64) (string, error) {
+	var status string
+	err := d.QueryRow(`SELECT COALESCE(status,'pending') FROM findings WHERE node_id=$1`, nodeID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return status, err
+}
+
+// FindingStatusByNodeID lets callers holding only an AssetStore (e.g. the agent
+// ToolSet) reach the triage status without a raw *DB.
+func (a *AssetStore) FindingStatusByNodeID(nodeID int64) (string, error) {
+	return a.db.FindingStatusByNodeID(nodeID)
 }
 
 // SetFindingReportByNodeID sets the Markdown report on the standalone finding row

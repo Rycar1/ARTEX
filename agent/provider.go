@@ -10,6 +10,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -74,6 +75,13 @@ type Config struct {
 	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
 	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
 	SessionHeaderKey string
+	// SessionBodyField,非空时,在每次 LLM 请求的 JSON 体里注入一个该名字的字段,
+	// 值=【当前会话的 session id】(与 SessionHeaderKey 取同一个值)。用于「请求体
+	// 里没有 conversation id 就直接 400」的网关:实测某中转按请求长度把一部分请求
+	// 路由到严格通道,返回 upstream 400 code 11-128 "conversation id missing",
+	// 而加上 body.conversation_id 后同样的请求 100% 成功(200)。
+	// 空 = 不注入(默认,旧配置行为不变)。
+	SessionBodyField string
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
@@ -254,7 +262,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.SessionBodyField)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +288,14 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	prov, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	// 整体墙钟(ARTEX_LLM_CALL_TIMEOUT):单次调用的最上层保险,防连接半开挂死冻住
+	// worker/planner。包在这里(组装处),recorder/pool 都在它之外,归一化错误可被
+	// llm_usage 记录并触发 llmpool 故障转移。0 = 不限,原样返回。
+	return wrapCallTimeout(prov, c), nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,
@@ -333,6 +348,10 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// sessionBodyField, when non-empty, is the JSON body field each request
+	// carries; its value is the same session id. Some gateways reject a body
+	// without a conversation id. Empty disables it. See Config.SessionBodyField.
+	sessionBodyField string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -343,6 +362,18 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if t.sessionHeaderKey != "" {
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
+		}
+	}
+	// Custom session-id body field: same value, carried in the JSON body instead
+	// of (or in addition to) a header. Some gateways answer a body without a
+	// conversation id with "conversation id missing" — but only for a
+	// length-dependent subset of requests, which makes it look like a random
+	// upstream failure. Injecting the field makes every request succeed.
+	if t.sessionBodyField != "" {
+		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
+			if err := injectSessionBodyField(req, t.sessionBodyField, sid); err != nil {
+				log.Printf("[llm] 注入会话体字段 %q 失败(按原请求发送): %v", t.sessionBodyField, err)
+			}
 		}
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
@@ -397,7 +428,49 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+// injectSessionBodyField adds {field: sid} to a JSON request body in place,
+// leaving every other field untouched. No-op when the body is not a JSON object
+// or already carries a non-empty value for that field (a caller that sets it
+// itself keeps control). The body is rebuilt from the snapshot — norma sends
+// every request from a *bytes.Reader, so GetBody is set — which also keeps the
+// recorder's capture identical to what actually goes on the wire.
+func injectSessionBodyField(req *http.Request, field, sid string) error {
+	field = strings.TrimSpace(field)
+	if field == "" || strings.TrimSpace(sid) == "" {
+		return nil
+	}
+	raw := requestBodySnapshot(req)
+	if raw == "" {
+		return fmt.Errorf("请求体不可读")
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return fmt.Errorf("请求体不是 JSON 对象: %w", err)
+	}
+	if cur, ok := obj[field]; ok {
+		var s string
+		if json.Unmarshal(cur, &s) == nil && strings.TrimSpace(s) != "" {
+			return nil
+		}
+	}
+	val, err := json.Marshal(sid)
+	if err != nil {
+		return err
+	}
+	obj[field] = val
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	req.Body = io.NopCloser(bytes.NewReader(out))
+	req.ContentLength = int64(len(out))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(out)), nil
+	}
+	return nil
+}
+
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, sessionBodyField string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -416,7 +489,11 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{
+		base:             transport,
+		sessionHeaderKey: strings.TrimSpace(sessionHeaderKey),
+		sessionBodyField: strings.TrimSpace(sessionBodyField),
+	}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a

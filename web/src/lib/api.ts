@@ -17,6 +17,7 @@ import type {
   AssetInterceptRule,
   AssetInterceptRuleInput,
   Audit,
+  AutoAllowState,
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
@@ -28,6 +29,7 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  Credential,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -38,6 +40,7 @@ import type {
   Finding,
   FindingAssetTree,
   FindingDeepenResponse,
+  FindingDuplicatesPage,
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
@@ -52,8 +55,11 @@ import type {
   InterceptDetail,
   InterceptPending,
   InterceptRule,
+  IntranetTopology,
   JudgeConfig,
   JudgeUsage,
+  InterceptModeState,
+  InterceptRuleMode,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -62,6 +68,7 @@ import type {
   LLMRetryPolicy,
   LLMTask,
   MCPServer,
+  MergeFindingsResult,
   MCPTool,
   MissingSkill,
   ModelTokenStat,
@@ -69,11 +76,18 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  PendingScopeRow,
   PromptVar,
   PromptVersion,
+  ReviewResult,
+  ReviewStats,
+  SessionExecResult,
+  SessionFsEntry,
+  SessionReadResult,
   SessionTokenUsage,
   Settings,
   Severity,
+  ShellSession,
   SkillCall,
   SkillItem,
   SSProject,
@@ -100,34 +114,30 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  TunnelInfo,
   UpdateCheck,
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
 
-function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("artex_token");
-}
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
+  return httpInner<T>(path, init, false);
+}
+
+async function httpInner<T>(path: string, init: RequestInit | undefined, retried: boolean): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
-  const token = getToken();
   const r = await fetch(`/api${path}`, {
     ...init,
     headers: {
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init?.headers as Record<string, string> | undefined),
+            ...(init?.headers as Record<string, string> | undefined),
     },
   });
+    // Basic Auth mode: 401 means the server rejected credentials. The browser
+  // handles re-authentication natively, so we just surface the error.
   if (r.status === 401) {
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
-      window.location.href = "/login";
-    }
     throw new Error("未授权");
   }
   if (!r.ok) {
@@ -162,7 +172,10 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// 凭据(F6):先 POST /api/sse-ticket(走 /api 代理,带 Authorization 头)换 60s
+// 一次性 ticket 再拼 ?ticket=——access token 不再出现在 URL/访问日志里。ticket
+// 用后即焚,所以 EventSource 自带的自动重连会在第二次握手时 401;调用点必须在
+// 连接彻底关闭(readyState === CLOSED)后重新走一遍本函数换票重连。
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX 渗透测试报告 — Acme Corp
@@ -186,15 +199,15 @@ function mockReport(_task?: string): string {
 > （demo）本报告由 mock 数据生成，仅用于界面演示。`;
 }
 
-export function sseUrl(path: string): string {
+export async function sseUrl(path: string): Promise<string> {
   const base =
     process.env.NEXT_PUBLIC_SSE_BASE ??
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
-  const token = getToken();
+  const { ticket } = await post<{ ticket: string }>("/sse-ticket");
   const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  return `${base}${path}${sep}ticket=${encodeURIComponent(ticket)}`;
 }
 
 const get = <T>(p: string) => http<T>(p);
@@ -210,6 +223,8 @@ const del = <T>(p: string, body?: unknown) =>
 // Go serializes nil slices as JSON null — coerce to [].
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
+// 内网作战页四个列表的 ?task_id= 过滤参数(空 = 全局视图)。
+const taskQuery = (taskId?: string) => (taskId ? `?task_id=${encodeURIComponent(taskId)}` : "");
 
 // findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
 // 资产树 / 导出共用同一份,新增筛选项只改这里(后端也只解析这一份)。
@@ -222,6 +237,7 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.review && q.review !== "all") p.set("review", q.review);
   return p;
 }
 
@@ -242,6 +258,9 @@ export const api = {
   initPassword: (password: string) => post<{ token: string }>("/auth/init", { password }),
   changePassword: (oldPassword: string, newPassword: string) =>
     post<{ ok: boolean }>("/auth/change-password", { old_password: oldPassword, new_password: newPassword }),
+  // 登出:吊销服务端 refresh token 并清 HttpOnly cookie;失败(如已过期)也照常
+  // 清本地登录态,由调用方兜底。
+  logout: () => post<{ ok: boolean }>("/auth/logout"),
 
   // ---- tasks ----
   tasks: () =>
@@ -259,6 +278,10 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    reviewEnabled?: boolean;
+    reviewSrcType?: string;
+    opMode?: string;
+    unattended?: boolean; // 无人值守:judge ask 强制二次裁决,不进人工审批队列(默认关)
     interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
@@ -273,10 +296,15 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      review_enabled: input.reviewEnabled ?? false, // 默认关;true=新漏洞自动进入 AI 二次审核
+      review_src_type: input.reviewSrcType ?? "edusrc", // 审核标准:edusrc(默认) | enterprise
+      op_mode: input.opMode ?? "standard", // 作战模式:standard(默认) | aggressive(激进,红色警示)
+      unattended: input.unattended ?? false, // 无人值守;全局开关(intercept_unattended)开启时被短路
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  updateTask: (id: string, input: { name?: string; pinned?: boolean; unattended?: boolean }) => patch<Task>(`/tasks/${id}`, input),
+  setTaskUnattended: (id: string, unattended: boolean) => patch<Task>(`/tasks/${id}`, { unattended }),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
   createTaskCategory: (name: string) => post<TaskCategory>("/task-categories", { name }),
@@ -442,10 +470,9 @@ export const api = {
     if (MOCK) return { uploaded: files.length };
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
-    const token = getToken();
     const r = await fetch(`/api/workspace/upload?path=${encodeURIComponent(dir)}`, {
       method: "POST",
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      headers: {},
       body: fd,
     });
     if (!r.ok) throw new Error(`上传失败: ${r.status}`);
@@ -456,9 +483,8 @@ export const api = {
     if (MOCK) {
       blob = new Blob([`（demo）${path} 的下载内容示例。`], { type: "text/plain" });
     } else {
-      const token = getToken();
       const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
-        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {},
       });
       if (!r.ok) throw new Error(`下载失败: ${r.status}`);
       blob = await r.blob();
@@ -556,6 +582,12 @@ export const api = {
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
   findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+  // ---- AI 二次审核 ----
+  // reviewStats 取二次审核页顶部计数(整表)。
+  reviewStats: () => get<ReviewStats>("/exploration/reviews/stats"),
+  // reviewFinding 手动重审一条漏洞(无视任务开关),同步返回审核结论。
+  reviewFinding: (id: string) =>
+    post<ReviewResult>(`/exploration/findings/${encodeURIComponent(id)}/review`, {}),
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {
@@ -570,9 +602,8 @@ export const api = {
     } else if (opts.scope === "filtered" && opts.filters) {
       for (const [k, v] of findingFilterParams(opts.filters)) p.set(k, v);
     }
-    const token = getToken();
     const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: {},
     });
     if (!r.ok) throw new Error(`export: ${r.status}`);
     const blob = await r.blob();
@@ -643,10 +674,9 @@ export const api = {
     side: "request" | "response",
     contextTask?: string,
   ) => {
-    const token = getToken();
     const response = await fetch(
       `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      { headers: {} },
     );
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: "下载失败" }));
@@ -671,6 +701,21 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  // ---- 四层去重:人工合并 / 疑似重复(见 server/finding_dedup.go)----
+  // mergeFindings 把勾选的 source 合并进 target(目标吸收严重度/证据,source 置 duplicate)。
+  mergeFindings: (sourceIds: string[], targetId: string) =>
+    post<MergeFindingsResult>("/exploration/findings/merge", { source_ids: sourceIds, target_id: targetId }),
+  // findingsDuplicates 取「疑似重复 / 已合并」分组(taskId 为空=全部任务)。
+  findingsDuplicates: (taskId?: string, limit = 200) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (taskId) p.set("task_id", taskId);
+    return get<FindingDuplicatesPage>(`/exploration/findings/duplicates?${p.toString()}`).then((r) =>
+      arr(r.items),
+    );
+  },
+  // dismissFindingDuplicate 人工判定「不是重复」:清掉疑似重复标记。
+  dismissFindingDuplicate: (id: string) =>
+    post<{ ok: boolean; id: number }>(`/exploration/findings/${encodeURIComponent(id)}/dismiss-duplicate`, {}),
   findingRetests: (id: string) =>
     get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
       arr(r.retests),
@@ -683,6 +728,10 @@ export const api = {
     }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),
+  // 人工发起「扩大危害」:在已确认据点上纵向升级(与审核自动派单同一套回路,
+  // 每个漏洞最多一轮)。notes 可选,用于指定优先尝试的升级方向。
+  escalateFinding: (id: string, notes: string) =>
+    post<FindingDeepenResponse>(`/exploration/findings/${id}/escalate`, { notes }),
   intents: (task?: string) => get<TaskNode[]>(`/exploration/intents${tq(task)}`).then(arr),
   tokenStats: (task?: string) =>
     get<{ workers: TokenUsage[]; sessions: SessionTokenUsage[]; total: TokenTotal }>(
@@ -865,9 +914,8 @@ export const api = {
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
-    const token = getToken();
     const r = await fetch(`/api/report${tq(task)}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: {},
     });
     if (!r.ok) throw new Error(`report: ${r.status}`);
     return r.text();
@@ -893,10 +941,9 @@ export const api = {
       };
     const fd = new FormData();
     for (const f of files) fd.append("file", f);
-    const token = getToken();
     const r = await fetch(`/api/chat/upload?scope=${scope}&id=${encodeURIComponent(id)}`, {
       method: "POST",
-      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      headers: {},
       body: fd,
     });
     if (!r.ok) throw new Error(`上传失败: ${r.status} ${await r.text()}`);
@@ -941,6 +988,7 @@ export const api = {
     profile_id?: number,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
+    session_body_field = "", // 非空=测试请求体里也注入该字段（值为一次性 session id）
   ) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -954,6 +1002,7 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      session_body_field,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -975,6 +1024,7 @@ export const api = {
     max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
+    session_body_field?: string; // 非空=每次请求体注入该字段，值=当前会话 session id；""=不注入
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
@@ -1153,11 +1203,10 @@ export const api = {
     if (MOCK) return { name: file.name.replace(/\.zip$/i, ""), files: 1 };
     const fd = new FormData();
     fd.append("file", file);
-    const token = getToken();
     const r = await fetch(`/api/skills/upload${overwrite ? "?overwrite=true" : ""}`, {
       method: "POST",
       body: fd,
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: {},
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body?.error || `上传失败(${r.status})`);
@@ -1242,22 +1291,19 @@ export const api = {
   // ---- intercept tool-config (全局工具拦截范围) ----
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
     if (MOCK) return { enabled_tools: ["bash"] };
-    const token = getToken();
     const r = await fetch("/api/intercept/tool-config", {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: {},
     });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
   interceptSetToolConfig: async (enabledTools: string[]): Promise<void> => {
     if (MOCK) return;
-    const token = getToken();
     const r = await fetch("/api/intercept/tool-config", {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+              },
       body: JSON.stringify({ enabled_tools: enabledTools }),
     });
     if (!r.ok) throw new Error(await r.text());
@@ -1267,6 +1313,26 @@ export const api = {
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
   interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
+
+  // ---- intercept review mode (拦截判定链:规则优先 / 纯模型审核) ----
+  interceptGetMode: () => get<InterceptModeState>("/intercept/mode"),
+  interceptSetMode: (mode: InterceptRuleMode) => put<{ ok: boolean; mode: InterceptRuleMode }>("/intercept/mode", { mode }),
+
+  // ---- guard auto-allow (一键放行,带时限的 ask 自动批准) ----
+  getAutoAllow: () => get<AutoAllowState>("/guard/auto-allow"),
+  setAutoAllow: (enabled: boolean, hours: number) =>
+    put<AutoAllowState>("/guard/auto-allow", { enabled, hours }),
+
+  // ---- 待授权网段(引擎在授权边界外探测到的网段,待人工扩权) ----
+  // 默认只返回 pending;all=true 含已决(approved/dismissed)。
+  pendingScope: (taskId: string, all = false) =>
+    get<{ items: PendingScopeRow[] }>(
+      `/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`,
+    ).then((r) => arr(r.items)),
+  // approve 把网段写入任务 scope,guard 后续放行;dismiss 忽略。
+  // 409 = 已被(并发)决定,调用方刷新列表即可。
+  decidePendingScope: (id: number, action: "approve" | "dismiss") =>
+    post<PendingScopeRow>(`/pending-scope/${id}/decide`, { action }),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {
@@ -1313,4 +1379,44 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- 内网作战（拓扑 / 会话 / 隧道 / 凭据）----
+  // 四个列表都支持可选 taskId(拼 ?task_id=);不传保持全局视图。
+  intranetTopology: (taskId?: string) =>
+    get<IntranetTopology>(`/intranet/topology${taskQuery(taskId)}`).then((r) => ({
+      nodes: arr(r.nodes),
+      edges: arr(r.edges),
+      segments: arr(r.segments),
+    })),
+  shellSessions: (taskId?: string) =>
+    get<{ items: ShellSession[] }>(`/sessions${taskQuery(taskId)}`).then((r) => arr(r.items)),
+  // timeout 单位为秒，省略则由后端用默认值。
+  sessionExec: (id: string, command: string, timeout?: number) =>
+    post<SessionExecResult>(`/sessions/${encodeURIComponent(id)}/exec`, {
+      command,
+      ...(timeout ? { timeout } : {}),
+    }),
+  sessionList: (id: string, path: string) =>
+    post<{ entries: SessionFsEntry[] }>(`/sessions/${encodeURIComponent(id)}/list`, { path }).then((r) =>
+      arr(r.entries),
+    ),
+  sessionRead: (id: string, path: string) =>
+    post<SessionReadResult>(`/sessions/${encodeURIComponent(id)}/read`, { path }),
+  sessionWrite: (id: string, path: string, contentBase64: string) =>
+    post<{ ok: boolean; bytes: number }>(`/sessions/${encodeURIComponent(id)}/write`, {
+      path,
+      content_base64: contentBase64,
+    }),
+  // 人工探活:成功 alive=true;失败 alive=false 且 error 带原因(后端已诚实标 dead)。
+  probeSession: (id: string) =>
+    post<{ alive: boolean; ms?: number; error?: string }>(`/sessions/${encodeURIComponent(id)}/probe`),
+  // 移交内网:以该会话的立足点主机为初始 scope 创建新内网任务,返回新任务 id(字符串)。
+  // 400 = 无法确定立足点 IP;404 = 会话不存在。
+  handoffSession: (id: string) => post<{ task_id: string }>(`/sessions/${encodeURIComponent(id)}/handoff`),
+  deleteSession: (id: string) => del<{ ok: boolean }>(`/sessions/${encodeURIComponent(id)}`),
+  tunnels: (taskId?: string) =>
+    get<{ items: TunnelInfo[] }>(`/tunnels${taskQuery(taskId)}`).then((r) => arr(r.items)),
+  teardownTunnel: (id: string) => post<{ ok: boolean }>(`/tunnels/${encodeURIComponent(id)}/teardown`),
+  credentials: (taskId?: string) =>
+    get<{ items: Credential[] }>(`/credentials${taskQuery(taskId)}`).then((r) => arr(r.items)),
 };

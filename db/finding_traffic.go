@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -329,12 +330,22 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	// SelfCheck 是 worker 提交前的结构化自检(agent/finding_selfcheck.go 的 7 个
+	// 布尔位)。原样落库供审核层核对;nil = 未填(独立 agent/旧调用)。
+	SelfCheck json.RawMessage
 }
 
 type RecordedFinding struct {
 	FindingID int64           `json:"finding_id,string"`
 	NodeID    int64           `json:"finding_node_id,string"`
 	Traffic   *FindingTraffic `json:"traffic"`
+
+	// 档 A 同入口合并(db/finding_merge.go):命中既有 confirmed/pending finding
+	// 时不新增行/节点,Merged=true,MergedInto* 指向聚合目标(与
+	// FindingID/NodeID 相同,冗余字段只是让调用方无需比较即可判断走了合并)。
+	Merged              bool  `json:"merged"`
+	MergedIntoFindingID int64 `json:"merged_into_finding_id,string,omitempty"`
+	MergedIntoNodeID    int64 `json:"merged_into_node_id,string,omitempty"`
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
@@ -361,6 +372,25 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
+	// 档 A 同入口合并:查重与插入同处本事务的任务级证据锁内,无并发双插窗口。
+	// 四层去重第一层:写入时就带上结构化合并键(归一化类别 + 主资产 / 文本弱锚)
+	// 与正文指纹,让后续查重不依赖重算。
+	dedupKey := FindingDedupKey(in.VulnClass, in.AssetIDs, FindingComparableText(in.VulnClass, in.Name, in.Summary, in.Evidence))
+	fingerprint := FindingFingerprint(in.VulnClass, in.Name, in.Summary, in.Evidence)
+	if dedupKey != "" {
+		// 任务级证据锁只覆盖同任务;跨任务同键(同一资产被两个任务同时上报)
+		// 需要键级咨询锁串行化,否则两个事务会同时查不到候选而各插一行。
+		if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext($1))`, "finding-dedup:"+dedupKey); err != nil {
+			return nil, err
+		}
+	}
+	cand, terminal, merr := findMergeCandidateTx(tx, in, dedupKey)
+	if merr != nil {
+		return nil, merr
+	}
+	if cand != nil {
+		return mergeFindingTx(tx, cand, in, prepared)
+	}
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
@@ -382,9 +412,19 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	selfCheck := in.SelfCheck
+	if len(selfCheck) == 0 {
+		selfCheck = json.RawMessage("{}")
+	}
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,dedup_key,fingerprint,self_check)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), dedupKey, fingerprint, string(selfCheck)).Scan(&out.FindingID); err != nil {
 		return nil, err
+	}
+	// 四层去重第二层:终态行(已修复/误报/忽略/风险接受/重复)不自动合并,但在新行
+	// 上打 suspected_dup_of「疑似重复」标记,交给二次审核或人工裁决。
+	// 纯增强:标记失败只记日志,绝不因此丢掉刚写入的漏洞。
+	if _, _, derr := markSuspectedDuplicateTx(tx, out.FindingID, in, dedupKey, terminal); derr != nil {
+		log.Printf("[dedup] 标记疑似重复失败 finding=%d: %v", out.FindingID, derr)
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
 	// 原子一致，不存在提交成功却没入队、消息永久丢失的窗口。

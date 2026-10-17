@@ -1,15 +1,16 @@
 // Package guard implements the safety boundary layer (docs §11): an audit log,
-// user-configured intercept-rule evaluation, and Observer/G5 failure attribution.
-// Every tool call passes through the PreToolUse hook before executing.
-// (The RoE authorization-scope mechanism was removed; a replacement may be added
-// later.) Destructive/exfil gating is no longer hard-coded here — it lives in the
-// DB intercept rules (seeded as ordinary [内置] rules, so users can disable or
-// delete them), evaluated via applyIntercept.
+// user-configured intercept-rule evaluation, RoE authorization-scope enforcement
+// (F5, see roe.go — Bash/HTTP 工具的交互目标与任务 task_scope 比对), and
+// Observer/G5 failure attribution. Every tool call passes through the PreToolUse
+// hook before executing. Destructive/exfil gating is no longer hard-coded here —
+// it lives in the DB intercept rules (seeded as ordinary [内置] rules, so users
+// can disable or delete them), evaluated via applyIntercept.
 package guard
 
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"regexp"
 	"sync"
 	"time"
@@ -34,6 +35,10 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	roe         RoEConfig              // optional; Scope==nil disables the RoE check
+	isolation   IsolationConfig        // optional; DataRoot==nil disables the per-task data isolation check
+	egress      *EgressGuard           // optional; 批 5 B2 出口审查(敏感指纹拦截),nil 关闭
+	tarpit      *tarpitState           // optional; 批 5 B3 tarpit 熔断,nil 关闭
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -74,8 +79,73 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
+	// 批 5 B2 出口审查:出站内容含平台敏感指纹(LLM key/jwt.key/gate 路径/PG 密码/
+	// callback_addr)即 deny,先于一切其他检查(含下方的 allow 审计——命中时命令
+	// 原文本身就可能带秘密,不能落盘)——这类 deny 不走拦截规则,也不被一键放行
+	// 豁免。审计只记 kind,不落指纹/原文。
+	if res, stop := g.checkEgress(ev, cmd); stop {
+		return res
+	}
 	g.record(ev.ToolName, "allow", "", cmd)
+	// 跨任务数据隔离:worker 与平台同容器同权限,共享数据根下的兄弟任务目录
+	// (/app/data/tasks/<其它 id>、transcripts、drafts)必须拦掉 —— 实测正是这条通路
+	// 让一个没拿到靶机的任务从兄弟任务里翻出平台宿主 IP。先于 RoE/拦截规则。
+	if res, stop := g.checkIsolation(ctx, ev, cmd); stop {
+		return res
+	}
+	// RoE 授权范围检查(F5):Bash/HTTP 类工具的交互目标与 task_scope 比对,
+	// 先于用户拦截规则;Out+strict 走 ask,Out+warn 只记审计。
+	if res, stop := g.checkRoE(ctx, ev, cmd); stop {
+		return res
+	}
+	// 批 5 B3 tarpit 熔断:每 host 抓取计数,超预算写一次 hint 提示 planner,
+	// 之后对该 host 仍 warn 放行(不硬 block,防误杀真实大站)。
+	g.checkTarpit(ev)
 	return g.applyIntercept(ctx, ev)
+}
+
+// SetEgress 装配出口审查的敏感指纹集合(server 侧进程内共享一份,见 egress.go)。
+// nil = 关闭。
+func (g *Guard) SetEgress(e *EgressGuard) {
+	g.mu.Lock()
+	g.egress = e
+	g.mu.Unlock()
+}
+
+// checkEgress 是 PreToolUse 第一道:对 Bash 类命令全文与 WebFetch 的 url/body
+// 做敏感指纹检查,命中 → deny("操作包含平台敏感信息,禁止外发")。
+func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
+	g.mu.Lock()
+	e := g.egress
+	g.mu.Unlock()
+	if e == nil {
+		return hook.Result{}, false
+	}
+	var texts []string
+	if cmd != "" {
+		texts = append(texts, cmd)
+	}
+	if ev.ToolName == "WebFetch" {
+		var in struct {
+			URL  string `json:"url"`
+			Body string `json:"body"`
+		}
+		if json.Unmarshal(ev.Input, &in) == nil {
+			texts = append(texts, in.URL, in.Body)
+		}
+	}
+	for _, text := range texts {
+		if text == "" {
+			continue
+		}
+		if kind, hit := e.Check(text); hit {
+			// 审计/日志只记 kind:命令原文可能本身就含敏感信息,不落盘;
+			// block 文案也不带命中内容,防止把指纹回显给模型。
+			log.Printf("[guard][egress] 命中平台敏感指纹(%s),%s 外发已拦截", kind, ev.ToolName)
+			return g.block(ev.ToolName, systemBlockMessage("操作包含平台敏感信息，禁止外发"), ""), true
+		}
+	}
+	return hook.Result{}, false
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
@@ -88,15 +158,22 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	// Review 按配置的判定链给出结论:默认「规则优先,未命中才交裁判」,或
+	// 「纯模型审核」(跳过全部拦截规则,每次调用都交裁判)。
+	dec, matched := g.interceptor.Review(ctx, ev.ToolName, ev.Input)
 	if !matched {
-		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
-		// or unwired, keep current behavior and allow.
-		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)
-		if !judged {
+		// 没有任何判定层给出结论(规则未命中,且没有可用裁判)。保持 fail-closed:
+		// 强编码特征但无法还原的载荷转人工,其余放行(与历史行为一致)。
+		if intercept.UndecodableEncodedPayload(string(ev.Input)) {
+			dec = intercept.Decision{
+				RuleName: "[内置] 编码载荷无法解码(疑似规避检测)",
+				Action:   "ask",
+				Message:  intercept.ObfuscationUndecodableHint,
+				Source:   "builtin",
+			}
+		} else {
 			return hook.Result{}
 		}
-		dec = d
 	}
 	switch dec.Action {
 	case "deny":

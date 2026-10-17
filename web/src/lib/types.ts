@@ -39,6 +39,10 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  review_enabled?: boolean; // 二次审核开关(创建时定,默认关)；true=新漏洞自动进入 AI 二次审核
+  review_src_type?: string; // 审核标准:edusrc(默认) | enterprise
+  op_mode?: string; // 作战模式:standard(默认,稳健) | aggressive(激进)
+  unattended?: boolean; // 无人值守:judge ask 强制二次裁决,不进人工审批队列(全局开关开启时被短路)
 }
 
 export interface TaskCategory {
@@ -56,6 +60,7 @@ export interface TaskTemplate {
   goal: string;
   category_id?: number | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
+  builtin?: boolean; // 内置模板（随程序播种；不可删除/改名）
   created_at: string;
   updated_at: string;
 }
@@ -66,6 +71,7 @@ export interface DeleteTaskOptions {
   delete_files: boolean;
   delete_findings: boolean;
   delete_llm_records: boolean;
+  delete_intranet: boolean;
 }
 
 export interface DeleteTaskResult {
@@ -76,6 +82,9 @@ export interface DeleteTaskResult {
   files_deleted: boolean;
   findings_deleted: number;
   llm_records_deleted: number;
+  sessions_deleted: number;
+  tunnels_deleted: number;
+  credentials_deleted: number;
   cleanup_warning?: string;
 }
 
@@ -255,6 +264,9 @@ export interface Asset {
   task_source?: string;
   task_source_summary?: string;
   task_source_node_id?: number;
+  // 批 6 L1 蜜罐静态签名:0=无信号;evidence 为命中签名(JSON 数组文本)
+  honeypot_score?: number;
+  honeypot_evidence?: string;
 }
 
 export interface IntentAsset {
@@ -509,7 +521,58 @@ export interface Finding {
   source_task_id?: string;
   inherited?: boolean;
   assets?: FindingAsset[];
+  // AI 二次审核结论(见 server/finding_review.go)。review_verdict 空串=尚未审核;
+  // ignored 的漏洞已被自动置为 status=ignored,原因写在 review_reasons;
+  // deepen = 线索真实但没打穿,已自动建回炉意图(不是终态,不推送)。
+  review_verdict?: "accepted" | "ignored" | "deepen" | "";
+  review_severity?: Severity | "";
+  review_score?: number;
+  review_reasons?: string;
+  review_notes?: string;
+  reviewed_at?: string;
+  // 四层去重(见 db/finding_dedup.go / db/finding_merge_manual.go)。
+  // merged_into 非空 = 这条已被人工合并到该 finding(状态同时为 duplicate);
+  // suspected_dup_of = 审核模型/结构化键指认的疑似重复目标,等待人工确认。
+  merged_into?: string;
+  suspected_dup_of?: string;
+  suspected_dup_score?: number;
+  // 危害升级(见 server/finding_escalate.go):已采纳的低危/中危漏洞会自动派一条
+  // 「扩大危害」意图再挖一轮。dispatched=已派/待结果;done=升级已交回待复核;
+  // failed=打不动,已保留原级。base_severity 是升级前的级别。
+  escalated_at?: string;
+  escalate_status?: "dispatched" | "done" | "failed" | "";
+  base_severity?: Severity | "";
   ts: string;
+}
+
+// FindingDupMember 是「疑似重复 / 已合并」分组里的一条(见 db/finding_merge_manual.go)。
+export interface FindingDupMember {
+  id: string;
+  vulnclass: string;
+  name?: string;
+  status: FindingStatus;
+  score?: number;
+  merged: boolean;
+}
+
+// FindingDupGroup 是「同一目标 + 若干疑似/已合并成员」的一组。
+export interface FindingDupGroup {
+  target_id: string;
+  vulnclass: string;
+  name?: string;
+  status: FindingStatus;
+  members: FindingDupMember[];
+}
+
+export interface FindingDuplicatesPage {
+  items: FindingDupGroup[];
+}
+
+// MergeFindingsResult 是人工合并的结果:实际并入的 source 与跳过的 source。
+export interface MergeFindingsResult {
+  target_id: string;
+  merged: string[];
+  skipped: string[];
 }
 
 // FindingsPage 是发现列表的服务端分页响应。
@@ -548,6 +611,31 @@ export interface FindingDeepenResponse {
   queued: boolean;
 }
 
+// ---- AI 二次审核 (finding review) ----
+// ReviewVerdict 是 AI 二次审核的结论:accepted=收录;ignored=不符合收录标准(已自动
+// 置为忽略);deepen=线索真实但没打穿,已自动建回炉意图让 worker 再挖一轮。
+// 空串=尚未审核。
+export type ReviewVerdict = "accepted" | "ignored" | "deepen";
+
+// ReviewStats 是二次审核页顶部计数(整表聚合)。
+export interface ReviewStats {
+  total: number; // 已审(有结论)
+  accepted: number;
+  ignored: number;
+  deepen: number; // 打回深挖(回炉中,非终态)
+  pending: number; // 开了审核但尚未出结论
+}
+
+// ReviewResult 是手动重审接口返回的结论。
+export interface ReviewResult {
+  finding_id: string;
+  verdict: ReviewVerdict;
+  severity?: Severity | "";
+  score?: number;
+  reasons?: string;
+  notes?: string;
+}
+
 // FindingStats 是发现全表聚合(统计卡 + 漏洞类型下拉),服务端计算,不受分页影响。
 export interface FindingStats {
   total: number;
@@ -581,6 +669,8 @@ export interface FindingQuery {
   sort?: "severity" | "time";
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。
   assetScope?: string;
+  // 二次审核结论筛选;all/空 = 不筛选。pending = 开了审核但尚未出结论。
+  review?: "all" | "pending" | ReviewVerdict;
 }
 
 // ---- Findings by asset (资产视图) ----
@@ -943,6 +1033,12 @@ export interface Settings {
   // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
   // 之后启动的 run 生效。
   noa_compaction?: boolean;
+  // 「停滞顾问」开关(默认开):worker 被判信息梯度为零时,除固定转向纪律外再唤起一次
+  // 带全局上下文的顾问调用,把「停止同轴重试」升级成「具体换到哪去」。
+  stuck_adviser_enabled?: boolean;
+  // 无人值守(默认关):开启后所有任务的 judge ask 走「禁止 ask 的强制二次裁决」,
+  // 不进人工审批队列;关闭时以任务级开关(tasks.unattended)为准。
+  intercept_unattended?: boolean;
   // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
@@ -1054,6 +1150,9 @@ export interface LLMProfile {
   // 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
   // ""=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
   session_header_key?: string;
+  // 自定义会话体字段名：非空时在每次请求的 JSON 体里注入该字段，值=当前会话/意图的
+  // session id。""=不注入。用于「请求体缺 conversation id 就 400」的网关。
+  session_body_field?: string;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
 }
@@ -1306,7 +1405,7 @@ export interface AssetInterceptRule {
 }
 
 export interface InterceptPending {
-  decision_source?: "rule" | "model" | "unknown" | "";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "aggressive_bypass" | "auto_allow" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1321,6 +1420,16 @@ export interface InterceptPending {
   created_at: string;
 }
 
+// InterceptRuleMode: 拦截判定链。
+//   rules      = 规则优先:命中规则即终态,未命中才交模型(默认)
+//   judge_only = 纯模型审核:跳过全部拦截规则,每次调用都交模型判定
+export type InterceptRuleMode = "rules" | "judge_only";
+
+export interface InterceptModeState {
+  mode: InterceptRuleMode;
+  judge_available: boolean; // 纯模型审核要求裁判模型已启用
+}
+
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
 export interface JudgeConfig {
   enabled: boolean;
@@ -1330,6 +1439,7 @@ export interface JudgeConfig {
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+  retry_attempts: number; // 模型出错 / 无法解析时的额外重试次数(0 = 不重试)
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。
@@ -1348,9 +1458,32 @@ export interface JudgeUsage {
   daily: JudgeDayUsage[];
 }
 
+// AutoAllowState: 一键放行(guard auto-allow)的当前状态。enabled=false 时
+// expires_at/remaining_seconds 均为 0;到期后后端惰性检查自动关闭。
+export interface AutoAllowState {
+  enabled: boolean;
+  expires_at: number; // unix 秒
+  remaining_seconds: number;
+}
+
+// PendingScopeRow: 引擎在授权边界外反复探测到的网段/主机,等待人工决定。
+// approve = 写入任务 scope(guard 后续放行);dismiss = 忽略。status 为已决态时
+// decided_at 有值;并发决定会返回 409,调用方刷新列表即可。
+export interface PendingScopeRow {
+  id: number;
+  task_id: number;
+  kind: string; // cidr | ip 等
+  value: string;
+  status: "pending" | "approved" | "dismissed";
+  hits: number;
+  first_seen: string;
+  last_seen: string;
+  decided_at?: string;
+}
+
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
-  decision_source?: "rule" | "model" | "unknown";
+  decision_source?: "rule" | "model" | "builtin" | "unknown" | "aggressive" | "aggressive_bypass" | "auto_allow";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1600,6 +1733,120 @@ export interface UpdateProgress {
   message: string;
   version?: string;
   error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// 内网作战（/intranet）：拓扑 / 会话（webshell) / 隧道 / 凭据。
+// 形状与后端契约一一对应；Go 侧 nil slice 序列化为 null,api 层统一 arr() 兜底。
+// ---------------------------------------------------------------------------
+
+/** GET /api/intranet/topology 的主机节点。 */
+export interface IntranetNode {
+  id: string;
+  ip: string;
+  segment: string;
+  /** 是否有存活会话（图上高亮/加边框）。 */
+  has_session: boolean;
+  alive_sessions: number;
+  /** 平台自身（回连端）节点，图上特殊标记。 */
+  is_callback: boolean;
+  /** 该主机探测到的开放服务（来自资产 open_ports）；拓扑图在主机点外圈展开。 */
+  services?: { port: number; service?: string }[];
+}
+
+/** GET /api/intranet/topology 的边（隧道链路）。state: alive / stopped / error。 */
+export interface IntranetEdge {
+  id: string;
+  kind: string;
+  from: string;
+  to: string;
+  state: string;
+}
+
+export interface IntranetSegment {
+  name: string;
+  color_key: string;
+}
+
+export interface IntranetTopology {
+  nodes: IntranetNode[];
+  edges: IntranetEdge[];
+  segments: IntranetSegment[];
+}
+
+/** GET /api/sessions 的会话（webshell）记录。status: alive / dead。 */
+export interface ShellSession {
+  id: string;
+  /** 马型，如 beholder / godzilla / antsword。 */
+  kind: string;
+  url: string;
+  lang: string;
+  platform: string;
+  /** 宿主标识（拓扑节点 id 或 ip）。 */
+  host_asset_id: string;
+  status: string;
+  last_beat: string;
+  /** 创建该会话的任务 id（后端 JSON number，omitempty；0/缺省 = 未关联）。 */
+  created_by_task?: number;
+}
+
+/** POST /api/sessions/{id}/exec 的结果。 */
+export interface SessionExecResult {
+  stdout: string;
+  stderr: string;
+  ms: number;
+  timed_out: boolean;
+  /** 通道侧错误（如会话已断），HTTP 层成功但执行失败时由后端填充。 */
+  error?: string;
+}
+
+/** POST /api/sessions/{id}/list 的目录项。 */
+export interface SessionFsEntry {
+  name: string;
+  is_dir: boolean;
+  size: number;
+}
+
+/** POST /api/sessions/{id}/read 的结果：文本 content 或 base64（二进制）二选一。 */
+export interface SessionReadResult {
+  content?: string;
+  content_base64?: string;
+  truncated: boolean;
+}
+
+/** GET /api/tunnels 的隧道台账。state: alive / stopped / error。 */
+export interface TunnelInfo {
+  id: string;
+  /** 归属任务 id（后端 JSON number；0 = 未关联）。 */
+  task_id: number;
+  kind: string;
+  state: string;
+  /** 平台侧入口（chisel server 绑定地址/端口）。 */
+  listen_host: string;
+  listen_port: number;
+  /** portfwd：经隧道访问的内网目标。 */
+  target_host?: string;
+  target_port?: number;
+  via_session_id: string;
+  last_check: string;
+  /** 探活/建链失败原因（state=error 时一般由后端填充）。 */
+  error?: string;
+}
+
+/** GET /api/credentials 的凭据记录（密钥已脱敏）。 */
+export interface Credential {
+  id: string;
+  cred_type: string;
+  username: string;
+  domain: string;
+  secret_masked: string;
+  source: string;
+  verified: boolean;
+  created_at: string;
+  /** 归属任务 id（后端 JSON number；0 = 未关联）。 */
+  task_id?: number;
+  /** 归属主机（拓扑节点 id / 资产 id / IP），用于把凭据映射到主机。 */
+  host_asset_id?: string | number;
 }
 
 // Original execution selected from an approval, never submitted to the reviewer.

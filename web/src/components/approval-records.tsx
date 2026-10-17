@@ -117,6 +117,10 @@ function MatchCell({ row, showReason = true }: { row: InterceptApprovalRow; show
           <BotIcon />
           模型判定
         </Badge>
+      ) : source(row) === "aggressive_bypass" ? (
+        <Badge variant="destructive" title="激进模式全放行:deny 裁决被转为 allow,审计可追">激进·全放行</Badge>
+      ) : source(row) === "builtin" ? (
+        <Badge variant="outline">内置兜底</Badge>
       ) : (
         <span className="truncate">{row.rule_name || "规则未记录或已删除"}</span>
       )}
@@ -333,7 +337,8 @@ export function ApprovalDetail({
   if (row.status === "pending") execution = "尚未执行";
   if (audit && audit.correlation !== "exact" && audit.effective_action === "allow") execution = "未关联执行结果";
   const command = typeof row.tool_input?.command === "string" ? row.tool_input.command : undefined;
-  let initialLabel = source(row) === "model" ? "模型初判" : "规则初判";
+  let initialLabel =
+    source(row) === "model" ? "模型初判" : source(row) === "builtin" ? "内置兜底" : "规则初判";
   if (audit?.model_fallback) initialLabel = "模型异常回退";
 
   return (
@@ -835,6 +840,10 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
                 <SelectItem value="all">全部来源</SelectItem>
                 <SelectItem value="model">模型判定</SelectItem>
                 <SelectItem value="rule">规则判定</SelectItem>
+                <SelectItem value="builtin">内置兜底</SelectItem>
+                <SelectItem value="aggressive">激进自动批准</SelectItem>
+                <SelectItem value="aggressive_bypass">激进·全放行</SelectItem>
+                <SelectItem value="auto_allow">一键放行</SelectItem>
                 <SelectItem value="unknown">来源未知</SelectItem>
               </SelectGroup>
             </SelectContent>

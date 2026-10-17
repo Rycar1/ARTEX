@@ -26,10 +26,6 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 	h := s.Handler()
-	tok, err := signJWT(s.jwtKey)
-	if err != nil {
-		t.Fatalf("sign jwt: %v", err)
-	}
 
 	do := func(method, path string, body any) (int, map[string]any) {
 		var r *http.Request
@@ -39,7 +35,7 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 		} else {
 			r = httptest.NewRequest(method, path, nil)
 		}
-		r.Header.Set("Authorization", "Bearer "+tok)
+		baAuth(s, r)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
 		var out map[string]any
@@ -62,7 +58,9 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	}
 
 	// create a task → 201, returns PG task (string id + exploration_id)
-	code, out := doRetry("POST", "/api/tasks", map[string]string{"description": "smoke", "goal": "测试 SQLi/XSS"})
+	// 描述里必须带一个可识别目标:平台有「无靶机拒跑」闸门,没有 URL/IP/域名/【附件】
+	// 声明的任务会被拒绝启动,planner 不跑 → 也就不会有 goal 节点。
+	code, out := doRetry("POST", "/api/tasks", map[string]string{"description": "smoke http://127.0.0.1:9/", "goal": "测试 SQLi/XSS"})
 	if code != 201 {
 		t.Fatalf("create task: %d (%v)", code, out)
 	}
