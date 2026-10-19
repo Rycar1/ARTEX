@@ -1140,6 +1140,7 @@ function ConcurrencySettingsDialog() {
                 id="task-concurrency-limit"
                 type="number"
                 min={1}
+                max={64}
                 className="w-32"
                 value={limit}
                 onChange={(event) => setLimit(event.target.value)}
@@ -3502,15 +3503,16 @@ function CreateTaskSheet({
                       checked={unattended}
                       onCheckedChange={(v) => setUnattended(v === true)}
                     />
-                    <span>无人值守（judge 需人审的命令自动强制二选一，不再等人）</span>
+                    <span>无人值守（所有「需人工审批」的命令自动强制二选一，不再等人）</span>
                   </label>
                   <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
                     <p>
-                      开启后，LLM 审核判定「需要人工审批」的命令将<b>自动发起第二次强制裁决</b>：
-                      在 allow / deny 中二选一（无法判断安全则拒绝），<b>不再进入人工审批队列</b>。
-                      适合夜间长跑、无人盯屏的任务；每次裁决在审计里标注「无人值守强制裁决」，可事后追查。
+                      开启后，<b>任何来源的「需要人工审批」都不再进入审批队列</b>：LLM 审核判定的、
+                      拦截规则命中的、编码载荷无法解码的，都会<b>自动强制裁决</b>——在 allow / deny 中二选一
+                      （无法判断安全则拒绝）。适合夜间长跑、无人盯屏的任务；每次裁决在审计里标注
+                      「无人值守强制裁决」，可事后追查。
                       全局开关（系统设置 → 无人值守）开启时，本任务无论勾选与否都按无人值守处理。
-                      RoE 范围强制与用户自建审批规则不受影响，仍需人工。
+                      <b>例外</b>：RoE 范围强制（越权目标）在无人值守下<b>直接拒绝</b>，需要越权请先把目标登记进任务范围。
                     </p>
                   </div>
                 </div>

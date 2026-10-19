@@ -144,6 +144,9 @@ type Traffic struct {
 	wmu   sync.Mutex // serializes record() vs DeleteHost (incl. blob GC)
 	seq   atomic.Int64
 	proxy *mproxy.Proxy
+	// recording 控制「是否把抓到的交换落库」(settings.traffic_capture)。默认 true
+	// 以保持旧行为;Open 后由 server 按配置显式设置。监听端口不受它影响。
+	recording atomic.Bool
 	// fts reports whether the full-text index is available. False on a driver
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
@@ -265,6 +268,8 @@ func Open(dir, addr string) (*Traffic, error) {
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	// 默认录制开(旧行为);server 起来后按 settings.traffic_capture 覆盖。
+	t.recording.Store(true)
 	return t, nil
 }
 
@@ -655,6 +660,13 @@ func (t *Traffic) CACertPath() string {
 // Start runs the proxy (blocking); run in a goroutine.
 func (t *Traffic) Start() error { return t.proxy.Start() }
 
+// SetRecording 控制是否把抓到的交换落库(settings.traffic_capture)。
+// 只影响"记不记",不影响代理是否监听:端口映射与浏览器 MCP 都依赖它一直开着。
+func (t *Traffic) SetRecording(on bool) { t.recording.Store(on) }
+
+// Recording 报告当前是否在落库(可观测/测试用)。
+func (t *Traffic) Recording() bool { return t.recording.Load() }
+
 // UpstreamProxy returns the current egress proxy URL ("" = direct dial).
 // Observability/test hook for the hot-swappable upstream (SetUpstreamProxy).
 func (t *Traffic) UpstreamProxy() string {
@@ -702,6 +714,12 @@ type sink struct {
 
 func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
+		return
+	}
+	// 录制开关(settings.traffic_capture)关闭时**不落库**。监听端口本身仍然开着
+	// (容器端口映射 + 浏览器 MCP 需要它),但"关闭时不记录任何流量"这条承诺必须由
+	// 这里保证:否则关闭前就启动的 agent 仍持有 HTTP_PROXY,其流量会继续被录下来。
+	if !s.t.recording.Load() {
 		return
 	}
 	s.t.record(f)

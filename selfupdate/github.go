@@ -10,12 +10,23 @@ import (
 	"time"
 )
 
-// Repo 是发布源。写死而不是做成配置项：更新源可配等于给任何能改配置的人一条
-// 远程代码执行通道，对一个渗透测试平台来说这个口子开不得。
-const Repo = "Autumn-27/artex"
+// Repo 是发布源。**故意不做成运行时配置**：更新源可配等于给任何能改配置的人一条
+// 远程代码执行通道(把源指到自己的仓库 → 平台下载并执行对方二进制)，对一个渗透
+// 测试平台来说这个口子开不得。
+//
+// 但写死成 const 会让二开/私有部署永远无法自更新，所以留一个**构建期**覆盖点：
+//
+//	go build -ldflags "-X github.com/Autumn-27/artex/selfupdate.Repo=owner/repo"
+//
+// 构建者本来就能决定这个二进制跑什么代码，因此这不扩大信任边界；而运行时改配置
+// 做不到，RCE 通道仍然是关闭的。
+var Repo = "Autumn-27/artex"
 
 // latestURL 是 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
-const latestURL = "https://api.github.com/repos/" + Repo + "/releases/latest"
+// 用函数而不是 const:Repo 现在可在构建期被 -X 覆盖。
+func latestURL() string {
+	return "https://api.github.com/repos/" + Repo + "/releases/latest"
+}
 
 // allowedHosts 限定升级链路能访问的域名。配合下面的 checkRedirect，
 // 任何一跳被重定向到名单外的主机都会直接失败——这是防止 DNS 污染 / 中间人
@@ -86,7 +97,7 @@ func checkURL(u *url.URL) error {
 
 // FetchLatest 查询最新正式版。
 func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +118,9 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 		// 未认证的 GitHub API 是每 IP 每小时 60 次，共用出口 IP 时很容易撞上。
 		return nil, fmt.Errorf("GitHub 接口限流（每小时 60 次），请稍后再试")
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("仓库 %s 尚未发布任何正式版本", Repo)
+		// 404 有两种常见原因:仓库没有正式版,或发布源指向了一个不存在的仓库(二开时
+		// 忘了用 -X 覆盖 Repo)。把两条都说出来,省得用户对着"尚未发布版本"猜。
+		return nil, fmt.Errorf("仓库 %s 没有可用的正式版(或该仓库不存在);发布源是构建期固定的,如需指向自己的仓库请用 -X selfupdate.Repo=owner/repo 重新构建", Repo)
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("GitHub 返回 %d", resp.StatusCode)
 	}

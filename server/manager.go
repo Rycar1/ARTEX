@@ -341,10 +341,19 @@ func (m *Manager) ConcurrencyLimit() (enabled bool, limit int) {
 	return true, limit
 }
 
-// SetConcurrency persists the running-task concurrency cap. limit<1 is clamped to 1.
+// maxConcurrencyLimit 是同时运行任务数的硬上限。理由同 maxWorkers:每个任务都是一整套
+// planner + N 个 worker 的 agent 循环,上限失控会同时打爆内存、上游配额与目标侧。
+const maxConcurrencyLimit = 64
+
+// SetConcurrency persists the running-task concurrency cap. limit<1 falls back to
+// the default; limit>maxConcurrencyLimit is rejected (not silently clamped) so the
+// caller learns the value didn't take effect.
 func (m *Manager) SetConcurrency(enabled bool, limit int) error {
 	if limit < 1 {
 		limit = defaultConcurrencyLimit
+	}
+	if limit > maxConcurrencyLimit {
+		return fmt.Errorf("任务并发上限不能超过 %d(当前填 %d)", maxConcurrencyLimit, limit)
 	}
 	if err := m.pg.SetSetting(settingConcurrencyLimit, strconv.Itoa(limit)); err != nil {
 		return err
@@ -366,10 +375,19 @@ func (m *Manager) Workers() int {
 	return n
 }
 
-// SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
+// maxWorkers 是并发 work-agent 数的硬上限。这不是性能建议值而是安全阀:每个 worker
+// 都是独立的 agent 循环,会并发打模型与目标;填 999 会瞬间打爆内存、上游配额与目标侧
+// 承载(token 还按线程数线性烧)。超出直接拒,不静默钳制 —— 让调用方知道没生效。
+const maxWorkers = 64
+
+// SetWorkers persists the concurrent work-agent count. Values <=0 or >maxWorkers
+// are rejected.
 func (m *Manager) SetWorkers(n int) error {
 	if n <= 0 {
 		return fmt.Errorf("workers 必须 >0")
+	}
+	if n > maxWorkers {
+		return fmt.Errorf("workers 不能超过 %d(当前填 %d)", maxWorkers, n)
 	}
 	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
 }
@@ -497,6 +515,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
 	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	// 把开关同步给录制器:关闭时代理仍监听(端口映射/浏览器 MCP 需要),但不落库。
+	// 否则关闭前启动的 agent 仍持 HTTP_PROXY,其流量会继续被录下来。
+	if m.traffic != nil {
+		m.traffic.SetRecording(m.trafficOn)
+	}
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -559,6 +582,11 @@ func (m *Manager) SetTrafficEnabled(on bool) error {
 	m.mu.Lock()
 	m.trafficOn = on
 	m.mu.Unlock()
+	// 立即让录制器停/开落库:代理端口保持监听(容器端口映射 + 浏览器 MCP 依赖它),
+	// 但关闭后必须真的不再记录 —— 否则"关闭时不记录任何流量"对已启动的 agent 不成立。
+	if m.traffic != nil {
+		m.traffic.SetRecording(on)
+	}
 	// Inject (on) or strip (off) the recording proxy + CA on the browser MCP so
 	// Playwright routes through the MITM. Must run after the flag flip above, since
 	// ProxyAddr/ProxyCACert honor it. putSettings rebuilds agents next (applyLLM),
@@ -681,10 +709,27 @@ func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
 // proxy are each left untouched when nil (so toggling the switch doesn't wipe a saved
 // key/proxy; pass a pointer to "" to clear). Callers must rebuild agents (applyLLM)
 // afterwards so the settings take effect.
+// webSearchBackends 是网络搜索后端的白名单。写配置时必须校验:存进一个非法后端名,
+// UI 会照原样回显,而 agent 拿到的搜索工具在真正调用时才失败(或按未知后端处理)——
+// 属于"配置看起来成功、功能静默不可用"的坑。注意是 brave-free 而不是 brave。
+var webSearchBackends = []string{"ddgs", "brave-free", "tavily", "deepseek"}
+
+func validWebSearchBackend(backend string) bool {
+	for _, b := range webSearchBackends {
+		if b == backend {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, proxy *string) error {
 	backend = strings.TrimSpace(backend)
 	if backend == "" {
 		backend = defaultWebSearchBackend
+	}
+	if !validWebSearchBackend(backend) {
+		return fmt.Errorf("未知的网络搜索后端 %q(可选:%s)", backend, strings.Join(webSearchBackends, "、"))
 	}
 	if err := m.pg.SetBool(settingWebSearchOn, on); err != nil {
 		return err
