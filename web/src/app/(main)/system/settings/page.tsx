@@ -503,12 +503,15 @@ export default function SystemSettingsPage() {
               无人值守（拦截审批）
             </CardTitle>
             <CardDescription>
-              开启后，judge 判定「需要人工审批（ask）」的命令将<b>自动发起第二次强制裁决</b>：
-              禁止 ask，在 <b>allow / deny</b> 中二选一，无法判断安全则一律 <b>deny</b>，
-              <b>不再进入人工审批队列</b>。适合夜间长跑、无人盯屏的任务，消除「等审批超时」的空转。
+              开启后，<b>任何来源的「需要人工审批（ask）」都不再进入审批队列</b>：
+              judge 判定要人审的命令，以及拦截规则命中、编码载荷无法解码等兜底 ask，
+              都会自动发起<b>强制裁决</b>——在 <b>allow / deny</b> 中二选一，
+              无法判断安全则一律 <b>deny</b>。适合夜间长跑、无人盯屏的任务，消除「等审批超时」的空转。
               每次裁决会在审计里标注「无人值守强制裁决」，可事后追查。
               <br />
-              <b>不受影响的硬边界</b>：RoE 范围强制（越权目标仍需人审）、用户自建的审批规则、编码无法解码的兜底转人工。
+              <b>例外（硬边界）</b>：<b>RoE 范围强制</b>（越权目标）在无人值守下<b>直接拒绝</b>，
+              既不交裁判也不等人——资产不出授权范围这条线不因无人值守而放宽；
+              需要越权访问时请先把目标登记进任务范围。
               关闭时恢复现状（ask 等人，超时按超时策略处理）。
             </CardDescription>
           </CardHeader>
@@ -757,6 +760,7 @@ export default function SystemSettingsPage() {
               <Input
                 type="number"
                 min={1}
+                max={64}
                 className="w-32 font-mono text-sm"
                 placeholder="3"
                 value={workers}

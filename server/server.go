@@ -3847,7 +3847,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			backend = *req.WebSearchBackend
 		}
 		if err := s.m.SetWebSearch(on, backend, req.BraveKey, req.TavilyKey, req.WebSearchProxy); err != nil {
-			writeErr(w, 500, err.Error())
+			// 非法后端等入参问题回 400(不是 500):这是调用方填错了,不是服务端故障。
+			writeErr(w, 400, err.Error())
 			return
 		}
 		changed = true
