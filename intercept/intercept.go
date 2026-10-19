@@ -1068,6 +1068,79 @@ func decisionSource(dec Decision) string {
 // pending record is still created (conversation_id = NULL) so the approvals
 // page shows it and the sidebar badge lights up. The worker thread blocks just
 // like in a chat session — the user must visit the approvals page to unblock it.
+// forceVerdictUnattended 用「禁止 ask」契约调一次裁判,把拿不准的判定强制落成
+// allow/deny。ok=false 表示裁判不可用、调用失败或仍不守契约 —— 调用方按安全默认拒绝。
+//
+// 与 Judge() 里的二次裁决同一套语义,但这里服务的是「非 judge 来源的 ask」:
+// 规则命中 / 编码兜底 / 其它硬编码 ask。它们原本只走 HandleAsk 建 pending 等人,
+// 无人值守下那条路必须换成「让裁判当场表态」。
+func (i *Interceptor) forceVerdictUnattended(ctx context.Context, toolName string, input []byte) (Decision, bool) {
+	cfg := i.judgeConfig()
+	if !cfg.Enabled {
+		return Decision{}, false
+	}
+	i.mu.RLock()
+	rv := i.reviewer
+	i.mu.RUnlock()
+	if rv == nil {
+		return Decision{}, false
+	}
+	reviewInput, err := BuildReviewInput(ctx, toolName, input)
+	if err != nil {
+		return Decision{}, false
+	}
+	jctx := ctx
+	if cfg.TimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		jctx, cancel = context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+	out, err := rv(jctx, cfg.ProfileID, cfg.Prompt+UnattendedContract, reviewInput)
+	if err != nil {
+		return Decision{}, false
+	}
+	if out.Action != "allow" && out.Action != "deny" {
+		return Decision{}, false
+	}
+	out.ProfileID = cfg.ProfileID
+	out.Source = "model"
+	return out, true
+}
+
+// resolveUnattendedAsk 是无人值守下 ask 的唯一出口:绝不建 pending。
+//
+//   - RoE 范围强制(NoAutoAllow):直接拒。资产不出授权范围是硬边界,不交裁判决定。
+//   - 其它(规则命中 / 编码兜底 / 硬编码 ask):裁判强制二选一;裁判不可用或仍 ask → 拒。
+//
+// 返回 true = 放行。所有结论都写一条历史(decision_source=model/带 aggressive 语义),
+// 事后可查「谁放行的、为什么」。
+func (i *Interceptor) resolveUnattendedAsk(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) bool {
+	if dec.NoAutoAllow {
+		d := dec
+		d.Action = "deny"
+		d.Message = "[无人值守] " + dec.Message + " —— RoE 范围强制属硬边界,无人值守下不放行"
+		i.Log(ctx, convID, d, toolName, input, "denied")
+		log.Printf("[intercept] 无人值守:RoE 范围强制直接拒绝(工具 %s)", toolName)
+		return false
+	}
+	forced, ok := i.forceVerdictUnattended(ctx, toolName, input)
+	if !ok {
+		d := dec
+		d.Action = "deny"
+		d.Message = "[无人值守] 裁判不可用,按安全默认拒绝: " + dec.Message
+		d.Source = "builtin"
+		i.Log(ctx, convID, d, toolName, input, "denied")
+		log.Printf("[intercept] 无人值守:裁判不可用,ask 兜底拒绝(工具 %s)", toolName)
+		return false
+	}
+	d := forced
+	d.RuleName = dec.RuleName
+	d.Message = "[无人值守强制裁决] 原判定 ask(" + dec.Message + ") → " + forced.Message
+	i.Log(ctx, convID, d, toolName, input, map[bool]string{true: "allowed", false: "denied"}[forced.Action == "allow"])
+	log.Printf("[intercept] 无人值守:ask 已强制裁决为 %s(工具 %s)", forced.Action, toolName)
+	return forced.Action == "allow"
+}
+
 func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) bool {
 	// 一键放行(带时限):启用中直接放行,不进 pending;历史记 decision_source=
 	// "auto_allow"。每次裁决前 AutoAllowStatus 做惰性到期检查,过期自动关闭。
@@ -1083,6 +1156,16 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	if !dec.NoAutoAllow && i.aggressiveTask(ctx) {
 		i.autoApproveAs(ctx, convID, dec, toolName, input, "aggressive", "激进模式自动批准")
 		return true
+	}
+
+	// 无人值守(任务级/全局):**任何来源的 ask 都不得建审批单**,否则页面上仍然
+	// 会出现「待审批」并一直挂着 —— 规则命中(起 HTTP 服务/横向喷洒/删除接口)、
+	// 编码载荷无法解码、RoE 范围强制这三类 ask 都直接走这里,不经过 Judge()。
+	// 处置:
+	//   - RoE 范围强制(NoAutoAllow):硬边界,直接拒(资产不出范围,不交裁判);
+	//   - 其余:交给裁判带「禁止 ask」契约强制二选一;裁判不可用/仍不守契约 → 安全拒绝。
+	if i.unattendedEnabled(ctx) {
+		return i.resolveUnattendedAsk(ctx, convID, dec, toolName, input)
 	}
 
 	ruleID := dec.RuleID
@@ -1126,26 +1209,15 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	}
 
 	if !dec.TimeoutEnabled {
-		if i.unattendedEnabled(ctx) {
-			// 无人值守:规则本身没配超时(内置 ask 规则就是 timeout_enabled=false)时
-			// **不能无限期等人** —— 否则无人值守任务会一直挂在这条审批上;若任务级
-			// timeout_seconds 又是 0(不限时),那就是永不结束。这里按全局 ask 超时策略
-			// 兜底,语义与 judge ask 的超时完全一致(默认 300s → deny)。
-			dec.TimeoutEnabled = true
-			dec.TimeoutSeconds = i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs)
-			dec.TimeoutAction = i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny")
-			log.Printf("[intercept] 无人值守:规则 #%d 未配超时,按全局 ask 超时兜底(%ds → %s)",
-				dec.RuleID, dec.TimeoutSeconds, dec.TimeoutAction)
-		} else {
-			// No timeout: wait indefinitely until user decides or worker stops.
-			select {
-			case allowed := <-ch:
-				return allowed
-			case <-ctx.Done():
-				_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
-				_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
-				return false
-			}
+		// No timeout: wait indefinitely until user decides or worker stops.
+		// (无人值守在上面已经提前返回,不会走到这里 —— 它从不建审批单。)
+		select {
+		case allowed := <-ch:
+			return allowed
+		case <-ctx.Done():
+			_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
+			_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+			return false
 		}
 	}
 
