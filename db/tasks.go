@@ -256,6 +256,10 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CoverageEnabled: coverageEnabled,
 		ReviewEnabled:   opts.ReviewEnabled, ReviewSrcType: reviewSrcType,
 		OpMode:          opMode,
+		// Unattended 必须显式带上:INSERT 已经把它写进 DB,但返回的 Task 是从这个
+		// 结构体直接给调用方的(不重读行),漏掉就会出现「库里是 t、内存是 false」——
+		// 新建任务后立刻跑时,任务级无人值守读内存开关会拿到 false,照样建审批单等人。
+		Unattended: opts.Unattended,
 	}
 	if err := tx.QueryRow(`
 INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, review_enabled, review_src_type, op_mode, unattended)
