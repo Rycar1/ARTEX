@@ -19,7 +19,12 @@ const sigAsset = sumsAsset + ".minisig"
 
 // embeddedPubKey 是 ARTEX Release 的 minisign 公钥（base64，对应 minisign -P 的输出）。
 // 私钥不入库，只保存在 GitHub Secrets 的 MINISIGN_KEY；换 key 时这里与 secret 同步更换。
-const embeddedPubKey = "RWSXIi1nUNeBgfwSraBVDfhBz6DC3SE0sWAK1z5CaLMaqAY7NAcerhIa"
+//
+// 二开/私有部署要发自己的 Release 时，同样在**构建期**换成自己的公钥（不要改成运行时
+// 配置：能改公钥等于能改信任根，验签就失去意义）：
+//
+//	go build -ldflags "-X github.com/Autumn-27/artex/selfupdate.embeddedPubKey=<你的 minisign -P 输出>"
+var embeddedPubKey = "RWSXIi1nUNeBgfwSraBVDfhBz6DC3SE0sWAK1z5CaLMaqAY7NAcerhIa"
 
 // skipSignEnv 是逃生门：置 1 时跳过验签（仅降级兼容旧 Release 等紧急场景使用，
 // 会打警告）。默认 fail-closed：签名缺失或验不过都拒绝安装。

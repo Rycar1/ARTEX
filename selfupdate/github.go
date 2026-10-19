@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -14,13 +15,13 @@ import (
 // 远程代码执行通道(把源指到自己的仓库 → 平台下载并执行对方二进制)，对一个渗透
 // 测试平台来说这个口子开不得。
 //
-// 但写死成 const 会让二开/私有部署永远无法自更新，所以留一个**构建期**覆盖点：
+// 默认指向本二开仓库(Rycar1/ARTEX)。若你的部署用别的发布源，可在**构建期**覆盖：
 //
 //	go build -ldflags "-X github.com/Autumn-27/artex/selfupdate.Repo=owner/repo"
 //
 // 构建者本来就能决定这个二进制跑什么代码，因此这不扩大信任边界；而运行时改配置
 // 做不到，RCE 通道仍然是关闭的。
-var Repo = "Autumn-27/artex"
+var Repo = "Rycar1/ARTEX"
 
 // latestURL 是 GitHub 的"最新正式版"接口。它会自动跳过 prerelease 和 draft。
 // 用函数而不是 const:Repo 现在可在构建期被 -X 覆盖。
@@ -95,6 +96,27 @@ func checkURL(u *url.URL) error {
 	return nil
 }
 
+// repoExists 探测发布源仓库本身是否存在(用于把 /releases/latest 的 404 区分成
+// 「仓库没有 Release」和「仓库根本不存在」)。任何异常都按"存在"处理:此时更可能是
+// 网络/限流问题,不该误导用户去改构建参数。
+func repoExists(ctx context.Context, c *http.Client) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+Repo, nil)
+	if err != nil {
+		return true
+	}
+	if err := checkURL(req.URL); err != nil {
+		return true
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "artex-selfupdate")
+	resp, err := c.Do(req)
+	if err != nil {
+		return true
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 // FetchLatest 查询最新正式版。
 func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestURL(), nil)
@@ -118,9 +140,16 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 		// 未认证的 GitHub API 是每 IP 每小时 60 次，共用出口 IP 时很容易撞上。
 		return nil, fmt.Errorf("GitHub 接口限流（每小时 60 次），请稍后再试")
 	case resp.StatusCode == http.StatusNotFound:
-		// 404 有两种常见原因:仓库没有正式版,或发布源指向了一个不存在的仓库(二开时
-		// 忘了用 -X 覆盖 Repo)。把两条都说出来,省得用户对着"尚未发布版本"猜。
-		return nil, fmt.Errorf("仓库 %s 没有可用的正式版(或该仓库不存在);发布源是构建期固定的,如需指向自己的仓库请用 -X selfupdate.Repo=owner/repo 重新构建", Repo)
+		// 404 有两种原因:仓库存在但还没发过正式 Release,或发布源指向了不存在的仓库。
+		// 多打一次 /repos/{repo} 区分开,给出可执行的下一步,而不是让用户对着
+		// "尚未发布版本"猜(本仓库默认指向二开源,首次使用时几乎必然是这个状态)。
+		if repoExists(ctx, c) {
+			return nil, fmt.Errorf("仓库 %s 存在但还没有发布正式版(Release);"+
+				"请在 GitHub 上发布一个 Release,并附上 %s 与 %s",
+				Repo, AssetName("vX.Y.Z", runtime.GOOS, runtime.GOARCH), sumsAsset)
+		}
+		return nil, fmt.Errorf("发布源仓库 %s 不存在;发布源是构建期固定的,"+
+			"如需指向别的仓库请用 -X .../selfupdate.Repo=owner/repo 重新构建", Repo)
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("GitHub 返回 %d", resp.StatusCode)
 	}
